@@ -18,7 +18,8 @@ Sommaire du fichier :
 
 Deux modes d'exécution :
   - Bot Discord persistant (par défaut) : `python main.py`
-      -> /broll niche:<mot-clé>   : pipeline complet, B-roll inclus
+      -> Exécution AUTOMATIQUE en arrière-plan sur la/les niche(s) définie(s) (NICHES)
+      -> /broll niche:<mot-clé>   : pipeline complet à la demande, B-roll inclus
       -> /tiktok urls:<lien(s)>   : télécharge une ou plusieurs vidéos TikTok précises
   - Exécution unique en CLI : `python main.py --niche "productivité"`
 """
@@ -43,7 +44,7 @@ import aiohttp
 import discord
 from aiohttp import web
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # ======================================================================================
@@ -718,8 +719,34 @@ def _limite_upload(interaction: discord.Interaction) -> int:
     return interaction.guild.filesize_limit if interaction.guild else 25 * 1024 * 1024
 
 
+def _lire_niches() -> list[str]:
+    return [n.strip() for n in os.getenv("NICHES", "voitures").split(",") if n.strip()]
+
+
+@tasks.loop(hours=float(os.getenv("AUTO_RUN_INTERVAL_HOURS", "24")))
+async def boucle_automatique() -> None:
+    """Exécute le pipeline tout seul, à intervalle régulier, en tournant sur la liste de niches."""
+    niches = _lire_niches()
+    if not niches:
+        return
+    niche = niches[boucle_automatique.current_loop % len(niches)]
+    logger.info("Exécution automatique programmée pour la niche : %s", niche)
+    try:
+        config = PipelineConfig.depuis_environnement()
+        async with TikTokAutomationPipeline(config) as pipeline:
+            await pipeline.run(niche)
+    except PipelineError as exc:
+        logger.error("Exécution automatique échouée pour « %s » : %s", niche, exc)
+    except Exception:  # noqa: BLE001
+        logger.exception("Erreur inattendue lors de l'exécution automatique.")
+
+
+_boucle_demarree = False
+
+
 @bot.event
 async def on_ready() -> None:
+    global _boucle_demarree
     guild_id = os.getenv("DISCORD_GUILD_ID", "")
     try:
         if guild_id:
@@ -734,13 +761,18 @@ async def on_ready() -> None:
         logger.exception("Échec de la synchronisation des commandes slash.")
     logger.info("Bot connecté en tant que %s.", bot.user)
 
+    auto_actif = os.getenv("AUTO_RUN_ENABLED", "true").strip().lower() in ("1", "true", "yes", "oui")
+    if auto_actif and not _boucle_demarree:
+        boucle_automatique.start()
+        _boucle_demarree = True
+        logger.info(
+            "Exécution automatique activée : niches=%s, toutes les %sh.",
+            _lire_niches(), os.getenv("AUTO_RUN_INTERVAL_HOURS", "24"),
+        )
 
-@bot.tree.command(name="broll", description="Lance le pipeline TikTok -> B-roll pour une niche donnée")
-@app_commands.describe(niche="Mot-clé / niche à rechercher sur TikTok")
-async def commande_broll(interaction: discord.Interaction, niche: str) -> None:
-    # Le pipeline peut prendre plus de 3 secondes : on défère la réponse immédiatement.
-    await interaction.response.defer(thinking=True)
 
+async def _lancer_pipeline_et_repondre(interaction: discord.Interaction, niche: str) -> None:
+    """Lance le pipeline pour `niche` et répond dans l'interaction (utilisé par /broll et /start)."""
     try:
         config = PipelineConfig.depuis_environnement()
     except PipelineError as exc:
@@ -754,7 +786,7 @@ async def commande_broll(interaction: discord.Interaction, niche: str) -> None:
         await interaction.followup.send(f"❌ Le pipeline a échoué : {exc}")
         return
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Erreur inattendue pendant /broll.")
+        logger.exception("Erreur inattendue pendant l'exécution du pipeline.")
         await interaction.followup.send(f"❌ Erreur inattendue : {exc}")
         return
 
@@ -773,6 +805,32 @@ async def commande_broll(interaction: discord.Interaction, niche: str) -> None:
     if len(script) > 4000:
         embed.set_footer(text="Script tronqué dans cet aperçu.")
     await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="broll", description="Lance le pipeline TikTok -> B-roll pour une niche donnée")
+@app_commands.describe(niche="Mot-clé / niche à rechercher sur TikTok")
+async def commande_broll(interaction: discord.Interaction, niche: str) -> None:
+    # Le pipeline peut prendre plus de 3 secondes : on défère la réponse immédiatement.
+    await interaction.response.defer(thinking=True)
+    await _lancer_pipeline_et_repondre(interaction, niche)
+
+
+@bot.tree.command(
+    name="start",
+    description="Lance tout de suite le pipeline sur la niche configurée (NICHES), sans attendre le cycle automatique",
+)
+async def commande_start(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(thinking=True)
+    niches = _lire_niches()
+    if not niches:
+        await interaction.followup.send("❌ Aucune niche configurée (variable NICHES dans .env).")
+        return
+
+    # Reprend la même niche que celle sur laquelle la boucle automatique en est actuellement.
+    index = boucle_automatique.current_loop % len(niches) if boucle_automatique.is_running() else 0
+    niche = niches[index]
+    await interaction.followup.send(f"🚀 Lancement immédiat sur la niche « {niche} »...")
+    await _lancer_pipeline_et_repondre(interaction, niche)
 
 
 @bot.tree.command(
