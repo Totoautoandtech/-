@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -126,12 +127,12 @@ class PipelineConfig:
     concurrence_telechargement: int = 5
 
     # --- Transcription ---
-    transcription_backend: str = "openai_api"  # "openai_api" ou "local_whisper"
+    transcription_backend: str = "gemini"  # "gemini", "openai_api" ou "local_whisper"
     openai_api_key: str = ""
     whisper_local_model: str = "base"
 
     # --- Réécriture IA ---
-    ai_provider: str = "openai"        # "openai", "anthropic" ou "gemini"
+    ai_provider: str = "gemini"         # "gemini", "openai" ou "anthropic"
     anthropic_api_key: str = ""
     openai_model: str = "gpt-4o"
     anthropic_model: str = "claude-3-5-sonnet-20241022"
@@ -158,10 +159,10 @@ class PipelineConfig:
             cobalt_api_url=_env("COBALT_API_URL"),
             quantite_broll=int(_env("BROLL_COUNT", "15")),
             concurrence_telechargement=int(_env("DOWNLOAD_CONCURRENCY", "5")),
-            transcription_backend=_env("TRANSCRIPTION_BACKEND", "openai_api"),
+            transcription_backend=_env("TRANSCRIPTION_BACKEND", "gemini"),
             openai_api_key=_env("OPENAI_API_KEY"),
             whisper_local_model=_env("WHISPER_LOCAL_MODEL", "base"),
-            ai_provider=_env("AI_PROVIDER", "openai"),
+            ai_provider=_env("AI_PROVIDER", "gemini"),
             anthropic_api_key=_env("ANTHROPIC_API_KEY"),
             openai_model=_env("OPENAI_MODEL", "gpt-4o"),
             anthropic_model=_env("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
@@ -182,6 +183,8 @@ class PipelineConfig:
             manquantes.append("RAPIDAPI_KEY")
         if self.transcription_backend == "openai_api" and not self.openai_api_key:
             manquantes.append("OPENAI_API_KEY (transcription via l'API OpenAI)")
+        if self.transcription_backend == "gemini" and not self.gemini_api_keys:
+            manquantes.append("GEMINI_API_KEYS (transcription via Gemini)")
         if self.ai_provider == "openai" and not self.openai_api_key:
             manquantes.append("OPENAI_API_KEY (réécriture GPT-4o)")
         if self.ai_provider == "anthropic" and not self.anthropic_api_key:
@@ -466,6 +469,8 @@ class TikTokAutomationPipeline:
         logger.info("Transcription de %s (backend: %s)", audio_path, self.config.transcription_backend)
         if self.config.transcription_backend == "local_whisper":
             texte = await asyncio.to_thread(self._transcrire_whisper_local, audio_path)
+        elif self.config.transcription_backend == "gemini":
+            texte = await self._transcrire_gemini(audio_path)
         else:
             texte = await self._transcrire_whisper_api(audio_path)
 
@@ -498,6 +503,56 @@ class TikTokAutomationPipeline:
 
         modele = whisper.load_model(self.config.whisper_local_model)
         return modele.transcribe(str(audio_path)).get("text", "")
+
+    async def _transcrire_gemini(self, audio_path: Path) -> str:
+        """
+        Transcription via l'API Gemini (l'audio est envoyé encodé en base64, comme le
+        permet l'API multimodale). Même rotation multi-clés que pour la réécriture.
+        """
+        cles = self.config.gemini_api_keys
+        if not cles:
+            raise PipelineError("Aucune clé Gemini configurée (GEMINI_API_KEYS).")
+
+        audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+        mime_type = "audio/mpeg" if audio_path.suffix == ".mp3" else "audio/mp4"
+
+        derniere_erreur: Optional[Exception] = None
+        for cle in random.sample(cles, len(cles)):
+            try:
+                return await self._transcrire_gemini_avec_cle(audio_b64, mime_type, cle)
+            except Exception as exc:  # noqa: BLE001
+                derniere_erreur = exc
+                logger.warning("Clé Gemini indisponible pour la transcription (%s...), clé suivante.", cle[:6])
+
+        raise PipelineError(f"Toutes les clés Gemini ont échoué pour la transcription : {derniere_erreur}") from derniere_erreur
+
+    async def _transcrire_gemini_avec_cle(self, audio_b64: str, mime_type: str, cle_api: str) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.config.gemini_model}:generateContent"
+        headers = {"x-goog-api-key": cle_api, "Content-Type": "application/json"}
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
+                    {"text": "Transcris cet audio mot pour mot, dans sa langue d'origine. "
+                              "Réponds uniquement avec le texte transcrit, sans aucun commentaire ni formatage."},
+                ],
+            }],
+            "generationConfig": {"temperature": 0.0},
+        }
+
+        async def _appel():
+            async with self._s().post(url, headers=headers, json=payload) as resp:
+                if resp.status != 200:
+                    texte = await resp.text()
+                    raise PipelineError(f"Gemini (transcription) a répondu {resp.status} : {texte[:300]}")
+                data = await resp.json()
+            try:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError) as exc:
+                raise PipelineError(f"Réponse Gemini (transcription) inattendue : {data}") from exc
+
+        return await _avec_retry(_appel, tentatives=2, etape="transcription Gemini")
 
     # ================================================================== 4. RÉÉCRITURE IA
     async def reecrire_script(self, script_brut: str) -> dict[str, str]:
