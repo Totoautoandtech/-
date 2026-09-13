@@ -71,6 +71,10 @@ def configurer_logging() -> logging.Logger:
 
 logger = configurer_logging()
 
+# Reconnaît une page TikTok classique (tiktok.com/@user/video/123...) ; tout le reste
+# (ex. un lien direct vers un fichier CDN) est traité comme déjà prêt à télécharger.
+_RE_PAGE_TIKTOK = re.compile(r"tiktok\.com/(@[\w.\-]+/video/\d+|v/\d+)", re.IGNORECASE)
+
 
 # ======================================================================================
 # 2. EXCEPTIONS + RETRY
@@ -98,6 +102,11 @@ async def _avec_retry(coro_factory, *, tentatives: int = 3, delai_initial: float
 # ======================================================================================
 # 3. CONFIGURATION
 # ======================================================================================
+
+
+def _env(nom: str, defaut: str = "") -> str:
+    """os.getenv, mais en retirant espaces/retours à la ligne accidentels (copier-coller depuis Render)."""
+    return os.getenv(nom, defaut).strip()
 
 
 @dataclass
@@ -142,31 +151,27 @@ class PipelineConfig:
         load_dotenv()
 
         config = cls(
-            rapidapi_key=os.getenv("RAPIDAPI_KEY", ""),
-            rapidapi_host=os.getenv("RAPIDAPI_HOST", cls.rapidapi_host),
-            min_vues=int(os.getenv("MIN_VUES", "1000000")),
-            min_vues_broll=int(os.getenv("MIN_VUES_BROLL", "0")),
-            cobalt_api_url=os.getenv("COBALT_API_URL", ""),
-            quantite_broll=int(os.getenv("BROLL_COUNT", "15")),
-            concurrence_telechargement=int(os.getenv("DOWNLOAD_CONCURRENCY", "5")),
-            transcription_backend=os.getenv("TRANSCRIPTION_BACKEND", "openai_api"),
-            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
-            whisper_local_model=os.getenv("WHISPER_LOCAL_MODEL", "base"),
-            ai_provider=os.getenv("AI_PROVIDER", "openai"),
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o"),
-            anthropic_model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
-            gemini_api_keys=[
-                cle.strip()
-                for cle in os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", "")).split(",")
-                if cle.strip()
-            ],
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
-            notifier_actif=os.getenv("NOTIFIER_ACTIF", "true").strip().lower() in ("1", "true", "yes", "oui"),
-            canal_notification=os.getenv("NOTIFICATION_CHANNEL", "discord"),
-            discord_webhook_url=os.getenv("DISCORD_WEBHOOK_URL", ""),
-            telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
-            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+            rapidapi_key=_env("RAPIDAPI_KEY"),
+            rapidapi_host=_env("RAPIDAPI_HOST", cls.rapidapi_host),
+            min_vues=int(_env("MIN_VUES", "1000000")),
+            min_vues_broll=int(_env("MIN_VUES_BROLL", "0")),
+            cobalt_api_url=_env("COBALT_API_URL"),
+            quantite_broll=int(_env("BROLL_COUNT", "15")),
+            concurrence_telechargement=int(_env("DOWNLOAD_CONCURRENCY", "5")),
+            transcription_backend=_env("TRANSCRIPTION_BACKEND", "openai_api"),
+            openai_api_key=_env("OPENAI_API_KEY"),
+            whisper_local_model=_env("WHISPER_LOCAL_MODEL", "base"),
+            ai_provider=_env("AI_PROVIDER", "openai"),
+            anthropic_api_key=_env("ANTHROPIC_API_KEY"),
+            openai_model=_env("OPENAI_MODEL", "gpt-4o"),
+            anthropic_model=_env("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
+            gemini_api_keys=[cle.strip() for cle in _env("GEMINI_API_KEYS", _env("GEMINI_API_KEY")).split(",") if cle.strip()],
+            gemini_model=_env("GEMINI_MODEL", "gemini-2.5-flash"),
+            notifier_actif=_env("NOTIFIER_ACTIF", "true").lower() in ("1", "true", "yes", "oui"),
+            canal_notification=_env("NOTIFICATION_CHANNEL", "discord"),
+            discord_webhook_url=_env("DISCORD_WEBHOOK_URL"),
+            telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
+            telegram_chat_id=_env("TELEGRAM_CHAT_ID"),
         )
         config._valider()
         return config
@@ -375,7 +380,17 @@ class TikTokAutomationPipeline:
         return chemin_audio
 
     async def _resoudre_video(self, tiktok_url: str) -> tuple[str, str]:
-        """Tente TikWM puis Cobalt en repli. Retourne (lien_direct, extension_fichier)."""
+        """
+        Tente TikWM puis Cobalt en repli. Retourne (lien_direct, extension_fichier).
+
+        Certains fournisseurs RapidAPI renvoient déjà un lien direct vers le fichier vidéo
+        (CDN, ex. tiktokcdn-us.com/...) plutôt qu'une page tiktok.com/@user/video/123 : dans
+        ce cas on télécharge directement, TikWM/Cobalt n'acceptant que les pages classiques.
+        """
+        if not _RE_PAGE_TIKTOK.search(tiktok_url):
+            logger.info("Lien déjà direct (pas une page tiktok.com) : téléchargement immédiat.")
+            return tiktok_url, ".mp4"
+
         try:
             return await self._resoudre_via_tikwm(tiktok_url)
         except Exception as exc:
@@ -720,10 +735,10 @@ def _limite_upload(interaction: discord.Interaction) -> int:
 
 
 def _lire_niches() -> list[str]:
-    return [n.strip() for n in os.getenv("NICHES", "voitures").split(",") if n.strip()]
+    return [n.strip() for n in _env("NICHES", "voitures").split(",") if n.strip()]
 
 
-@tasks.loop(hours=float(os.getenv("AUTO_RUN_INTERVAL_HOURS", "24")))
+@tasks.loop(hours=float(_env("AUTO_RUN_INTERVAL_HOURS", "24")))
 async def boucle_automatique() -> None:
     """Exécute le pipeline tout seul, à intervalle régulier, en tournant sur la liste de niches."""
     niches = _lire_niches()
@@ -747,7 +762,7 @@ _boucle_demarree = False
 @bot.event
 async def on_ready() -> None:
     global _boucle_demarree
-    guild_id = os.getenv("DISCORD_GUILD_ID", "")
+    guild_id = _env("DISCORD_GUILD_ID")
     try:
         if guild_id:
             guilde = discord.Object(id=int(guild_id))
@@ -761,13 +776,13 @@ async def on_ready() -> None:
         logger.exception("Échec de la synchronisation des commandes slash.")
     logger.info("Bot connecté en tant que %s.", bot.user)
 
-    auto_actif = os.getenv("AUTO_RUN_ENABLED", "true").strip().lower() in ("1", "true", "yes", "oui")
+    auto_actif = _env("AUTO_RUN_ENABLED", "true").lower() in ("1", "true", "yes", "oui")
     if auto_actif and not _boucle_demarree:
         boucle_automatique.start()
         _boucle_demarree = True
         logger.info(
             "Exécution automatique activée : niches=%s, toutes les %sh.",
-            _lire_niches(), os.getenv("AUTO_RUN_INTERVAL_HOURS", "24"),
+            _lire_niches(), _env("AUTO_RUN_INTERVAL_HOURS", "24"),
         )
 
 
@@ -910,7 +925,7 @@ async def _demarrer_serveur_keepalive() -> None:
     app.router.add_get("/", _requete_sante)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.getenv("PORT", "10000"))
+    port = int(_env("PORT", "10000"))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info("Serveur keep-alive démarré sur le port %s.", port)
@@ -932,7 +947,7 @@ async def _executer_pipeline_cli(niche: str) -> None:
 
 async def _demarrer_bot_discord() -> None:
     """Démarre le bot Discord persistant + le serveur keep-alive (mode par défaut sur Render)."""
-    token = os.getenv("DISCORD_BOT_TOKEN", "")
+    token = _env("DISCORD_BOT_TOKEN")
     if not token:
         raise PipelineError("DISCORD_BOT_TOKEN manquant dans .env : impossible de démarrer le bot.")
 
