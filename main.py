@@ -285,7 +285,16 @@ class TikTokAutomationPipeline:
         data = await _avec_retry(_appel, etape=f"recherche TikTok « {mot_cle} »")
 
         videos = [v for v in self._extraire_liste_videos(data) if v["vues"] >= min_vues]
-        videos.sort(key=lambda v: v["vues"], reverse=True)
+
+        # Priorise les vidéos dont le titre contient le mot-clé recherché (certains
+        # fournisseurs RapidAPI renvoient des résultats peu filtrés) ; à défaut de titre
+        # exploitable, on retombe simplement sur le tri par vues.
+        mot = mot_cle.lower().strip()
+        videos.sort(key=lambda v: (mot not in v.get("titre", "").lower() if mot else False, -v["vues"]))
+
+        for v in videos[:5]:
+            logger.info("  candidat : %s vues — « %s »", v["vues"], v.get("titre", "")[:80] or "(sans titre)")
+
         return videos[:limite]
 
     @staticmethod
@@ -316,8 +325,9 @@ class TikTokAutomationPipeline:
                 lien = item.get("play") or item.get("video_url")
                 if not lien and auteur and video_id and video_id != "None":
                     lien = f"https://www.tiktok.com/@{auteur}/video/{video_id}"
+                titre = item.get("title") or item.get("desc") or item.get("description") or ""
                 if lien:
-                    resultats.append({"id": video_id, "url": lien, "vues": vues, "auteur": auteur})
+                    resultats.append({"id": video_id, "url": lien, "vues": vues, "auteur": auteur, "titre": titre})
             except (TypeError, ValueError, AttributeError):
                 continue
         return resultats
@@ -854,38 +864,14 @@ class TikTokAutomationPipeline:
 
     # ================================================================== ORCHESTRATION COMPLÈTE
     async def run(self, niche: str) -> dict[str, Any]:
-        """Exécute le pipeline complet, du repérage de la vidéo virale au B-roll téléchargé."""
+        """Exécute le pipeline complet, du repérage automatique de la vidéo virale au B-roll."""
         resultats: dict[str, Any] = {"niche": niche}
         try:
             video = await self.rechercher_video_virale(niche)
             resultats["video_source"] = video
-
-            dossier_travail = Path("downloads") / f"travail_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            audio_path = await self.telecharger_audio(video["url"], dossier_travail)
-
-            script_brut = await self.transcrire_audio(audio_path)
-            resultats["script_brut"] = script_brut
-
-            reecriture = await self.reecrire_script(script_brut)
-            resultats.update(reecriture)
-
-            if self.config.notifier_actif:
-                await self.envoyer_notification(reecriture["script_modifie"])
-            else:
-                logger.info("Notification désactivée (NOTIFIER_ACTIF=false).")
-
-            liens_broll = await self.rechercher_broll_tiktok(reecriture["mot_cle_broll"])
-            chemins_broll = await self.telecharger_plusieurs_videos_tiktok(liens_broll, prefixe_dossier="broll")
-            resultats["dossier_broll"] = str(chemins_broll[0].parent)
-            resultats["nb_broll_telecharges"] = len(chemins_broll)
-            resultats["chemins_broll"] = [str(c) for c in chemins_broll]
-
-            if self.config.stockage_broll == "google_drive":
-                resultats["liens_drive"] = await self._televerser_plusieurs_vers_drive(chemins_broll)
-
+            resultats.update(await self._executer_depuis_source(video["url"]))
             logger.info("Pipeline terminé avec succès pour la niche « %s ».", niche)
             return resultats
-
         except PipelineError as exc:
             logger.error("Le pipeline s'est arrêté : %s", exc)
             resultats["erreur"] = str(exc)
@@ -894,6 +880,55 @@ class TikTokAutomationPipeline:
             logger.exception("Erreur inattendue dans le pipeline.")
             resultats["erreur"] = str(exc)
             raise PipelineError(f"Erreur inattendue : {exc}") from exc
+
+    async def run_depuis_lien(self, tiktok_url: str) -> dict[str, Any]:
+        """
+        Comme run(), mais à partir d'une vidéo TikTok choisie soi-même (lien fourni) au
+        lieu de la recherche automatique — utile quand la recherche par mot-clé renvoie
+        des vidéos hors-sujet.
+        """
+        resultats: dict[str, Any] = {"video_source": {"url": tiktok_url}}
+        try:
+            resultats.update(await self._executer_depuis_source(tiktok_url))
+            logger.info("Pipeline (depuis lien) terminé avec succès.")
+            return resultats
+        except PipelineError as exc:
+            logger.error("Le pipeline (depuis lien) s'est arrêté : %s", exc)
+            resultats["erreur"] = str(exc)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Erreur inattendue dans le pipeline (depuis lien).")
+            resultats["erreur"] = str(exc)
+            raise PipelineError(f"Erreur inattendue : {exc}") from exc
+
+    async def _executer_depuis_source(self, tiktok_url: str) -> dict[str, Any]:
+        """Étapes 2 à 7 (audio -> transcription -> réécriture -> notif -> B-roll), pour une URL donnée."""
+        resultats: dict[str, Any] = {}
+
+        dossier_travail = Path("downloads") / f"travail_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        audio_path = await self.telecharger_audio(tiktok_url, dossier_travail)
+
+        script_brut = await self.transcrire_audio(audio_path)
+        resultats["script_brut"] = script_brut
+
+        reecriture = await self.reecrire_script(script_brut)
+        resultats.update(reecriture)
+
+        if self.config.notifier_actif:
+            await self.envoyer_notification(reecriture["script_modifie"])
+        else:
+            logger.info("Notification désactivée (NOTIFIER_ACTIF=false).")
+
+        liens_broll = await self.rechercher_broll_tiktok(reecriture["mot_cle_broll"])
+        chemins_broll = await self.telecharger_plusieurs_videos_tiktok(liens_broll, prefixe_dossier="broll")
+        resultats["dossier_broll"] = str(chemins_broll[0].parent)
+        resultats["nb_broll_telecharges"] = len(chemins_broll)
+        resultats["chemins_broll"] = [str(c) for c in chemins_broll]
+
+        if self.config.stockage_broll == "google_drive":
+            resultats["liens_drive"] = await self._televerser_plusieurs_vers_drive(chemins_broll)
+
+        return resultats
 
 
 # ======================================================================================
@@ -1069,6 +1104,32 @@ async def commande_broll(interaction: discord.Interaction, niche: str) -> None:
     # Le pipeline peut prendre plus de 3 secondes : on défère la réponse immédiatement.
     await interaction.response.defer(thinking=True)
     await _lancer_pipeline_et_repondre(interaction, niche)
+
+
+@bot.tree.command(
+    name="script",
+    description="Génère script + B-roll à partir d'UNE vidéo TikTok que tu choisis toi-même (lien)",
+)
+@app_commands.describe(url="Lien de la vidéo TikTok à utiliser comme source")
+async def commande_script(interaction: discord.Interaction, url: str) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        config = PipelineConfig.depuis_environnement()
+    except PipelineError as exc:
+        await interaction.followup.send(f"❌ Configuration invalide : {exc}")
+        return
+    try:
+        async with TikTokAutomationPipeline(config) as pipeline:
+            resultats = await pipeline.run_depuis_lien(url)
+    except PipelineError as exc:
+        await interaction.followup.send(f"❌ Le pipeline a échoué : {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Erreur inattendue pendant /script.")
+        await interaction.followup.send(f"❌ Erreur inattendue : {exc}")
+        return
+
+    await _envoyer_resultats(interaction.followup, "vidéo choisie", resultats, _limite_upload(interaction))
 
 
 @bot.tree.command(
