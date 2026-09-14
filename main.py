@@ -120,6 +120,9 @@ class PipelineConfig:
     min_vues: int = 1_000_000          # seuil "viral" pour la vidéo source
     min_vues_broll: int = 0            # seuil (facultatif) pour les vidéos B-roll
     compte_reference: str = ""         # ex. "alexauto" : puise le B-roll depuis ce compte en priorité
+    source_broll: str = "tiktok"       # "tiktok" (UGC réel) ou "pexels" (plans neutres, sans texte)
+    pexels_api_key: str = ""
+    duree_broll_cible: int = 60        # secondes ; utilisé pour trier les résultats Pexels
 
     # --- Résolution + téléchargement (sans watermark) ---
     tikwm_base_url: str = "https://www.tikwm.com/api/"
@@ -163,6 +166,9 @@ class PipelineConfig:
             min_vues=int(_env("MIN_VUES", "1000000")),
             min_vues_broll=int(_env("MIN_VUES_BROLL", "0")),
             compte_reference=_env("COMPTE_REFERENCE"),
+            source_broll=_env("SOURCE_BROLL", "tiktok"),
+            pexels_api_key=_env("PEXELS_API_KEY"),
+            duree_broll_cible=int(_env("DUREE_BROLL_SECONDES", "60")),
             cobalt_api_url=_env("COBALT_API_URL"),
             quantite_broll=int(_env("BROLL_COUNT", "15")),
             concurrence_telechargement=int(_env("DOWNLOAD_CONCURRENCY", "5")),
@@ -209,6 +215,8 @@ class PipelineConfig:
             manquantes.append("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (ou mettez NOTIFIER_ACTIF=false)")
         if self.stockage_broll == "google_drive" and not self.google_service_account_json:
             manquantes.append("GOOGLE_SERVICE_ACCOUNT_JSON (stockage B-roll sur Google Drive)")
+        if self.source_broll == "pexels" and not self.pexels_api_key:
+            manquantes.append("PEXELS_API_KEY (source B-roll = pexels)")
 
         if manquantes:
             raise PipelineError("Variables d'environnement manquantes dans .env : " + ", ".join(manquantes))
@@ -802,6 +810,50 @@ class TikTokAutomationPipeline:
         return [texte[i:i + taille_max] for i in range(0, len(texte), taille_max)] or [""]
 
     # ================================================================== 6. B-ROLL (TikTok, sans watermark)
+    async def rechercher_broll(self, mot_cle: str) -> list[str]:
+        """Dispatcher : source TikTok (par défaut) ou Pexels, selon SOURCE_BROLL."""
+        if self.config.source_broll == "pexels":
+            return await self._chercher_broll_pexels(mot_cle)
+        return await self.rechercher_broll_tiktok(mot_cle)
+
+    async def _chercher_broll_pexels(self, mot_cle: str) -> list[str]:
+        """
+        Cherche du B-roll sur Pexels : à la différence de TikTok, ce sont des plans neutres
+        et libres de droits, sans texte ni voix, triables par durée — pensés pour être
+        réutilisés en montage. Retourne des liens directs (pas de résolution TikWM requise).
+        """
+        url = "https://api.pexels.com/videos/search"
+        headers = {"Authorization": self.config.pexels_api_key}
+        params = {"query": mot_cle, "orientation": "portrait", "size": "large", "per_page": "80"}
+
+        async def _appel():
+            async with self._s().get(url, headers=headers, params=params) as resp:
+                if resp.status != 200:
+                    texte = await resp.text()
+                    raise PipelineError(f"Pexels a répondu {resp.status} : {texte[:300]}")
+                return await resp.json()
+
+        data = await _avec_retry(_appel, etape=f"recherche Pexels « {mot_cle} »")
+
+        cible = self.config.duree_broll_cible
+        candidats = []
+        for video in data.get("videos", []):
+            if video.get("width", 0) >= video.get("height", 1):
+                continue  # on garde uniquement le format vertical 9:16
+            fichiers = sorted(
+                (f for f in video.get("video_files", []) if f.get("link")),
+                key=lambda f: f.get("width", 0) or 0, reverse=True,
+            )
+            if fichiers:
+                ecart = abs(video.get("duration", cible) - cible)
+                candidats.append((ecart, fichiers[0]["link"]))
+
+        if not candidats:
+            raise PipelineError(f"Aucune vidéo Pexels verticale trouvée pour « {mot_cle} ».")
+
+        candidats.sort(key=lambda c: c[0])  # les plus proches de la durée cible en premier
+        return [lien for _, lien in candidats[: self.config.quantite_broll]]
+
     async def rechercher_broll_tiktok(self, mot_cle: str) -> list[str]:
         """
         Cherche des vidéos TikTok à utiliser comme B-roll. Si COMPTE_REFERENCE est
@@ -919,7 +971,7 @@ class TikTokAutomationPipeline:
         else:
             logger.info("Notification désactivée (NOTIFIER_ACTIF=false).")
 
-        liens_broll = await self.rechercher_broll_tiktok(reecriture["mot_cle_broll"])
+        liens_broll = await self.rechercher_broll(reecriture["mot_cle_broll"])
         chemins_broll = await self.telecharger_plusieurs_videos_tiktok(liens_broll, prefixe_dossier="broll")
         resultats["dossier_broll"] = str(chemins_broll[0].parent)
         resultats["nb_broll_telecharges"] = len(chemins_broll)
