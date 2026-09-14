@@ -119,6 +119,7 @@ class PipelineConfig:
     rapidapi_host: str = "tiktok-scraper7.p.rapidapi.com"
     min_vues: int = 1_000_000          # seuil "viral" pour la vidéo source
     min_vues_broll: int = 0            # seuil (facultatif) pour les vidéos B-roll
+    compte_reference: str = ""         # ex. "alexauto" : puise le B-roll depuis ce compte en priorité
 
     # --- Résolution + téléchargement (sans watermark) ---
     tikwm_base_url: str = "https://www.tikwm.com/api/"
@@ -146,6 +147,11 @@ class PipelineConfig:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
+    # --- Stockage des vidéos B-roll ---
+    stockage_broll: str = "discord"      # "discord" (pièces jointes) ou "google_drive"
+    google_service_account_json: str = ""  # contenu JSON complet de la clé de compte de service
+    google_drive_folder_id: str = ""       # dossier Drive partagé avec le compte de service
+
     @classmethod
     def depuis_environnement(cls) -> "PipelineConfig":
         """Charge la configuration depuis .env et valide les clés requises selon les backends choisis."""
@@ -156,6 +162,7 @@ class PipelineConfig:
             rapidapi_host=_env("RAPIDAPI_HOST", cls.rapidapi_host),
             min_vues=int(_env("MIN_VUES", "1000000")),
             min_vues_broll=int(_env("MIN_VUES_BROLL", "0")),
+            compte_reference=_env("COMPTE_REFERENCE"),
             cobalt_api_url=_env("COBALT_API_URL"),
             quantite_broll=int(_env("BROLL_COUNT", "15")),
             concurrence_telechargement=int(_env("DOWNLOAD_CONCURRENCY", "5")),
@@ -173,6 +180,9 @@ class PipelineConfig:
             discord_webhook_url=_env("DISCORD_WEBHOOK_URL"),
             telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=_env("TELEGRAM_CHAT_ID"),
+            stockage_broll=_env("STOCKAGE_BROLL", "discord"),
+            google_service_account_json=_env("GOOGLE_SERVICE_ACCOUNT_JSON"),
+            google_drive_folder_id=_env("GOOGLE_DRIVE_FOLDER_ID"),
         )
         config._valider()
         return config
@@ -197,6 +207,8 @@ class PipelineConfig:
             self.telegram_bot_token and self.telegram_chat_id
         ):
             manquantes.append("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (ou mettez NOTIFIER_ACTIF=false)")
+        if self.stockage_broll == "google_drive" and not self.google_service_account_json:
+            manquantes.append("GOOGLE_SERVICE_ACCOUNT_JSON (stockage B-roll sur Google Drive)")
 
         if manquantes:
             raise PipelineError("Variables d'environnement manquantes dans .env : " + ", ".join(manquantes))
@@ -367,6 +379,74 @@ class TikTokAutomationPipeline:
         if not reussies:
             raise PipelineError("Aucune des vidéos TikTok fournies n'a pu être téléchargée.")
         return reussies
+
+    # ---------------------------------------------------------------------------- GOOGLE DRIVE (optionnel)
+    async def _televerser_plusieurs_vers_drive(self, chemins: list[Path]) -> list[str]:
+        """Envoie plusieurs fichiers sur Google Drive en parallèle, retourne les liens de partage."""
+        semaphore = asyncio.Semaphore(self.config.concurrence_telechargement)
+
+        async def _un(chemin: Path) -> Optional[str]:
+            async with semaphore:
+                try:
+                    return await self._televerser_vers_drive(chemin)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Échec de l'envoi vers Drive pour %s : %s", chemin, exc)
+                    return None
+
+        resultats = await asyncio.gather(*(_un(c) for c in chemins))
+        liens = [r for r in resultats if r]
+        logger.info("%s/%s vidéo(s) envoyée(s) sur Google Drive.", len(liens), len(chemins))
+        return liens
+
+    async def _televerser_vers_drive(self, chemin: Path) -> str:
+        """
+        Envoie un fichier dans le dossier Drive configuré (GOOGLE_DRIVE_FOLDER_ID), via un
+        compte de service. Ce dossier doit avoir été partagé au préalable, en Éditeur, avec
+        l'adresse e-mail du compte de service (champ "client_email" du JSON) — voir la notice.
+        """
+        jeton = await asyncio.to_thread(self._obtenir_jeton_drive, self.config.google_service_account_json)
+
+        metadonnees: dict[str, Any] = {"name": chemin.name}
+        if self.config.google_drive_folder_id:
+            metadonnees["parents"] = [self.config.google_drive_folder_id]
+
+        data = aiohttp.FormData()
+        data.add_field("metadata", json.dumps(metadonnees), content_type="application/json")
+        data.add_field("file", chemin.read_bytes(), filename=chemin.name, content_type="video/mp4")
+
+        url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink"
+        headers = {"Authorization": f"Bearer {jeton}"}
+
+        async def _appel():
+            async with self._s().post(url, data=data, headers=headers) as resp:
+                if resp.status not in (200, 201):
+                    texte = await resp.text()
+                    raise PipelineError(f"Google Drive a répondu {resp.status} : {texte[:300]}")
+                return await resp.json()
+
+        reponse = await _avec_retry(_appel, etape=f"envoi Drive {chemin.name}")
+        lien = reponse.get("webViewLink", "")
+        if not lien:
+            raise PipelineError(f"Google Drive n'a renvoyé aucun lien pour {chemin.name} : {reponse}")
+        return lien
+
+    @staticmethod
+    def _obtenir_jeton_drive(json_credentials: str) -> str:
+        """Bloquant (google-auth) : exécuté dans un thread via asyncio.to_thread."""
+        try:
+            from google.auth.transport.requests import Request
+            from google.oauth2 import service_account
+        except ImportError as exc:
+            raise PipelineError(
+                "Le paquet google-auth n'est pas installé : décommentez-le dans requirements.txt."
+            ) from exc
+
+        infos = json.loads(json_credentials)
+        creds = service_account.Credentials.from_service_account_info(
+            infos, scopes=["https://www.googleapis.com/auth/drive.file"]
+        )
+        creds.refresh(Request())
+        return creds.token
 
     async def telecharger_audio(self, tiktok_url: str, dossier_travail: Path) -> Path:
         """Télécharge la vidéo TikTok source puis en extrait la piste audio complète (ffmpeg)."""
@@ -713,7 +793,27 @@ class TikTokAutomationPipeline:
 
     # ================================================================== 6. B-ROLL (TikTok, sans watermark)
     async def rechercher_broll_tiktok(self, mot_cle: str) -> list[str]:
-        """Cherche des vidéos TikTok sur le thème détecté par l'IA, à utiliser comme B-roll."""
+        """
+        Cherche des vidéos TikTok à utiliser comme B-roll. Si COMPTE_REFERENCE est
+        configuré (ex. "alexauto"), les vidéos de ce compte sont essayées en premier ;
+        en cas d'échec ou si rien n'est configuré, repli automatique sur la recherche
+        par mot-clé (thème détecté par l'IA).
+        """
+        if self.config.compte_reference:
+            try:
+                videos = await self._rechercher_videos_compte(self.config.compte_reference, self.config.quantite_broll)
+                if videos:
+                    logger.info(
+                        "B-roll pris depuis le compte de référence @%s (%s vidéo(s)).",
+                        self.config.compte_reference, len(videos),
+                    )
+                    return [v["url"] for v in videos]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Recherche via le compte @%s échouée (%s), repli sur la recherche par mot-clé.",
+                    self.config.compte_reference, exc,
+                )
+
         logger.info("Recherche de %s vidéo(s) TikTok B-roll pour « %s »", self.config.quantite_broll, mot_cle)
         videos = await self._rechercher_videos_tiktok(
             mot_cle, limite=self.config.quantite_broll, min_vues=self.config.min_vues_broll
@@ -721,6 +821,36 @@ class TikTokAutomationPipeline:
         if not videos:
             raise PipelineError(f"Aucune vidéo TikTok trouvée pour le thème B-roll « {mot_cle} ».")
         return [v["url"] for v in videos]
+
+    async def _rechercher_videos_compte(self, unique_id: str, limite: int) -> list[dict[str, Any]]:
+        """
+        Récupère les dernières vidéos d'un compte TikTok précis.
+
+        NOTE : comme pour `_rechercher_videos_tiktok`, l'endpoint et le schéma JSON exacts
+        dépendent du fournisseur RapidAPI souscrit. Ciblé ici sur /user/posts (format
+        "tiktok-scraper7", cohérent avec RAPIDAPI_HOST par défaut) — ajustez si besoin.
+        En cas d'erreur, `rechercher_broll_tiktok` bascule automatiquement sur la
+        recherche par mot-clé, donc le pipeline continue de fonctionner même si cet
+        endpoint ne correspond pas exactement à votre API.
+        """
+        url = f"https://{self.config.rapidapi_host}/user/posts"
+        headers = {
+            "X-RapidAPI-Key": self.config.rapidapi_key,
+            "X-RapidAPI-Host": self.config.rapidapi_host,
+        }
+        params = {"unique_id": unique_id, "count": str(max(limite, 20)), "cursor": "0"}
+
+        async def _appel():
+            async with self._s().get(url, headers=headers, params=params) as resp:
+                if resp.status != 200:
+                    texte = await resp.text()
+                    raise PipelineError(f"RapidAPI (compte @{unique_id}) a répondu {resp.status} : {texte[:300]}")
+                return await resp.json()
+
+        data = await _avec_retry(_appel, tentatives=2, etape=f"recherche du compte @{unique_id}")
+        videos = self._extraire_liste_videos(data)
+        videos.sort(key=lambda v: v["vues"], reverse=True)
+        return videos[:limite]
 
     # ================================================================== ORCHESTRATION COMPLÈTE
     async def run(self, niche: str) -> dict[str, Any]:
@@ -748,6 +878,10 @@ class TikTokAutomationPipeline:
             chemins_broll = await self.telecharger_plusieurs_videos_tiktok(liens_broll, prefixe_dossier="broll")
             resultats["dossier_broll"] = str(chemins_broll[0].parent)
             resultats["nb_broll_telecharges"] = len(chemins_broll)
+            resultats["chemins_broll"] = [str(c) for c in chemins_broll]
+
+            if self.config.stockage_broll == "google_drive":
+                resultats["liens_drive"] = await self._televerser_plusieurs_vers_drive(chemins_broll)
 
             logger.info("Pipeline terminé avec succès pour la niche « %s ».", niche)
             return resultats
@@ -804,11 +938,31 @@ async def boucle_automatique() -> None:
     try:
         config = PipelineConfig.depuis_environnement()
         async with TikTokAutomationPipeline(config) as pipeline:
-            await pipeline.run(niche)
+            resultats = await pipeline.run(niche)
     except PipelineError as exc:
         logger.error("Exécution automatique échouée pour « %s » : %s", niche, exc)
+        return
     except Exception:  # noqa: BLE001
         logger.exception("Erreur inattendue lors de l'exécution automatique.")
+        return
+
+    channel_id = _env("DISCORD_CHANNEL_ID")
+    if not channel_id:
+        logger.warning(
+            "DISCORD_CHANNEL_ID non configuré : les %s vidéo(s) restent sur le disque de Render "
+            "et seront perdues au prochain redémarrage. Configurez DISCORD_CHANNEL_ID pour les "
+            "recevoir automatiquement, ou utilisez /start pour les récupérer via l'interaction.",
+            resultats.get("nb_broll_telecharges", 0),
+        )
+        return
+
+    canal = bot.get_channel(int(channel_id))
+    if canal is None:
+        logger.error("Salon Discord introuvable pour DISCORD_CHANNEL_ID=%s", channel_id)
+        return
+
+    limite = canal.guild.filesize_limit if getattr(canal, "guild", None) else 25 * 1024 * 1024
+    await _envoyer_resultats(canal, niche, resultats, limite)
 
 
 _boucle_demarree = False
@@ -841,6 +995,52 @@ async def on_ready() -> None:
         )
 
 
+def _decouper_en_lots(elements: list, taille_lot: int) -> list[list]:
+    return [elements[i:i + taille_lot] for i in range(0, len(elements), taille_lot)]
+
+
+async def _envoyer_resultats(envoi, niche: str, resultats: dict[str, Any], limite_taille: int) -> None:
+    """
+    Envoie le résumé (embed), puis les vidéos B-roll elles-mêmes — en pièces jointes
+    Discord, ou en liens Google Drive selon STOCKAGE_BROLL. `envoi` est soit
+    `interaction.followup` (commandes /broll, /start), soit un salon Discord (boucle
+    automatique) — les deux exposent une méthode async `send(...)`.
+
+    Important : le disque de Render est effacé à chaque redémarrage/redéploiement, donc
+    les vidéos ne sont récupérables qu'en les envoyant/téléversant ici, pas en allant les
+    chercher sur le serveur après coup.
+    """
+    script = resultats.get("script_modifie", "") or ""
+    embed = discord.Embed(
+        title=f"✅ Pipeline terminé — {niche}",
+        description=script[:4000] if script else "(script vide)",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="🎯 Thème B-roll", value=resultats.get("mot_cle_broll", "?"), inline=False)
+    embed.add_field(name="📁 B-roll", value=f"{resultats.get('nb_broll_telecharges', 0)} vidéo(s) trouvée(s)", inline=False)
+    if len(script) > 4000:
+        embed.set_footer(text="Script tronqué dans cet aperçu.")
+    await envoi.send(embed=embed)
+
+    liens_drive = resultats.get("liens_drive")
+    if liens_drive is not None:
+        # Stockage Google Drive : on poste les liens plutôt que les fichiers.
+        texte = "\n".join(f"🎬 {lien}" for lien in liens_drive) or "(aucun lien — voir les logs)"
+        for morceau in [texte[i:i + 1900] for i in range(0, len(texte), 1900)] or [""]:
+            await envoi.send(morceau)
+        return
+
+    # Stockage Discord (par défaut) : les fichiers sont attachés directement.
+    chemins = [Path(p) for p in resultats.get("chemins_broll", [])]
+    fichiers_ok = [c for c in chemins if c.exists() and c.stat().st_size <= limite_taille]
+    for lot in _decouper_en_lots(fichiers_ok, MAX_FICHIERS_PAR_MESSAGE):
+        await envoi.send(files=[discord.File(c) for c in lot])
+
+    ignorees = len(chemins) - len(fichiers_ok)
+    if ignorees:
+        await envoi.send(f"⚠️ {ignorees} vidéo(s) B-roll trop lourde(s) pour Discord, non envoyées.")
+
+
 async def _lancer_pipeline_et_repondre(interaction: discord.Interaction, niche: str) -> None:
     """Lance le pipeline pour `niche` et répond dans l'interaction (utilisé par /broll et /start)."""
     try:
@@ -860,21 +1060,7 @@ async def _lancer_pipeline_et_repondre(interaction: discord.Interaction, niche: 
         await interaction.followup.send(f"❌ Erreur inattendue : {exc}")
         return
 
-    script = resultats.get("script_modifie", "") or ""
-    embed = discord.Embed(
-        title=f"✅ Pipeline terminé — {niche}",
-        description=script[:4000] if script else "(script vide)",
-        color=discord.Color.green(),
-    )
-    embed.add_field(name="🎯 Thème B-roll", value=resultats.get("mot_cle_broll", "?"), inline=False)
-    embed.add_field(
-        name="📁 B-roll téléchargé",
-        value=f"{resultats.get('nb_broll_telecharges', 0)} vidéo(s) dans `{resultats.get('dossier_broll', '?')}`",
-        inline=False,
-    )
-    if len(script) > 4000:
-        embed.set_footer(text="Script tronqué dans cet aperçu.")
-    await interaction.followup.send(embed=embed)
+    await _envoyer_resultats(interaction.followup, niche, resultats, _limite_upload(interaction))
 
 
 @bot.tree.command(name="broll", description="Lance le pipeline TikTok -> B-roll pour une niche donnée")
