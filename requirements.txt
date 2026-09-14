@@ -3,5 +3,8 @@ python-dotenv>=1.0,<2
 aiofiles>=23.2,<24
 discord.py>=2.3.2,<3
 
+# Optionnel — uniquement si STOCKAGE_BROLL=google_drive
+# google-auth>=2.29,<3
+
 # Optionnel — uniquement si TRANSCRIPTION_BACKEND=local_whisper (lourd : torch + modèle local)
 # openai-whisper>=20231117
