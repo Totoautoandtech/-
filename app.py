@@ -65,6 +65,9 @@ class Config:
     gemini_model: str
     pexels_api_key: str
     duree_cible: int
+    gmail_adresse: str
+    gmail_mot_de_passe: str
+    destinataire_email: str
 
     @classmethod
     def charger(cls) -> "Config":
@@ -79,6 +82,9 @@ class Config:
             gemini_model=_env("GEMINI_MODEL", "gemini-2.5-flash"),
             pexels_api_key=pexels,
             duree_cible=int(_env("DUREE_CIBLE_SECONDES", "30")),
+            gmail_adresse=_env("GMAIL_ADRESSE"),
+            gmail_mot_de_passe=_env("GMAIL_MOT_DE_PASSE_APP"),
+            destinataire_email=_env("DESTINATAIRE_EMAIL", "tomheude8@gmail.com"),
         )
 
 
@@ -104,6 +110,60 @@ def _police() -> str:
         "Aucune police trouvée. Ajoutez un fichier .ttf dans static/fonts/Sous-titres.ttf "
         "(ex. une police Google Fonts téléchargée), ou installez fonts-dejavu sur le serveur."
     )
+
+
+# ======================================================================================
+# ENVOI PAR E-MAIL (script + vidéo, vers un compte Gmail)
+# ======================================================================================
+
+
+def _envoyer_email_sync(sujet: str, corps: str, piece_jointe: Optional[Path] = None) -> None:
+    """Bloquant (smtplib) : exécuté dans un thread via asyncio.to_thread."""
+    import smtplib
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["Subject"] = sujet
+    msg["From"] = CONFIG.gmail_adresse
+    msg["To"] = CONFIG.destinataire_email
+    msg.set_content(corps)
+
+    LIMITE_PIECE_JOINTE = 18 * 1024 * 1024  # marge sous la limite Gmail de 25 Mo (encodage inclus)
+    if piece_jointe and piece_jointe.exists() and piece_jointe.stat().st_size <= LIMITE_PIECE_JOINTE:
+        msg.add_attachment(
+            piece_jointe.read_bytes(), maintype="video", subtype="mp4", filename=piece_jointe.name
+        )
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=60) as serveur:
+        serveur.login(CONFIG.gmail_adresse, CONFIG.gmail_mot_de_passe)
+        serveur.send_message(msg)
+
+
+async def envoyer_script_et_video(hook: str, corps_script: str, video_path: Path) -> None:
+    """
+    Envoie le script et la vidéo par e-mail au compte configuré (DESTINATAIRE_EMAIL).
+    Ne fait rien (juste un log) si GMAIL_ADRESSE / GMAIL_MOT_DE_PASSE_APP ne sont pas
+    configurés — l'envoi e-mail est une option, pas une obligation pour que l'appli tourne.
+    """
+    if not (CONFIG.gmail_adresse and CONFIG.gmail_mot_de_passe):
+        logger.info("Envoi e-mail désactivé (GMAIL_ADRESSE / GMAIL_MOT_DE_PASSE_APP non configurés).")
+        return
+
+    base_url = _env("RENDER_EXTERNAL_URL")
+    lien_video = f"{base_url}/videos/{video_path.name}" if base_url else f"/videos/{video_path.name}"
+    corps_email = (
+        f"Hook :\n{hook}\n\n"
+        f"Script :\n{corps_script}\n\n"
+        f"Vidéo : {lien_video}\n"
+        f"(pièce jointe incluse si le fichier fait moins de 18 Mo)"
+    )
+    try:
+        await asyncio.to_thread(
+            _envoyer_email_sync, f"Nouvelle vidéo — {hook[:60]}", corps_email, video_path
+        )
+        logger.info("E-mail envoyé à %s.", CONFIG.destinataire_email)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Envoi e-mail échoué : %s", exc)
 
 
 STYLES_SOUS_TITRES = {
@@ -750,6 +810,7 @@ async def video(requete: RequeteVideo) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.exception("Erreur inattendue dans /api/video.")
         raise HTTPException(500, f"Erreur inattendue : {exc}") from exc
+    await envoyer_script_et_video(requete.hook, requete.corps, chemin)
     return {"url": f"/videos/{chemin.name}"}
 
 
@@ -768,4 +829,5 @@ async def montage(requete: RequeteMontage) -> dict:
     except Exception as exc:  # noqa: BLE001
         logger.exception("Erreur inattendue dans /api/montage.")
         raise HTTPException(500, f"Erreur inattendue : {exc}") from exc
+    await envoyer_script_et_video(requete.hook, requete.corps, chemin)
     return {"url": f"/videos/{chemin.name}"}
