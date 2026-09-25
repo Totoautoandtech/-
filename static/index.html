@@ -150,6 +150,29 @@
 <script>
 const $ = (id) => document.getElementById(id);
 
+// Appel réseau robuste : si le serveur met trop de temps ou plante, on affiche un
+// message clair au lieu de faire planter la page sur une réponse vide/illisible.
+async function appelJSON(url, corps) {
+  const res = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(corps),
+  });
+  const texte = await res.text();
+  let data = {};
+  if (texte) {
+    try { data = JSON.parse(texte); }
+    catch {
+      throw new Error(
+        res.ok
+          ? "Réponse du serveur illisible."
+          : `Le serveur a mis trop de temps à répondre ou a planté (erreur ${res.status}). Réessaie avec moins de vidéos ou des vidéos plus courtes.`
+      );
+    }
+  }
+  if (!res.ok) throw new Error(data.detail || `Erreur ${res.status}`);
+  return data;
+}
+
 // --- Navigation entre les 3 modes ---
 document.querySelectorAll('.onglet').forEach(bouton => {
   bouton.addEventListener('click', () => {
@@ -189,12 +212,7 @@ $('btn-reference').addEventListener('click', async () => {
   statut.textContent = 'Transcription + réécriture en cours...';
 
   try {
-    const res = await fetch('/api/reference', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lien }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Erreur inconnue');
+    const data = await appelJSON('/api/reference', { lien });
 
     // Bascule vers l'onglet Montage avec le script pré-rempli
     document.querySelector('.onglet[data-mode="montage"]').click();
@@ -213,24 +231,20 @@ $('btn-reference').addEventListener('click', async () => {
 $('btn-montage').addEventListener('click', async () => {
   const hook = $('mon-hook').value.trim();
   const corps = $('mon-corps').value.trim();
-  const liens_videos = $('mon-liens').value.split('\n').map(l => l.trim()).filter(Boolean);
+  // On ne garde que les vraies URLs (http...) : ignore les lignes vides ou mal collées.
+  const liens_videos = $('mon-liens').value.split('\n').map(l => l.trim()).filter(l => l.startsWith('http'));
   const style = document.querySelector('input[name=style-montage-radio]:checked')?.value || 'classique';
   const statut = $('statut-montage');
 
   if (!hook || !corps) { statut.textContent = 'Renseigne le hook et le script.'; statut.className = 'statut erreur'; return; }
-  if (!liens_videos.length) { statut.textContent = 'Ajoute au moins un lien de vidéo source.'; statut.className = 'statut erreur'; return; }
+  if (!liens_videos.length) { statut.textContent = 'Ajoute au moins un vrai lien de vidéo (commençant par http).'; statut.className = 'statut erreur'; return; }
 
   $('btn-montage').disabled = true;
   statut.className = 'statut';
   statut.textContent = `Analyse de ${liens_videos.length} vidéo(s) par l'IA, puis montage... patiente.`;
 
   try {
-    const res = await fetch('/api/montage', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ hook, corps, liens_videos, style }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Erreur inconnue');
+    const data = await appelJSON('/api/montage', { hook, corps, liens_videos, style });
     statut.textContent = '';
     afficherResultat(data.url);
   } catch (err) {
@@ -252,13 +266,7 @@ $('btn-analyser').addEventListener('click', async () => {
   statut.textContent = 'Analyse en cours...';
 
   try {
-    const res = await fetch('/api/analyser', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lien }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Erreur inconnue');
-
+    const data = await appelJSON('/api/analyser', { lien });
     $('hook').value = data.hook;
     $('corps').value = data.corps;
     $('mot-cle').value = data.mot_cle_broll;
@@ -281,15 +289,10 @@ $('btn-video').addEventListener('click', async () => {
   statut.textContent = 'Génération en cours (B-roll + montage)...';
 
   try {
-    const res = await fetch('/api/video', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        hook: $('hook').value, corps: $('corps').value,
-        mot_cle_broll: $('mot-cle').value, style,
-      }),
+    const data = await appelJSON('/api/video', {
+      hook: $('hook').value, corps: $('corps').value,
+      mot_cle_broll: $('mot-cle').value, style,
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || 'Erreur inconnue');
     statut.textContent = '';
     afficherResultat(data.url);
   } catch (err) {
