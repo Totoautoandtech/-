@@ -119,6 +119,8 @@ DOSSIER_TRAVAIL = RACINE / "travail"
 DOSSIER_TRAVAIL.mkdir(exist_ok=True)
 
 TAILLE_MAX_TELECHARGEMENT = 100 * 1024 * 1024  # évite de remplir le disque avec un lien distant
+TAILLE_MAX_PAGE_SOURCE = 2 * 1024 * 1024
+DUREE_MAX_APERCU_IA = 90  # analyse visuelle bornée pour rester compatible avec 512 Mo de RAM
 
 FONT_CANDIDATS = [
     RACINE / "static/fonts/Sous-titres.ttf",  # ajoutez votre propre police ici pour un rendu garanti
@@ -341,7 +343,15 @@ async def _extraire_texte_page(session: aiohttp.ClientSession, url: str) -> str:
         async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
             if resp.status != 200:
                 raise ErreurApp(f"Page inaccessible ({resp.status})")
-            return await resp.text()
+            morceaux: list[bytes] = []
+            total = 0
+            async for bloc in resp.content.iter_chunked(64 * 1024):
+                restant = TAILLE_MAX_PAGE_SOURCE - total
+                if restant <= 0:
+                    break
+                morceaux.append(bloc[:restant])
+                total += min(len(bloc), restant)
+            return b"".join(morceaux).decode(resp.charset or "utf-8", errors="replace")
 
     html = await _avec_retry(_appel, tentatives=2, etape="récupération de la page")
     soup = await asyncio.to_thread(BeautifulSoup, html, "html.parser")
@@ -465,14 +475,21 @@ PROMPT_REFERENCE = (
 
 
 async def _transcrire_video(video_path: Path) -> str:
-    """Extrait l'audio (ffmpeg) et transcrit mot pour mot via Gemini."""
+    """Extrait un audio compact (ffmpeg) et le transcrit via Gemini."""
     audio_path = video_path.with_suffix(".mp3")
-    commande = ["ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "libmp3lame", "-q:a", "2", str(audio_path)]
-    proc = await asyncio.create_subprocess_exec(*commande, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Un audio mono 16 kHz suffit pour la transcription et évite de charger plusieurs
+    # dizaines de Mo en mémoire avant l'encodage base64.
+    commande = [
+        "ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "libmp3lame",
+        "-ac", "1", "-ar", "16000", "-b:a", "48k", str(audio_path),
+    ]
+    proc = await asyncio.create_subprocess_exec(*commande, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise ErreurApp(f"Extraction audio échouée : {stderr.decode(errors='ignore')[-200:]}")
 
+    if not audio_path.exists() or audio_path.stat().st_size > 12 * 1024 * 1024:
+        raise ErreurApp("Audio trop volumineux pour la transcription.")
     audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
     return await _appel_gemini_brut(
         [
@@ -547,7 +564,10 @@ async def chercher_broll(mot_cle: str, duree_visee: float) -> list[str]:
             key=lambda f: f.get("width", 0) or 0, reverse=True,
         )
         if fichiers:
-            candidats.append(fichiers[0]["link"])
+            # 1080/1920 px suffisent pour la sortie verticale et évitent de télécharger
+            # les versions 4K inutilement lourdes sur une instance Render 512 Mo.
+            raisonnables = [fichier for fichier in fichiers if (fichier.get("width", 0) or 0) <= 1920]
+            candidats.append((raisonnables or fichiers)[0]["link"])
 
     if not candidats:
         raise ErreurApp(f"Aucune vidéo Pexels verticale trouvée pour « {mot_cle} ».")
@@ -582,18 +602,41 @@ def _decouper_en_segments(hook: str, corps: str) -> list[dict]:
     return [{"id": i, "texte": p} for i, p in enumerate(phrases)]
 
 
+async def _creer_apercu_video(video_path: Path) -> Path:
+    """Réduit une source avant l'envoi inline à Gemini.
+
+    Les vidéos TikTok peuvent être lourdes. Une preview 640 px, 12 fps et 90 secondes
+    conserve assez d'information visuelle pour le repérage sans exploser la RAM du Render
+    gratuit quand l'encodage base64 est effectué.
+    """
+    apercu = video_path.with_name(f"{video_path.stem}_analyse.mp4")
+    commande = [
+        "ffmpeg", "-y", "-i", str(video_path), "-t", str(DUREE_MAX_APERCU_IA),
+        "-vf", "scale=640:-2:force_original_aspect_ratio=decrease,fps=12",
+        "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
+        "-maxrate", "500k", "-bufsize", "1000k", "-pix_fmt", "yuv420p", str(apercu),
+    ]
+    proc = await asyncio.create_subprocess_exec(*commande, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        apercu.unlink(missing_ok=True)
+        raise ErreurApp(f"Préparation de l'aperçu échouée : {stderr.decode(errors='ignore')[-200:]}")
+    return apercu
+
+
 async def _analyser_video(video_path: Path, segments: list[dict]) -> list[dict]:
     """Demande à Gemini de repérer, dans cette vidéo, les passages qui illustrent le script."""
-    taille_mo = video_path.stat().st_size / 1_048_576
-    if taille_mo > 18:
-        logger.warning("%s fait %.1f Mo : trop lourd pour l'analyse inline, ignorée.", video_path.name, taille_mo)
-        return []
-
-    video_b64 = base64.b64encode(video_path.read_bytes()).decode("ascii")
-    segments_json = json.dumps([{"id": s["id"], "texte": s["texte"]} for s in segments], ensure_ascii=False)
-    prompt = PROMPT_ANALYSE_VIDEO.format(segments=segments_json)
-
+    apercu: Optional[Path] = None
     try:
+        apercu = await _creer_apercu_video(video_path)
+        taille_mo = apercu.stat().st_size / 1_048_576
+        if taille_mo > 12:
+            logger.warning("Preview de %s trop lourde (%.1f Mo), analyse ignorée.", video_path.name, taille_mo)
+            return []
+
+        video_b64 = base64.b64encode(apercu.read_bytes()).decode("ascii")
+        segments_json = json.dumps([{"id": s["id"], "texte": s["texte"]} for s in segments], ensure_ascii=False)
+        prompt = PROMPT_ANALYSE_VIDEO.format(segments=segments_json)
         brut = await _appel_gemini_brut(
             [
                 {"inline_data": {"mime_type": "video/mp4", "data": video_b64}},
@@ -607,6 +650,9 @@ async def _analyser_video(video_path: Path, segments: list[dict]) -> list[dict]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Analyse vidéo échouée pour %s : %s", video_path.name, exc)
         return []
+    finally:
+        if apercu:
+            apercu.unlink(missing_ok=True)
 
 
 def _assigner_fragments(segments: list[dict], candidats_par_video: dict[str, list[dict]]) -> dict[int, dict]:
@@ -792,19 +838,20 @@ async def construire_montage(liens_videos: list[str], hook: str, corps: str, sty
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Téléchargement échoué pour %s : %s", lien, exc)
 
-            await asyncio.gather(*(_telecharger_une(i, lien) for i, lien in enumerate(liens_videos)))
+            # Téléchargements séquentiels : évite de cumuler plusieurs buffers réseau
+            # et plusieurs fichiers temporaires en même temps sur l'instance 512 Mo.
+            for i, lien in enumerate(liens_videos):
+                await _telecharger_une(i, lien)
 
         if not chemins_videos:
             raise ErreurApp("Aucune des vidéos fournies n'a pu être téléchargée.")
 
-        # 2. L'IA analyse chaque vidéo pour y repérer les passages pertinents
-        # Analyse en parallèle (plutôt qu'une vidéo après l'autre) : réduit fortement
-        # le temps total, donc le risque de dépasser le délai autorisé par Render.
+        # 2. Analyse séquentielle : une seule preview et un seul payload base64 en RAM
+        # à la fois. C'est volontaire sur Render Free (limite mémoire de 512 Mo).
         noms = list(chemins_videos.keys())
-        resultats_analyse = await asyncio.gather(
-            *(_analyser_video(chemins_videos[nom], segments) for nom in noms)
-        )
-        candidats_par_video = dict(zip(noms, resultats_analyse))
+        candidats_par_video: dict[str, list[dict]] = {}
+        for nom in noms:
+            candidats_par_video[nom] = await _analyser_video(chemins_videos[nom], segments)
 
         # 3. Attribution du meilleur fragment par segment, repli si l'IA n'a rien trouvé
         assignation = _assigner_fragments(segments, candidats_par_video)
