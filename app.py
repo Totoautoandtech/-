@@ -14,8 +14,9 @@ Démarrage local :
     pip install -r requirements.txt
     uvicorn app:app --host 0.0.0.0 --port 8000
 
-Déploiement Render : utiliser le `Dockerfile` fourni (il installe ffmpeg), ou installer
-ffmpeg dans l'image/runtime avant de lancer `uvicorn app:app --host 0.0.0.0 --port $PORT`.
+Déploiement Render : utiliser le `render.yaml` fourni avec le `Dockerfile` (il installe
+ffmpeg), ou installer ffmpeg dans l'image/runtime avant de lancer `uvicorn app:app
+--host 0.0.0.0 --port $PORT`.
 
 Variables d'environnement :
     GEMINI_API_KEYS   (obligatoire) une ou plusieurs clés, séparées par des virgules
@@ -35,6 +36,7 @@ import random
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -865,6 +867,96 @@ class RequeteMontage(BaseModel):
     style: str = Field(default="classique", max_length=32)
 
 
+# Render limite la durée de vie des requêtes HTTP. Les générations vidéo sont donc
+# lancées en arrière-plan et l'interface suit leur état avec un petit polling.
+JOBS: dict[str, dict[str, Any]] = {}
+JOB_TASKS: dict[str, asyncio.Task] = {}
+JOB_SEMAPHORE = asyncio.Semaphore(1)
+DUREE_VIE_JOB = 60 * 60
+
+
+def _purger_jobs() -> None:
+    maintenant = time.monotonic()
+    expires = [
+        job_id for job_id, job in JOBS.items()
+        if job.get("status") in {"completed", "failed"} and maintenant - job.get("updated_at", maintenant) > DUREE_VIE_JOB
+    ]
+    for job_id in expires:
+        JOBS.pop(job_id, None)
+        JOB_TASKS.pop(job_id, None)
+
+
+def _valider_requete_video(requete: RequeteVideo) -> None:
+    if not requete.hook.strip() or not requete.corps.strip():
+        raise ErreurApp("Hook et corps du script requis.")
+    if not requete.mot_cle_broll.strip():
+        raise ErreurApp("Le thème visuel est requis.")
+
+
+def _valider_requete_montage(requete: RequeteMontage) -> list[str]:
+    if not requete.hook.strip() or not requete.corps.strip():
+        raise ErreurApp("Hook et corps du script requis.")
+    liens = [lien.strip() for lien in requete.liens_videos if lien.strip()]
+    if not liens:
+        raise ErreurApp("Ajoute au moins un lien de vidéo source.")
+    return [_valider_url(lien, "Lien vidéo") for lien in liens]
+
+
+async def _produire_video(requete: RequeteVideo) -> dict[str, str]:
+    _valider_requete_video(requete)
+    cues = _decouper_en_cues(requete.hook, requete.corps)
+    duree_totale = cues[-1]["fin"] if cues else float(CONFIG.duree_cible)
+    liens_broll = await chercher_broll(requete.mot_cle_broll, duree_totale)
+    chemin = await construire_video(liens_broll, cues, duree_totale, requete.style)
+    await envoyer_script_et_video(requete.hook, requete.corps, chemin)
+    return {"url": f"/videos/{chemin.name}"}
+
+
+async def _produire_montage(requete: RequeteMontage) -> dict[str, str]:
+    liens = _valider_requete_montage(requete)
+    chemin = await construire_montage(liens, requete.hook, requete.corps, requete.style)
+    await envoyer_script_et_video(requete.hook, requete.corps, chemin)
+    return {"url": f"/videos/{chemin.name}"}
+
+
+async def _produire_reference(requete: RequeteReference) -> dict[str, str]:
+    if not requete.lien.strip():
+        raise ErreurApp("Lien vide.")
+    return await generer_script_depuis_reference(requete.lien.strip())
+
+
+async def _produire_analyser(requete: RequeteAnalyser) -> dict[str, str]:
+    if not requete.lien.strip():
+        raise ErreurApp("Lien vide.")
+    source_texte = await extraire_source(requete.lien.strip())
+    return await generer_script(source_texte)
+
+
+async def _executer_job(job_id: str, fabrique) -> None:
+    job = JOBS[job_id]
+    try:
+        async with JOB_SEMAPHORE:
+            job["status"] = "running"
+            job["updated_at"] = time.monotonic()
+            resultat = await fabrique()
+        job.update(resultat, status="completed", updated_at=time.monotonic())
+    except ErreurApp as exc:
+        job.update(status="failed", error=str(exc), updated_at=time.monotonic())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Job %s échoué.", job_id)
+        job.update(status="failed", error=f"Erreur inattendue : {exc}", updated_at=time.monotonic())
+    finally:
+        JOB_TASKS.pop(job_id, None)
+
+
+def _demarrer_job(fabrique) -> str:
+    _purger_jobs()
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {"job_id": job_id, "status": "queued", "created_at": time.monotonic(), "updated_at": time.monotonic()}
+    JOB_TASKS[job_id] = asyncio.create_task(_executer_job(job_id, fabrique))
+    return job_id
+
+
 @app.get("/")
 async def racine() -> FileResponse:
     return FileResponse(RACINE / "static" / "index.html")
@@ -886,6 +978,47 @@ async def styles() -> dict:
     return {"styles": list(STYLES_SOUS_TITRES.keys())}
 
 
+@app.post("/api/jobs/analyser", status_code=202)
+async def lancer_job_analyser(requete: RequeteAnalyser) -> dict[str, str]:
+    if not requete.lien.strip():
+        raise HTTPException(400, "Lien vide.")
+    return {"job_id": _demarrer_job(lambda: _produire_analyser(requete)), "status": "queued"}
+
+
+@app.post("/api/jobs/video", status_code=202)
+async def lancer_job_video(requete: RequeteVideo) -> dict[str, str]:
+    try:
+        _valider_requete_video(requete)
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"job_id": _demarrer_job(lambda: _produire_video(requete)), "status": "queued"}
+
+
+@app.post("/api/jobs/montage", status_code=202)
+async def lancer_job_montage(requete: RequeteMontage) -> dict[str, str]:
+    try:
+        _valider_requete_montage(requete)
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"job_id": _demarrer_job(lambda: _produire_montage(requete)), "status": "queued"}
+
+
+@app.post("/api/jobs/reference", status_code=202)
+async def lancer_job_reference(requete: RequeteReference) -> dict[str, str]:
+    if not requete.lien.strip():
+        raise HTTPException(400, "Lien vide.")
+    return {"job_id": _demarrer_job(lambda: _produire_reference(requete)), "status": "queued"}
+
+
+@app.get("/api/jobs/{job_id}")
+async def etat_job(job_id: str) -> dict[str, Any]:
+    _purger_jobs()
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job introuvable ou expiré.")
+    return {key: value for key, value in job.items() if key not in {"created_at", "updated_at"}}
+
+
 @app.post("/api/analyser")
 async def analyser(requete: RequeteAnalyser) -> dict:
     if not requete.lien.strip():
@@ -904,54 +1037,34 @@ async def analyser(requete: RequeteAnalyser) -> dict:
 @app.post("/api/reference")
 async def reference(requete: RequeteReference) -> dict:
     """Mode « vidéo de référence » : reprend le script d'une vidéo TikTok existante, hook préservé."""
-    if not requete.lien.strip():
-        raise HTTPException(400, "Lien vide.")
     try:
-        script = await generer_script_depuis_reference(requete.lien.strip())
+        return await _produire_reference(requete)
     except ErreurApp as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("Erreur inattendue dans /api/reference.")
         raise HTTPException(500, f"Erreur inattendue : {exc}") from exc
-    return script
 
 
 @app.post("/api/video")
 async def video(requete: RequeteVideo) -> dict:
     """Mode « thème libre » : B-roll cherché sur Pexels."""
-    if not requete.hook.strip() or not requete.corps.strip():
-        raise HTTPException(400, "Hook et corps du script requis.")
-    if not requete.mot_cle_broll.strip():
-        raise HTTPException(400, "Le thème visuel est requis.")
     try:
-        cues = _decouper_en_cues(requete.hook, requete.corps)
-        duree_totale = cues[-1]["fin"] if cues else float(CONFIG.duree_cible)
-        liens_broll = await chercher_broll(requete.mot_cle_broll, duree_totale)
-        chemin = await construire_video(liens_broll, cues, duree_totale, requete.style)
+        return await _produire_video(requete)
     except ErreurApp as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("Erreur inattendue dans /api/video.")
         raise HTTPException(500, f"Erreur inattendue : {exc}") from exc
-    await envoyer_script_et_video(requete.hook, requete.corps, chemin)
-    return {"url": f"/videos/{chemin.name}"}
 
 
 @app.post("/api/montage")
 async def montage(requete: RequeteMontage) -> dict:
     """Mode « montage multi-vidéos » : l'IA repère les bons passages dans TES vidéos."""
-    if not requete.hook.strip() or not requete.corps.strip():
-        raise HTTPException(400, "Hook et corps du script requis.")
-    liens = [l.strip() for l in requete.liens_videos if l.strip()]
-    if not liens:
-        raise HTTPException(400, "Ajoute au moins un lien de vidéo source.")
     try:
-        liens = [_valider_url(lien, "Lien vidéo") for lien in liens]
-        chemin = await construire_montage(liens, requete.hook, requete.corps, requete.style)
+        return await _produire_montage(requete)
     except ErreurApp as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("Erreur inattendue dans /api/montage.")
         raise HTTPException(500, f"Erreur inattendue : {exc}") from exc
-    await envoyer_script_et_video(requete.hook, requete.corps, chemin)
-    return {"url": f"/videos/{chemin.name}"}
