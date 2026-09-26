@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: vesper-video-generator
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/sante
+    envVars:
+      - key: GEMINI_API_KEYS
+        sync: false
+      - key: PEXELS_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: DUREE_CIBLE_SECONDES
+        value: "30"
+      - key: GMAIL_ADRESSE
+        sync: false
+      - key: GMAIL_MOT_DE_PASSE_APP
+        sync: false
+      - key: DESTINATAIRE_EMAIL
+        value: tomheude8@gmail.com
