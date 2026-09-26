@@ -153,10 +153,15 @@ const $ = (id) => document.getElementById(id);
 // Appel réseau robuste : si le serveur met trop de temps ou plante, on affiche un
 // message clair au lieu de faire planter la page sur une réponse vide/illisible.
 async function appelJSON(url, corps) {
-  const res = await fetch(url, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(corps),
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(corps),
+    });
+  } catch (err) {
+    throw new Error('Impossible de joindre le serveur. Vérifie qu\'il est bien démarré.');
+  }
   const texte = await res.text();
   let data = {};
   if (texte) {
@@ -184,13 +189,25 @@ document.querySelectorAll('.onglet').forEach(bouton => {
 });
 
 // --- Styles de sous-titres (chargés une fois, dupliqués dans les 2 sélecteurs concernés) ---
-async function chargerStyles() {
-  const res = await fetch('/api/styles');
-  const { styles } = await res.json();
+function afficherStyles(styles) {
   const html = styles.map((s, i) => `<label><input type="radio" name="style-montage-radio" value="${s}" ${i === 0 ? 'checked' : ''}> ${s}</label>`).join('');
   const htmlLibre = styles.map((s, i) => `<label><input type="radio" name="style-libre-radio" value="${s}" ${i === 0 ? 'checked' : ''}> ${s}</label>`).join('');
   $('style-choix-montage').innerHTML = html;
   $('style-choix-libre').innerHTML = htmlLibre;
+}
+
+async function chargerStyles() {
+  try {
+    const res = await fetch('/api/styles');
+    if (!res.ok) throw new Error(`Erreur ${res.status}`);
+    const data = await res.json();
+    if (!Array.isArray(data.styles) || !data.styles.length) throw new Error('Styles absents');
+    afficherStyles(data.styles);
+  } catch (err) {
+    // La génération reste utilisable même si le chargement de l'interface échoue.
+    console.warn('Impossible de charger les styles, valeurs par défaut utilisées.', err);
+    afficherStyles(['classique', 'jaune', 'centre']);
+  }
 }
 chargerStyles();
 

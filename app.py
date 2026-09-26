@@ -14,7 +14,8 @@ Démarrage local :
     pip install -r requirements.txt
     uvicorn app:app --host 0.0.0.0 --port 8000
 
-Déploiement Render : Web Service, Start Command `uvicorn app:app --host 0.0.0.0 --port $PORT`.
+Déploiement Render : utiliser le `Dockerfile` fourni (il installe ffmpeg), ou installer
+ffmpeg dans l'image/runtime avant de lancer `uvicorn app:app --host 0.0.0.0 --port $PORT`.
 
 Variables d'environnement :
     GEMINI_API_KEYS   (obligatoire) une ou plusieurs clés, séparées par des virgules
@@ -38,6 +39,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
@@ -45,7 +47,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # ======================================================================================
 # LOGGING & CONFIG
@@ -71,17 +73,33 @@ class Config:
 
     @classmethod
     def charger(cls) -> "Config":
+        """Charge la configuration sans empêcher le serveur de démarrer.
+
+        Les clés externes sont vérifiées au moment où l'endpoint concerné est appelé.
+        Cela permet notamment à Render, aux tests et à la page d'accueil de démarrer
+        avec une réponse d'erreur explicite plutôt qu'un crash à l'import du module.
+        """
         cles = [c.strip() for c in _env("GEMINI_API_KEYS").split(",") if c.strip()]
         pexels = _env("PEXELS_API_KEY")
+
+        try:
+            duree_cible = int(_env("DUREE_CIBLE_SECONDES", "30"))
+            if duree_cible <= 0:
+                raise ValueError
+        except ValueError:
+            logger.warning("DUREE_CIBLE_SECONDES invalide : 30 secondes utilisées.")
+            duree_cible = 30
+
         if not cles:
-            raise RuntimeError("GEMINI_API_KEYS manquant dans les variables d'environnement.")
+            logger.warning("GEMINI_API_KEYS absent : les endpoints IA seront indisponibles.")
         if not pexels:
-            raise RuntimeError("PEXELS_API_KEY manquant dans les variables d'environnement.")
+            logger.warning("PEXELS_API_KEY absent : la génération B-roll sera indisponible.")
+
         return cls(
             gemini_api_keys=cles,
             gemini_model=_env("GEMINI_MODEL", "gemini-2.5-flash"),
             pexels_api_key=pexels,
-            duree_cible=int(_env("DUREE_CIBLE_SECONDES", "30")),
+            duree_cible=duree_cible,
             gmail_adresse=_env("GMAIL_ADRESSE"),
             gmail_mot_de_passe=_env("GMAIL_MOT_DE_PASSE_APP"),
             destinataire_email=_env("DESTINATAIRE_EMAIL", "tomheude8@gmail.com"),
@@ -90,13 +108,18 @@ class Config:
 
 CONFIG = Config.charger()
 
-DOSSIER_VIDEOS = Path("videos")
+# Tous les chemins sont ancrés sur le dossier du dépôt, pas sur le répertoire depuis
+# lequel uvicorn a été lancé. C'est important pour les déploiements et les tests.
+RACINE = Path(__file__).resolve().parent
+DOSSIER_VIDEOS = RACINE / "videos"
 DOSSIER_VIDEOS.mkdir(exist_ok=True)
-DOSSIER_TRAVAIL = Path("travail")
+DOSSIER_TRAVAIL = RACINE / "travail"
 DOSSIER_TRAVAIL.mkdir(exist_ok=True)
 
+TAILLE_MAX_TELECHARGEMENT = 100 * 1024 * 1024  # évite de remplir le disque avec un lien distant
+
 FONT_CANDIDATS = [
-    Path("static/fonts/Sous-titres.ttf"),  # ajoutez votre propre police ici pour un rendu garanti
+    RACINE / "static/fonts/Sous-titres.ttf",  # ajoutez votre propre police ici pour un rendu garanti
     Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
     Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
 ]
@@ -110,6 +133,14 @@ def _police() -> str:
         "Aucune police trouvée. Ajoutez un fichier .ttf dans static/fonts/Sous-titres.ttf "
         "(ex. une police Google Fonts téléchargée), ou installez fonts-dejavu sur le serveur."
     )
+
+
+def _verifier_ffmpeg() -> None:
+    if shutil.which("ffmpeg") is None:
+        raise ErreurApp(
+            "ffmpeg est absent du serveur. Installe-le localement ou déploie l'application "
+            "avec le Dockerfile fourni."
+        )
 
 
 # ======================================================================================
@@ -197,25 +228,67 @@ async def _avec_retry(fabrique, *, tentatives: int = 3, etape: str = ""):
 _RE_PAGE_TIKTOK = re.compile(r"tiktok\.com/(@[\w.\-]+/video/\d+|v/\d+|t/\w+)", re.IGNORECASE)
 
 
+def _valider_url(url: str, nom: str = "Lien") -> str:
+    """Valide les URL reçues avant de les transmettre à aiohttp."""
+    valeur = url.strip()
+    parsee = urlparse(valeur)
+    if parsee.scheme not in {"http", "https"} or not parsee.netloc:
+        raise ErreurApp(f"{nom} invalide : utilise une URL commençant par http:// ou https://.")
+    return valeur
+
+
+def _est_url_tiktok(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").lower().rstrip(".")
+    return hostname == "tiktok.com" or hostname.endswith(".tiktok.com")
+
+
 async def _telecharger_fichier(session: aiohttp.ClientSession, url: str, destination: Path) -> None:
+    url = _valider_url(url, "URL de téléchargement")
+
     async def _appel():
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                raise ErreurApp(f"Téléchargement échoué ({resp.status})")
-            async with aiofiles.open(destination, "wb") as f:
-                async for bloc in resp.content.iter_chunked(256 * 1024):
-                    await f.write(bloc)
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    raise ErreurApp(f"Téléchargement échoué ({resp.status})")
+
+                taille_annoncee = resp.headers.get("Content-Length")
+                if taille_annoncee:
+                    try:
+                        if int(taille_annoncee) > TAILLE_MAX_TELECHARGEMENT:
+                            raise ErreurApp("Le fichier distant est trop volumineux (100 Mo maximum).")
+                    except ValueError:
+                        logger.warning("Content-Length invalide reçu pour %s.", url)
+
+                total = 0
+                async with aiofiles.open(destination, "wb") as f:
+                    async for bloc in resp.content.iter_chunked(256 * 1024):
+                        total += len(bloc)
+                        if total > TAILLE_MAX_TELECHARGEMENT:
+                            raise ErreurApp("Le fichier distant dépasse 100 Mo.")
+                        await f.write(bloc)
+        except Exception:
+            # Ne jamais laisser un fichier partiel être réutilisé après un retry.
+            destination.unlink(missing_ok=True)
+            raise
 
     await _avec_retry(_appel, etape=f"téléchargement {destination.name}")
 
 
 async def _resoudre_video_tiktok(session: aiohttp.ClientSession, url: str) -> str:
     """Résout un lien TikTok vers son fichier vidéo direct (sans watermark), via TikWM."""
+    url = _valider_url(url, "Lien TikTok")
+
     async def _appel():
         async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}) as resp:
-            donnees = await resp.json()
-        if donnees.get("code") != 0 or "data" not in donnees:
-            raise ErreurApp(f"TikWM : {donnees.get('msg', 'réponse invalide')}")
+            if resp.status != 200:
+                raise ErreurApp(f"TikWM inaccessible ({resp.status})")
+            try:
+                donnees = await resp.json(content_type=None)
+            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
+            message = donnees.get("msg", "réponse invalide") if isinstance(donnees, dict) else "réponse invalide"
+            raise ErreurApp(f"TikWM : {message}")
         return donnees["data"]
 
     donnees = await _avec_retry(_appel, tentatives=2, etape="résolution TikTok")
@@ -236,11 +309,19 @@ async def _extraire_texte_tiktok(session: aiohttp.ClientSession, url: str) -> st
     Récupère la légende écrite par le créateur (aucune IA ici : pas de téléchargement,
     pas de transcription — la légende suffit comme matière première pour le script).
     """
+    url = _valider_url(url, "Lien TikTok")
+
     async def _appel():
         async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}) as resp:
-            donnees = await resp.json()
-        if donnees.get("code") != 0 or "data" not in donnees:
-            raise ErreurApp(f"TikWM : {donnees.get('msg', 'réponse invalide')}")
+            if resp.status != 200:
+                raise ErreurApp(f"TikWM inaccessible ({resp.status})")
+            try:
+                donnees = await resp.json(content_type=None)
+            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
+            message = donnees.get("msg", "réponse invalide") if isinstance(donnees, dict) else "réponse invalide"
+            raise ErreurApp(f"TikWM : {message}")
         return donnees["data"]
 
     donnees = await _avec_retry(_appel, tentatives=2, etape="récupération TikTok")
@@ -252,6 +333,8 @@ async def _extraire_texte_tiktok(session: aiohttp.ClientSession, url: str) -> st
 
 async def _extraire_texte_page(session: aiohttp.ClientSession, url: str) -> str:
     """Récupère le titre + le texte principal d'une page web quelconque."""
+    url = _valider_url(url)
+
     async def _appel():
         async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
             if resp.status != 200:
@@ -271,8 +354,9 @@ async def _extraire_texte_page(session: aiohttp.ClientSession, url: str) -> str:
 
 
 async def extraire_source(url: str) -> str:
+    url = _valider_url(url)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-        if _RE_PAGE_TIKTOK.search(url) or "tiktok.com" in url.lower():
+        if _RE_PAGE_TIKTOK.search(url) or _est_url_tiktok(url):
             return await _extraire_texte_tiktok(session, url)
         return await _extraire_texte_page(session, url)
 
@@ -299,6 +383,9 @@ async def _appel_gemini_brut(
     parts: list[dict], *, temperature: float, system: Optional[str] = None, json_mode: bool = False
 ) -> str:
     cles = CONFIG.gemini_api_keys
+    if not cles:
+        raise ErreurApp("GEMINI_API_KEYS n'est pas configuré sur le serveur.")
+
     derniere: Optional[Exception] = None
     for cle in random.sample(cles, len(cles)):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{CONFIG.gemini_model}:generateContent"
@@ -330,7 +417,7 @@ async def _appel_gemini_brut(
     raise ErreurApp(f"Toutes les clés Gemini ont échoué : {derniere}")
 
 
-def _parser_json(brut: str) -> dict[str, Any]:
+def _parser_json(brut: str) -> Any:
     nettoye = brut.strip()
     if nettoye.startswith("```"):
         nettoye = nettoye.strip("`")
@@ -340,7 +427,7 @@ def _parser_json(brut: str) -> dict[str, Any]:
             nettoye = nettoye[4:]
     try:
         return json.loads(nettoye)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, TypeError) as exc:
         raise ErreurApp(f"Réponse IA non exploitable : {brut[:200]}") from exc
 
 
@@ -349,9 +436,13 @@ async def generer_script(source_texte: str) -> dict[str, str]:
         [{"text": source_texte}], temperature=0.8, system=PROMPT_SCRIPT, json_mode=True
     )
     resultat = _parser_json(brut)
+    if not isinstance(resultat, dict):
+        raise ErreurApp("Réponse IA non exploitable : un objet JSON était attendu.")
     for cle in ("hook", "corps", "mot_cle_broll"):
-        if not str(resultat.get(cle, "")).strip():
+        valeur = resultat.get(cle)
+        if not isinstance(valeur, str) or not valeur.strip():
             raise ErreurApp(f"Réponse IA incomplète : « {cle} » manquant.")
+        resultat[cle] = valeur.strip()
     return resultat
 
 
@@ -392,6 +483,7 @@ async def _transcrire_video(video_path: Path) -> str:
 
 
 async def generer_script_depuis_reference(lien: str) -> dict[str, str]:
+    _verifier_ffmpeg()
     dossier = DOSSIER_TRAVAIL / uuid.uuid4().hex
     dossier.mkdir(parents=True, exist_ok=True)
     try:
@@ -406,9 +498,13 @@ async def generer_script_depuis_reference(lien: str) -> dict[str, str]:
             [{"text": transcript}], temperature=0.7, system=PROMPT_REFERENCE, json_mode=True
         )
         resultat = _parser_json(brut)
+        if not isinstance(resultat, dict):
+            raise ErreurApp("Réponse IA non exploitable : un objet JSON était attendu.")
         for cle in ("hook", "corps", "mot_cle_broll"):
-            if not str(resultat.get(cle, "")).strip():
+            valeur = resultat.get(cle)
+            if not isinstance(valeur, str) or not valeur.strip():
                 raise ErreurApp(f"Réponse IA incomplète : « {cle} » manquant.")
+            resultat[cle] = valeur.strip()
         return resultat
     finally:
         shutil.rmtree(dossier, ignore_errors=True)
@@ -420,6 +516,12 @@ async def generer_script_depuis_reference(lien: str) -> dict[str, str]:
 
 
 async def chercher_broll(mot_cle: str, duree_visee: float) -> list[str]:
+    mot_cle = mot_cle.strip()
+    if not mot_cle:
+        raise ErreurApp("Le thème visuel est requis pour chercher le B-roll.")
+    if not CONFIG.pexels_api_key:
+        raise ErreurApp("PEXELS_API_KEY n'est pas configuré sur le serveur.")
+
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": CONFIG.pexels_api_key}
     params = {"query": mot_cle, "orientation": "portrait", "size": "large", "per_page": "40"}
@@ -621,6 +723,7 @@ async def _incruster_sous_titres(assemble: Path, cues: list[dict], style: str, d
 
 async def construire_video(liens_broll: list[str], cues: list[dict], duree_totale: float, style: str) -> Path:
     """Mode « thème libre » : B-roll cherché sur Pexels."""
+    _verifier_ffmpeg()
     dossier = DOSSIER_TRAVAIL / uuid.uuid4().hex
     dossier.mkdir(parents=True, exist_ok=True)
 
@@ -666,6 +769,7 @@ def _cues_depuis_segments(segments_ordonnes: list[dict], mots_par_cue: int = 5) 
 
 async def construire_montage(liens_videos: list[str], hook: str, corps: str, style: str) -> Path:
     """Mode « montage multi-vidéos » : l'IA repère les bons passages dans les vidéos fournies."""
+    _verifier_ffmpeg()
     segments = _decouper_en_segments(hook, corps)
     if not segments:
         raise ErreurApp("Script vide : rien à monter.")
@@ -735,35 +839,46 @@ async def construire_montage(liens_videos: list[str], hook: str, corps: str, sty
 # ======================================================================================
 
 app = FastAPI(title="Générateur de vidéos")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-app.mount("/videos", StaticFiles(directory="videos"), name="videos")
+app.mount("/static", StaticFiles(directory=str(RACINE / "static")), name="static")
+app.mount("/videos", StaticFiles(directory=str(DOSSIER_VIDEOS)), name="videos")
 
 
 class RequeteAnalyser(BaseModel):
-    lien: str
+    lien: str = Field(min_length=1, max_length=2048)
 
 
 class RequeteReference(BaseModel):
-    lien: str
+    lien: str = Field(min_length=1, max_length=2048)
 
 
 class RequeteVideo(BaseModel):
-    hook: str
-    corps: str
-    mot_cle_broll: str
-    style: str = "classique"
+    hook: str = Field(min_length=1, max_length=4000)
+    corps: str = Field(min_length=1, max_length=12000)
+    mot_cle_broll: str = Field(min_length=1, max_length=200)
+    style: str = Field(default="classique", max_length=32)
 
 
 class RequeteMontage(BaseModel):
-    hook: str
-    corps: str
-    liens_videos: list[str]
-    style: str = "classique"
+    hook: str = Field(min_length=1, max_length=4000)
+    corps: str = Field(min_length=1, max_length=12000)
+    liens_videos: list[str] = Field(min_length=1, max_length=20)
+    style: str = Field(default="classique", max_length=32)
 
 
 @app.get("/")
 async def racine() -> FileResponse:
-    return FileResponse("static/index.html")
+    return FileResponse(RACINE / "static" / "index.html")
+
+
+@app.get("/api/sante")
+async def sante() -> dict[str, Any]:
+    """Endpoint léger pour les sondes de déploiement et le diagnostic."""
+    return {
+        "ok": True,
+        "gemini_configure": bool(CONFIG.gemini_api_keys),
+        "pexels_configure": bool(CONFIG.pexels_api_key),
+        "ffmpeg_installe": shutil.which("ffmpeg") is not None,
+    }
 
 
 @app.get("/api/styles")
@@ -806,6 +921,8 @@ async def video(requete: RequeteVideo) -> dict:
     """Mode « thème libre » : B-roll cherché sur Pexels."""
     if not requete.hook.strip() or not requete.corps.strip():
         raise HTTPException(400, "Hook et corps du script requis.")
+    if not requete.mot_cle_broll.strip():
+        raise HTTPException(400, "Le thème visuel est requis.")
     try:
         cues = _decouper_en_cues(requete.hook, requete.corps)
         duree_totale = cues[-1]["fin"] if cues else float(CONFIG.duree_cible)
@@ -829,6 +946,7 @@ async def montage(requete: RequeteMontage) -> dict:
     if not liens:
         raise HTTPException(400, "Ajoute au moins un lien de vidéo source.")
     try:
+        liens = [_valider_url(lien, "Lien vidéo") for lien in liens]
         chemin = await construire_montage(liens, requete.hook, requete.corps, requete.style)
     except ErreurApp as exc:
         raise HTTPException(400, str(exc)) from exc
