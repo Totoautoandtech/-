@@ -34,6 +34,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import shutil
 import subprocess
 import time
@@ -41,13 +42,13 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import aiofiles
 import aiohttp
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -72,6 +73,11 @@ class Config:
     gmail_adresse: str
     gmail_mot_de_passe: str
     destinataire_email: str
+    tiktok_client_key: str
+    tiktok_client_secret: str
+    google_client_id: str
+    google_client_secret: str
+    url_publique: str
 
     @classmethod
     def charger(cls) -> "Config":
@@ -105,6 +111,11 @@ class Config:
             gmail_adresse=_env("GMAIL_ADRESSE"),
             gmail_mot_de_passe=_env("GMAIL_MOT_DE_PASSE_APP"),
             destinataire_email=_env("DESTINATAIRE_EMAIL", "tomheude8@gmail.com"),
+            tiktok_client_key=_env("TIKTOK_CLIENT_KEY"),
+            tiktok_client_secret=_env("TIKTOK_CLIENT_SECRET"),
+            google_client_id=_env("GOOGLE_CLIENT_ID"),
+            google_client_secret=_env("GOOGLE_CLIENT_SECRET"),
+            url_publique=_env("APP_BASE_URL") or _env("RENDER_EXTERNAL_URL"),
         )
 
 
@@ -884,10 +895,108 @@ async def construire_montage(liens_videos: list[str], hook: str, corps: str, sty
 
 
 # ======================================================================================
+# CONNEXIONS TIKTOK & GOOGLE DRIVE (OAuth 2.0)
+# ======================================================================================
+
+# Les jetons restent côté serveur et ne sont jamais exposés au navigateur. Sur une instance
+# Render unique, ce stockage mémoire est volontairement simple ; un redémarrage demandera une
+# reconnexion, sans conserver de secret dans le dépôt ou sur le disque éphémère.
+SESSIONS_INTEGRATIONS: dict[str, dict[str, Any]] = {}
+ETATS_OAUTH: dict[str, dict[str, Any]] = {}
+DUREE_VIE_ETAT_OAUTH = 10 * 60
+
+
+def _url_publique(request: Request) -> str:
+    return (CONFIG.url_publique or str(request.base_url)).rstrip("/")
+
+
+def _session_id(request: Request) -> tuple[str, bool]:
+    existant = request.cookies.get("creator_session", "")
+    if re.fullmatch(r"[a-f0-9]{48}", existant):
+        SESSIONS_INTEGRATIONS.setdefault(existant, {})
+        return existant, False
+    nouveau = secrets.token_hex(24)
+    SESSIONS_INTEGRATIONS[nouveau] = {}
+    return nouveau, True
+
+
+def _poser_cookie(response, session_id: str, request: Request) -> None:
+    response.set_cookie(
+        "creator_session", session_id, max_age=30 * 24 * 3600, httponly=True,
+        secure=_url_publique(request).startswith("https://"), samesite="lax", path="/",
+    )
+
+
+def _nouvel_etat_oauth(session_id: str, service: str) -> str:
+    maintenant = time.time()
+    for cle, valeur in list(ETATS_OAUTH.items()):
+        if maintenant - valeur["created_at"] > DUREE_VIE_ETAT_OAUTH:
+            ETATS_OAUTH.pop(cle, None)
+    etat = secrets.token_urlsafe(32)
+    ETATS_OAUTH[etat] = {"session_id": session_id, "service": service, "created_at": maintenant}
+    return etat
+
+
+def _consommer_etat_oauth(etat: str, service: str) -> str:
+    donnees = ETATS_OAUTH.pop(etat, None)
+    if not donnees or donnees["service"] != service or time.time() - donnees["created_at"] > DUREE_VIE_ETAT_OAUTH:
+        raise HTTPException(400, "Connexion expirée ou invalide. Recommence depuis le tableau de bord.")
+    return donnees["session_id"]
+
+
+async def _requete_json(method: str, url: str, **kwargs) -> dict[str, Any]:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=45)) as session:
+        async with session.request(method, url, **kwargs) as response:
+            try:
+                donnees = await response.json(content_type=None)
+            except (json.JSONDecodeError, aiohttp.ContentTypeError) as exc:
+                raise ErreurApp(f"Le service externe a renvoyé une réponse illisible ({response.status}).") from exc
+            if response.status >= 400:
+                erreur = donnees.get("error")
+                message_erreur = erreur.get("message") if isinstance(erreur, dict) else erreur
+                detail = donnees.get("error_description") or message_erreur or donnees.get("message")
+                raise ErreurApp(str(detail or f"Service externe indisponible ({response.status})"))
+            return donnees
+
+
+async def _jeton_google_valide(integration: dict[str, Any]) -> str:
+    if integration.get("access_token") and integration.get("expires_at", 0) > time.time() + 60:
+        return integration["access_token"]
+    refresh = integration.get("refresh_token")
+    if not refresh:
+        raise ErreurApp("La connexion Google Drive a expiré. Reconnecte Google Drive.")
+    donnees = await _requete_json(
+        "POST", "https://oauth2.googleapis.com/token",
+        data={"client_id": CONFIG.google_client_id, "client_secret": CONFIG.google_client_secret,
+              "refresh_token": refresh, "grant_type": "refresh_token"},
+    )
+    integration["access_token"] = donnees["access_token"]
+    integration["expires_at"] = time.time() + int(donnees.get("expires_in", 3600))
+    return integration["access_token"]
+
+
+async def _sauvegarder_sur_drive(session_id: str, chemin: Path) -> dict[str, str]:
+    integration = SESSIONS_INTEGRATIONS.get(session_id, {}).get("google_drive")
+    if not integration:
+        raise ErreurApp("Connecte Google Drive avant de sauvegarder la vidéo.")
+    jeton = await _jeton_google_valide(integration)
+    metadata = {"name": chemin.name, "description": "Créée avec ς੮ ς८Րɿƿ੮"}
+    formulaire = aiohttp.FormData()
+    formulaire.add_field("metadata", json.dumps(metadata), content_type="application/json; charset=UTF-8")
+    formulaire.add_field("file", chemin.read_bytes(), filename=chemin.name, content_type="video/mp4")
+    donnees = await _requete_json(
+        "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink",
+        headers={"Authorization": f"Bearer {jeton}"}, data=formulaire,
+    )
+    return {"id": donnees["id"], "name": donnees.get("name", chemin.name),
+            "url": donnees.get("webViewLink", f"https://drive.google.com/open?id={donnees['id']}")}
+
+
+# ======================================================================================
 # API
 # ======================================================================================
 
-app = FastAPI(title="Générateur de vidéos")
+app = FastAPI(title="ς੮ ς८Րɿƿ੮ — Studio vidéo")
 app.mount("/static", StaticFiles(directory=str(RACINE / "static")), name="static")
 app.mount("/videos", StaticFiles(directory=str(DOSSIER_VIDEOS)), name="videos")
 
@@ -912,6 +1021,10 @@ class RequeteMontage(BaseModel):
     corps: str = Field(min_length=1, max_length=12000)
     liens_videos: list[str] = Field(min_length=1, max_length=20)
     style: str = Field(default="classique", max_length=32)
+
+
+class RequeteSauvegardeDrive(BaseModel):
+    url: str = Field(min_length=1, max_length=500)
 
 
 # Render limite la durée de vie des requêtes HTTP. Les générations vidéo sont donc
@@ -1006,7 +1119,11 @@ def _demarrer_job(fabrique) -> str:
 
 @app.get("/")
 async def racine() -> FileResponse:
-    return FileResponse(RACINE / "static" / "index.html")
+    # Empêche le CDN et le navigateur de conserver l'ancien tableau de bord après un déploiement.
+    return FileResponse(
+        RACINE / "static" / "index.html",
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/api/sante")
@@ -1017,7 +1134,151 @@ async def sante() -> dict[str, Any]:
         "gemini_configure": bool(CONFIG.gemini_api_keys),
         "pexels_configure": bool(CONFIG.pexels_api_key),
         "ffmpeg_installe": shutil.which("ffmpeg") is not None,
+        "tiktok_configure": bool(CONFIG.tiktok_client_key and CONFIG.tiktok_client_secret),
+        "google_drive_configure": bool(CONFIG.google_client_id and CONFIG.google_client_secret),
     }
+
+
+@app.get("/api/integrations/status")
+async def statut_integrations(request: Request):
+    session_id, nouveau = _session_id(request)
+    session = SESSIONS_INTEGRATIONS[session_id]
+    tiktok = session.get("tiktok") or {}
+    drive = session.get("google_drive") or {}
+    response = JSONResponse({
+        "tiktok": {
+            "connected": bool(tiktok), "configured": bool(CONFIG.tiktok_client_key and CONFIG.tiktok_client_secret),
+            "display_name": tiktok.get("display_name", ""), "avatar_url": tiktok.get("avatar_url", ""),
+        },
+        "google_drive": {
+            "connected": bool(drive), "configured": bool(CONFIG.google_client_id and CONFIG.google_client_secret),
+            "email": drive.get("email", ""), "name": drive.get("name", ""),
+        },
+    })
+    if nouveau:
+        _poser_cookie(response, session_id, request)
+    return response
+
+
+@app.get("/api/oauth/tiktok/start")
+async def connecter_tiktok(request: Request):
+    if not (CONFIG.tiktok_client_key and CONFIG.tiktok_client_secret):
+        raise HTTPException(503, "Ajoute TIKTOK_CLIENT_KEY et TIKTOK_CLIENT_SECRET dans Render.")
+    session_id, nouveau = _session_id(request)
+    etat = _nouvel_etat_oauth(session_id, "tiktok")
+    callback = f"{_url_publique(request)}/api/oauth/tiktok/callback"
+    url = "https://www.tiktok.com/v2/auth/authorize/?" + urlencode({
+        "client_key": CONFIG.tiktok_client_key, "scope": "user.info.basic",
+        "response_type": "code", "redirect_uri": callback, "state": etat,
+    })
+    response = RedirectResponse(url)
+    if nouveau:
+        _poser_cookie(response, session_id, request)
+    return response
+
+
+@app.get("/api/oauth/tiktok/callback")
+async def callback_tiktok(request: Request, code: str = "", state: str = "", error: str = ""):
+    if error or not code:
+        return RedirectResponse("/?integration=tiktok&status=error")
+    session_id = _consommer_etat_oauth(state, "tiktok")
+    callback = f"{_url_publique(request)}/api/oauth/tiktok/callback"
+    try:
+        jetons = await _requete_json(
+            "POST", "https://open.tiktokapis.com/v2/oauth/token/",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={"client_key": CONFIG.tiktok_client_key, "client_secret": CONFIG.tiktok_client_secret,
+                  "code": code, "grant_type": "authorization_code", "redirect_uri": callback},
+        )
+        profil = await _requete_json(
+            "GET", "https://open.tiktokapis.com/v2/user/info/?fields=open_id,union_id,avatar_url,display_name",
+            headers={"Authorization": f"Bearer {jetons['access_token']}"},
+        )
+        utilisateur = profil.get("data", {}).get("user", {})
+        SESSIONS_INTEGRATIONS.setdefault(session_id, {})["tiktok"] = {
+            **jetons, "display_name": utilisateur.get("display_name", "Compte TikTok"),
+            "avatar_url": utilisateur.get("avatar_url", ""), "open_id": utilisateur.get("open_id", ""),
+        }
+    except ErreurApp as exc:
+        logger.warning("Connexion TikTok échouée : %s", exc)
+        return RedirectResponse("/?integration=tiktok&status=error")
+    response = RedirectResponse("/?integration=tiktok&status=connected")
+    _poser_cookie(response, session_id, request)
+    return response
+
+
+@app.get("/api/oauth/google/start")
+async def connecter_google(request: Request):
+    if not (CONFIG.google_client_id and CONFIG.google_client_secret):
+        raise HTTPException(503, "Ajoute GOOGLE_CLIENT_ID et GOOGLE_CLIENT_SECRET dans Render.")
+    session_id, nouveau = _session_id(request)
+    etat = _nouvel_etat_oauth(session_id, "google")
+    callback = f"{_url_publique(request)}/api/oauth/google/callback"
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
+        "client_id": CONFIG.google_client_id, "redirect_uri": callback, "response_type": "code",
+        "scope": "openid email profile https://www.googleapis.com/auth/drive.file",
+        "access_type": "offline", "prompt": "consent", "state": etat,
+    })
+    response = RedirectResponse(url)
+    if nouveau:
+        _poser_cookie(response, session_id, request)
+    return response
+
+
+@app.get("/api/oauth/google/callback")
+async def callback_google(request: Request, code: str = "", state: str = "", error: str = ""):
+    if error or not code:
+        return RedirectResponse("/?integration=drive&status=error")
+    session_id = _consommer_etat_oauth(state, "google")
+    callback = f"{_url_publique(request)}/api/oauth/google/callback"
+    try:
+        jetons = await _requete_json(
+            "POST", "https://oauth2.googleapis.com/token",
+            data={"client_id": CONFIG.google_client_id, "client_secret": CONFIG.google_client_secret,
+                  "code": code, "grant_type": "authorization_code", "redirect_uri": callback},
+        )
+        profil = await _requete_json(
+            "GET", "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {jetons['access_token']}"},
+        )
+        SESSIONS_INTEGRATIONS.setdefault(session_id, {})["google_drive"] = {
+            **jetons, "expires_at": time.time() + int(jetons.get("expires_in", 3600)),
+            "email": profil.get("email", ""), "name": profil.get("name", "Google Drive"),
+        }
+    except ErreurApp as exc:
+        logger.warning("Connexion Google échouée : %s", exc)
+        return RedirectResponse("/?integration=drive&status=error")
+    response = RedirectResponse("/?integration=drive&status=connected")
+    _poser_cookie(response, session_id, request)
+    return response
+
+
+@app.post("/api/integrations/{service}/disconnect")
+async def deconnecter_integration(service: str, request: Request):
+    if service not in {"tiktok", "google-drive"}:
+        raise HTTPException(404, "Intégration inconnue.")
+    session_id, nouveau = _session_id(request)
+    SESSIONS_INTEGRATIONS[session_id].pop("tiktok" if service == "tiktok" else "google_drive", None)
+    response = JSONResponse({"ok": True})
+    if nouveau:
+        _poser_cookie(response, session_id, request)
+    return response
+
+
+@app.post("/api/integrations/google-drive/backup")
+async def sauvegarder_drive(requete: RequeteSauvegardeDrive, request: Request):
+    session_id, _ = _session_id(request)
+    chemin_url = urlparse(requete.url).path
+    nom = Path(chemin_url).name
+    if chemin_url != f"/videos/{nom}" or not re.fullmatch(r"[a-zA-Z0-9_.-]+\.mp4", nom):
+        raise HTTPException(400, "URL de vidéo invalide.")
+    chemin = DOSSIER_VIDEOS / nom
+    if not chemin.is_file():
+        raise HTTPException(404, "Vidéo introuvable ou expirée.")
+    try:
+        return await _sauvegarder_sur_drive(session_id, chemin)
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/styles")
