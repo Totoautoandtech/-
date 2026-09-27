@@ -6,6 +6,7 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /api/sante
+    autoDeploy: true
     envVars:
       - key: GEMINI_API_KEYS
         sync: false
@@ -21,3 +22,13 @@ services:
         sync: false
       - key: DESTINATAIRE_EMAIL
         value: tomheude8@gmail.com
+      # OAuth TikTok Login Kit — ne jamais mettre les valeurs dans ce fichier.
+      - key: TIKTOK_CLIENT_KEY
+        sync: false
+      - key: TIKTOK_CLIENT_SECRET
+        sync: false
+      # OAuth Google (API Google Drive activée dans Google Cloud).
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
