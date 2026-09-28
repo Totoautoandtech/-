@@ -34,6 +34,22 @@ test('un job sauvegardé est repris après actualisation', () => {
   assert.equal(U.loadActiveJob(storage), null);
 });
 
+test('six projets préparés survivent à une actualisation', () => {
+  const values = new Map();
+  const storage = {
+    setItem: (key, value) => values.set(key, value),
+    getItem: key => values.get(key) || null,
+    removeItem: key => values.delete(key)
+  };
+  const drafts = Array.from({ length: 6 }, (_, i) => ({ titre: `Projet ${i + 1}` }));
+  U.saveBatchDrafts(storage, drafts);
+  assert.deepEqual(U.loadBatchDrafts(storage), drafts);
+  U.saveBatchDrafts(storage, [...drafts, { titre: 'Projet 7' }]);
+  assert.equal(U.loadBatchDrafts(storage).length, 6);
+  U.clearBatchDrafts(storage);
+  assert.deepEqual(U.loadBatchDrafts(storage), []);
+});
+
 test('le verrou de soumission empêche un double clic', async () => {
   const guard = U.submissionGuard();
   let releases;

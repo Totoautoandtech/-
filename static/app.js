@@ -7,9 +7,12 @@
   let diagnosticData = null;
   let activeJobId = '';
   let diagnosticTimer = 0;
+  let historyTimer = 0;
+  let batchDrafts = U.loadBatchDrafts(localStorage);
   const guards = {
     analyser: U.submissionGuard(), video: U.submissionGuard(),
-    reference: U.submissionGuard(), montage: U.submissionGuard(), diagnostic: U.submissionGuard()
+    reference: U.submissionGuard(), montage: U.submissionGuard(), diagnostic: U.submissionGuard(),
+    batch: U.submissionGuard()
   };
 
   const setStatus = (element, message, type = '') => {
@@ -161,7 +164,10 @@
   }
 
   function setBusy(busy) {
-    ['btn-analyser', 'btn-video', 'btn-reference', 'btn-montage'].forEach(id => { $(id).disabled = busy || (id === 'btn-montage' && !diagnosticData); });
+    ['btn-analyser', 'btn-video', 'btn-reference', 'btn-montage', 'btn-add-project'].forEach(id => {
+      $(id).disabled = busy || (['btn-montage', 'btn-add-project'].includes(id) && !diagnosticData);
+    });
+    $('btn-launch-batch').disabled = busy || batchDrafts.length === 0;
     $('btn-cancel').disabled = !busy;
   }
 
@@ -198,6 +204,77 @@
     showDrive(data.drive);
   }
 
+  function renderHistory(data) {
+    const container = $('history-list');
+    const jobs = (data.jobs || []).filter(job => ['montage', 'video'].includes(job.type));
+    container.replaceChildren();
+    if (!jobs.length) {
+      const empty = document.createElement('p'); empty.className = 'hint'; empty.textContent = 'Aucune création récente.';
+      container.append(empty); return false;
+    }
+    let hasActive = false;
+    jobs.forEach(job => {
+      hasActive ||= !['completed', 'failed', 'cancelled'].includes(job.status);
+      const item = document.createElement('article'); item.className = 'history-item';
+      const top = document.createElement('div'); top.className = 'history-top';
+      const title = document.createElement('p'); title.className = 'history-title'; title.textContent = job.title || 'Création vidéo';
+      const state = document.createElement('span'); state.className = 'counter'; state.textContent = `${job.progress || 0}%`;
+      top.append(title, state);
+      const meta = document.createElement('p'); meta.className = 'history-meta';
+      const queue = job.status === 'queued' && job.queue_position ? ` · position ${job.queue_position}` : '';
+      const batch = job.batch_total > 1 ? ` · lot ${Number(job.batch_index) + 1}/${job.batch_total}` : '';
+      meta.textContent = `${statusLabels[job.status] || job.status}${queue}${batch} · ${job.detail || ''}`;
+      const progress = document.createElement('div'); progress.className = 'history-progress';
+      const fill = document.createElement('i'); fill.style.width = `${Number(job.progress || 0)}%`; progress.append(fill);
+      item.append(top, meta, progress);
+      if (job.error || job.source_error_count) {
+        const error = document.createElement('p'); error.className = 'history-meta';
+        error.textContent = job.error || `${job.source_error_count} avertissement(s) source`;
+        item.append(error);
+      }
+      const actions = document.createElement('div'); actions.className = 'history-links';
+      if (job.url) {
+        const open = document.createElement('button'); open.textContent = 'Voir';
+        open.onclick = () => showResult(job.url, job.drive); actions.append(open);
+        const download = document.createElement('a'); download.href = job.url; download.download = '';
+        download.textContent = 'Télécharger'; actions.append(download);
+      }
+      if (job.drive?.url) {
+        const drive = document.createElement('a'); drive.href = job.drive.url; drive.target = '_blank';
+        drive.rel = 'noopener'; drive.textContent = 'Drive ↗'; actions.append(drive);
+      }
+      if (!['completed', 'failed', 'cancelled'].includes(job.status)) {
+        const cancel = document.createElement('button'); cancel.textContent = 'Annuler';
+        cancel.onclick = async () => {
+          if (!confirm(`Annuler « ${job.title || 'cette création'} » ?`)) return;
+          cancel.disabled = true;
+          try { await requestJSON(`/api/jobs/${encodeURIComponent(job.job_id)}/cancel`, { body: {} }); await loadHistory(); }
+          catch (error) { toast(error.message, true); cancel.disabled = false; }
+        };
+        actions.append(cancel);
+      }
+      if (actions.childNodes.length) item.append(actions);
+      container.append(item);
+    });
+    return hasActive;
+  }
+
+  async function loadHistory() {
+    clearTimeout(historyTimer);
+    try {
+      const data = await requestJSON('/api/jobs', {
+        retryTransient: true, retryForMs: 45000,
+        onRetry: message => { $('history-list').textContent = message; }
+      });
+      const active = renderHistory(data);
+      historyTimer = setTimeout(loadHistory, active ? 3000 : 30000);
+    } catch (error) {
+      $('history-list').textContent = error.message;
+      historyTimer = setTimeout(loadHistory, 15000);
+    }
+  }
+  $('refresh-history').onclick = loadHistory;
+
   async function waitJob(id, type, statusElement) {
     activeJobId = id;
     setBusy(true);
@@ -224,6 +301,7 @@
       if (data.status === 'completed') {
         U.clearActiveJob(localStorage); activeJobId = ''; setBusy(false);
         if (data.url) showResult(data.url, data.drive);
+        loadHistory();
         return data;
       }
       if (data.status === 'failed' || data.status === 'cancelled') {
@@ -281,8 +359,49 @@
   });
 
   function resetDiagnostic() {
-    diagnosticData = null; $('btn-montage').disabled = true;
+    diagnosticData = null;
+    $('btn-montage').disabled = true;
+    $('btn-add-project').disabled = true;
     $('diagnostic').classList.remove('visible');
+  }
+
+  function currentProject(riskAccepted = false) {
+    const style = document.querySelector('input[name="style-montage"]:checked')?.value || 'classique';
+    return {
+      titre: $('mon-title').value.trim() || `Création ${batchDrafts.length + 1}`,
+      hook: $('mon-hook').value.trim(), corps: $('mon-corps').value.trim(),
+      liens_videos: U.parseLinks($('mon-liens').value, 20).links,
+      lien_reference_style: $('mon-style-ref').value.trim(), style,
+      resolution: $('mon-resolution').value,
+      estimated_seconds: Number(diagnosticData?.estimated_seconds || 0),
+      accepter_risque: riskAccepted,
+      idempotency_key: uuid()
+    };
+  }
+
+  function renderBatchDrafts() {
+    U.saveBatchDrafts(localStorage, batchDrafts);
+    $('batch-counter').textContent = `${batchDrafts.length}/6`;
+    $('batch-drafts').classList.toggle('visible', batchDrafts.length > 0);
+    $('btn-launch-batch').disabled = batchDrafts.length === 0;
+    const list = $('batch-draft-list'); list.replaceChildren();
+    batchDrafts.forEach((project, index) => {
+      const item = document.createElement('div'); item.className = 'draft-item';
+      const top = document.createElement('div'); top.className = 'draft-top';
+      const title = document.createElement('p'); title.className = 'draft-title'; title.textContent = project.titre;
+      const remove = document.createElement('button'); remove.className = 'icon-btn'; remove.title = 'Retirer'; remove.textContent = '×';
+      remove.onclick = () => { batchDrafts.splice(index, 1); renderBatchDrafts(); };
+      top.append(title, remove);
+      const meta = document.createElement('p'); meta.className = 'draft-meta';
+      meta.textContent = `${project.liens_videos.length} source(s) · ${Math.max(1, Math.ceil(project.estimated_seconds / 60))} min estimées${project.lien_reference_style ? ' · référence style' : ''}`;
+      item.append(top, meta); list.append(item);
+    });
+    if (batchDrafts.length >= 6) $('btn-add-project').disabled = true;
+  }
+
+  function resetProjectForm() {
+    ['mon-title', 'mon-hook', 'mon-corps', 'mon-liens', 'mon-style-ref'].forEach(id => { $(id).value = ''; });
+    resetDiagnostic(); validateLinksLocally(false);
   }
 
   function validateLinksLocally(scheduleServer = true) {
@@ -310,7 +429,9 @@
     (data.sources || []).forEach(source => appendSource(list, source));
     (data.errors || []).filter(error => !(data.sources || []).some(s => s.url === error.url)).forEach(error => appendSource(list, error, true));
     if (data.reference) appendSource(list, { ...data.reference, url: `Référence · ${data.reference.url}` }, data.reference.status !== 'valid');
-    $('btn-montage').disabled = data.valid_count < 1 || data.reference?.status === 'unavailable' || Boolean(activeJobId);
+    const unusable = data.valid_count < 1 || data.reference?.status === 'unavailable' || Boolean(activeJobId);
+    $('btn-montage').disabled = unusable;
+    $('btn-add-project').disabled = unusable || batchDrafts.length >= 6;
     setStatus(
       $('statut-montage'),
       data.valid_count ? 'Diagnostic terminé. Vérifie l’estimation avant le lancement.' : 'Aucune source accessible.',
@@ -340,6 +461,41 @@
   $('mon-style-ref').addEventListener('input', () => { resetDiagnostic(); clearTimeout(diagnosticTimer); diagnosticTimer = setTimeout(runDiagnostic, 900); });
   $('btn-diagnostic').onclick = runDiagnostic;
 
+  $('btn-add-project').onclick = () => {
+    const status = $('statut-montage');
+    if (batchDrafts.length >= 6) { setStatus(status, 'La file contient déjà 6 projets.', 'error'); return; }
+    if (!$('mon-hook').value.trim() || !$('mon-corps').value.trim()) { setStatus(status, 'Complète l’accroche et le script.', 'error'); return; }
+    if (!diagnosticData?.valid_count) { setStatus(status, 'Valide d’abord les sources de ce projet.', 'error'); return; }
+    batchDrafts.push(currentProject(false));
+    renderBatchDrafts(); resetProjectForm();
+    setStatus(status, `Projet ajouté. Prépare le suivant ou lance les ${batchDrafts.length} création(s).`, 'success');
+  };
+
+  $('btn-launch-batch').onclick = () => guards.batch.run(async () => {
+    if (!batchDrafts.length) return;
+    const risky = batchDrafts.filter(project => project.estimated_seconds > 540);
+    if (risky.length && !confirm(
+      `${risky.length} projet(s) risquent de dépasser 9 minutes chacun sur Render gratuit.\n\nLancer quand même la file ?`
+    )) return;
+    const button = $('btn-launch-batch'); button.disabled = true;
+    const projects = batchDrafts.map(project => ({ ...project, accepter_risque: project.estimated_seconds > 540 }));
+    try {
+      const result = await requestJSON('/api/jobs/montage/batch', {
+        body: { projets: projects, idempotency_key: uuid() },
+        retryTransient: true, retryForMs: 45000,
+        onRetry: message => setStatus($('statut-montage'), message)
+      });
+      batchDrafts = []; U.clearBatchDrafts(localStorage); renderBatchDrafts();
+      setStatus(
+        $('statut-montage'),
+        `${result.count} création(s) placée(s) dans la file. La page n’est plus nécessaire tant que l’instance Render ne redémarre pas.`,
+        'success'
+      );
+      toast(`${result.count} création(s) ajoutée(s) à la file.`); loadHistory();
+    } catch (error) { setStatus($('statut-montage'), error.message, 'error'); }
+    finally { button.disabled = batchDrafts.length === 0; }
+  });
+
   $('btn-montage').onclick = () => guards.montage.run(async () => {
     const button = $('btn-montage'), status = $('statut-montage');
     if (!$('mon-hook').value.trim() || !$('mon-corps').value.trim()) { setStatus(status, 'Complète l’accroche et le script.', 'error'); return; }
@@ -351,18 +507,8 @@
     }
     button.disabled = true; setStatus(status, 'Création du travail idempotent…');
     try {
-      const style = document.querySelector('input[name="style-montage"]:checked')?.value || 'classique';
-      await launchJob('montage', {
-        hook: $('mon-hook').value, corps: $('mon-corps').value,
-        // Relance aussi les sources temporairement indisponibles : elles peuvent avoir récupéré,
-        // et leur erreur restera attachée au job si elles échouent encore.
-        liens_videos: U.parseLinks($('mon-liens').value, 20).links,
-        lien_reference_style: $('mon-style-ref').value.trim(), style,
-        resolution: $('mon-resolution').value,
-        estimated_seconds: diagnosticData.estimated_seconds,
-        accepter_risque: riskAccepted,
-        idempotency_key: uuid()
-      }, status);
+      // Les sources temporairement indisponibles sont retentées par le job et gardent leur erreur individuelle.
+      await launchJob('montage', currentProject(riskAccepted), status);
       setStatus(status, 'Montage terminé.', 'success');
     } catch (error) { setStatus(status, error.message, 'error'); }
     finally { button.disabled = Boolean(activeJobId) || !diagnosticData; }
@@ -405,5 +551,6 @@
   }
 
   requestJSON('/api/styles').then(data => styles(data.styles)).catch(() => styles());
-  loadConfig(); loadIntegrations(); validateLinksLocally(false); resumeJob();
+  loadConfig(); renderBatchDrafts(); validateLinksLocally(false);
+  loadIntegrations().then(loadHistory); resumeJob();
 })();

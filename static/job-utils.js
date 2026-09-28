@@ -5,6 +5,7 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict';
   const ACTIVE_JOB_KEY = 'vesper.activeJob.v2';
+  const BATCH_DRAFTS_KEY = 'vesper.batchDrafts.v1';
 
   function isTransientStatus(status) { return status === 502 || status === 503 || status === 504; }
   function backoffDelay(attempt) { return Math.min(12000, 750 * Math.pow(2, Math.max(0, attempt))); }
@@ -43,6 +44,16 @@
     } catch (_) { return null; }
   }
   function clearActiveJob(storage) { storage.removeItem(ACTIVE_JOB_KEY); }
+  function saveBatchDrafts(storage, drafts) {
+    storage.setItem(BATCH_DRAFTS_KEY, JSON.stringify(Array.isArray(drafts) ? drafts.slice(0, 6) : []));
+  }
+  function loadBatchDrafts(storage) {
+    try {
+      const drafts = JSON.parse(storage.getItem(BATCH_DRAFTS_KEY) || '[]');
+      return Array.isArray(drafts) ? drafts.slice(0, 6) : [];
+    } catch (_) { return []; }
+  }
+  function clearBatchDrafts(storage) { storage.removeItem(BATCH_DRAFTS_KEY); }
 
   function submissionGuard() {
     let busy = false;
@@ -57,7 +68,8 @@
   }
 
   return {
-    ACTIVE_JOB_KEY, isTransientStatus, backoffDelay, sleep, normalizeTikTokLink,
-    parseLinks, saveActiveJob, loadActiveJob, clearActiveJob, submissionGuard
+    ACTIVE_JOB_KEY, BATCH_DRAFTS_KEY, isTransientStatus, backoffDelay, sleep, normalizeTikTokLink,
+    parseLinks, saveActiveJob, loadActiveJob, clearActiveJob,
+    saveBatchDrafts, loadBatchDrafts, clearBatchDrafts, submissionGuard
   };
 });

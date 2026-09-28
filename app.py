@@ -1113,6 +1113,7 @@ class RequeteVideo(BaseModel):
 
 
 class RequeteMontage(BaseModel):
+    titre: str = Field(default="", max_length=120)
     hook: str = Field(min_length=1, max_length=4000)
     corps: str = Field(min_length=1, max_length=12000)
     liens_videos: list[str] = Field(min_length=1, max_length=20)
@@ -1127,6 +1128,11 @@ class RequeteMontage(BaseModel):
 class RequeteDiagnosticMontage(BaseModel):
     liens_videos: list[str] = Field(min_length=1, max_length=20)
     lien_reference_style: str = Field(default="", max_length=2048)
+
+
+class RequeteLotMontages(BaseModel):
+    projets: list[RequeteMontage] = Field(min_length=1, max_length=6)
+    idempotency_key: str = Field(default="", max_length=80)
 
 
 class RequeteSauvegardeDrive(BaseModel):
@@ -1156,6 +1162,7 @@ class ContexteJob:
         valeurs.pop("statut", None)
         valeurs["status"] = statut
         valeurs["updated_at"] = time.monotonic()
+        valeurs["updated_at_unix"] = time.time()
         self.job.update(valeurs)
         self.derniere_etape = detail or self.derniere_etape
         logger.info("[%s] %s %s%% — %s", self.job_id, statut, self.job.get("progress", 0), detail)
@@ -1355,7 +1362,16 @@ def _empreinte_job(type_job: str, donnees: dict[str, Any], session_id: str) -> s
 
 
 
-def _demarrer_job(type_job: str, modele: BaseModel, session_id: str, fabrique) -> tuple[str, bool]:
+def _demarrer_job(
+    type_job: str,
+    modele: BaseModel,
+    session_id: str,
+    fabrique,
+    *,
+    batch_id: str = "",
+    batch_index: int = 0,
+    batch_total: int = 1,
+) -> tuple[str, bool]:
     _purger_jobs()
     donnees = modele.model_dump()
     empreinte = _empreinte_job(type_job, donnees, session_id)
@@ -1366,10 +1382,19 @@ def _demarrer_job(type_job: str, modele: BaseModel, session_id: str, fabrique) -
 
     job_id = uuid.uuid4().hex
     maintenant = time.monotonic()
+    titre = str(getattr(modele, "titre", "") or "").strip()
     JOBS[job_id] = {
         "job_id": job_id, "type": type_job, "owner": session_id, "status": "queued",
-        "progress": 0, "detail": "En attente sur Render", "created_at": maintenant,
-        "updated_at": maintenant, "source_errors": [], "sources": [],
+        "title": titre or (f"Création {batch_index + 1}" if batch_total > 1 else "Création vidéo"),
+        "batch_id": batch_id, "batch_index": batch_index, "batch_total": batch_total,
+        "progress": 0,
+        "detail": (
+            f"En attente · projet {batch_index + 1}/{batch_total}"
+            if batch_total > 1 else "En attente sur Render"
+        ),
+        "created_at": maintenant, "updated_at": maintenant,
+        "created_at_unix": time.time(), "updated_at_unix": time.time(),
+        "source_errors": [], "sources": [],
         "drive": {"status": "pending"}, "fingerprint": empreinte,
     }
     JOB_INDEX[empreinte] = job_id
@@ -1638,6 +1663,51 @@ async def lancer_job_montage(requete: RequeteMontage, request: Request):
     return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 
 
+@app.post("/api/jobs/montage/batch", status_code=202)
+async def lancer_lot_montages(requete: RequeteLotMontages, request: Request):
+    """Place jusqu’à six projets indépendants dans la file séquentielle Render Free."""
+    for projet in requete.projets:
+        try:
+            _valider_requete_montage(projet)
+        except (ErreurApp, ErreurMontage) as exc:
+            raise HTTPException(
+                400,
+                f"Projet « {projet.titre or 'sans titre'} » invalide : {exc}",
+            ) from exc
+        if projet.estimated_seconds > 540 and not projet.accepter_risque:
+            raise HTTPException(
+                409,
+                f"Le projet « {projet.titre or 'sans titre'} » est estimé à plus de 9 minutes. "
+                "Confirme le risque avant de lancer le lot.",
+            )
+
+    session_id, nouveau = _session_id(request)
+    batch_id = uuid.uuid4().hex
+    jobs: list[dict[str, Any]] = []
+    total = len(requete.projets)
+    for index, projet in enumerate(requete.projets):
+        if not projet.idempotency_key and requete.idempotency_key:
+            projet = projet.model_copy(
+                update={"idempotency_key": f"{requete.idempotency_key}:{index}"}
+            )
+        job_id, reused = _demarrer_job(
+            "montage", projet, session_id,
+            lambda contexte, p=projet: _produire_montage(p, contexte, session_id),
+            batch_id=batch_id, batch_index=index, batch_total=total,
+        )
+        jobs.append({
+            "job_id": job_id, "title": JOBS[job_id]["title"],
+            "status": JOBS[job_id]["status"], "reused": reused,
+        })
+
+    response = JSONResponse(
+        {"batch_id": batch_id, "count": len(jobs), "jobs": jobs}, status_code=202
+    )
+    if nouveau:
+        _poser_cookie(response, session_id, request)
+    return response
+
+
 @app.post("/api/jobs/reference", status_code=202)
 async def lancer_job_reference(requete: RequeteReference, request: Request):
     if not requete.lien.strip():
@@ -1647,6 +1717,38 @@ async def lancer_job_reference(requete: RequeteReference, request: Request):
         "reference", requete, session_id, lambda contexte: _produire_reference(requete, contexte)
     )
     return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
+
+
+@app.get("/api/jobs")
+async def historique_jobs(request: Request):
+    """Historique de six heures, utilisable après fermeture ou actualisation de la page."""
+    _purger_jobs()
+    session_id, nouveau = _session_id(request)
+    file_ids = [
+        identifiant for identifiant, valeur in sorted(
+            JOBS.items(), key=lambda item: float(item[1].get("created_at", 0))
+        )
+        if valeur.get("status") == "queued"
+    ]
+    positions = {identifiant: position + 1 for position, identifiant in enumerate(file_ids)}
+    champs = {
+        "job_id", "type", "title", "batch_id", "batch_index", "batch_total",
+        "status", "progress", "detail", "url", "error", "drive",
+        "created_at_unix", "updated_at_unix", "elapsed_seconds", "reference_warning",
+    }
+    historique = []
+    for identifiant, job in JOBS.items():
+        if job.get("owner") != session_id:
+            continue
+        resume = {cle: job[cle] for cle in champs if cle in job}
+        resume["queue_position"] = positions.get(identifiant, 0)
+        resume["source_error_count"] = len(job.get("source_errors") or [])
+        historique.append(resume)
+    historique.sort(key=lambda item: float(item.get("created_at_unix", 0)), reverse=True)
+    response = JSONResponse({"jobs": historique, "retention_seconds": DUREE_VIE_JOB})
+    if nouveau:
+        _poser_cookie(response, session_id, request)
+    return response
 
 
 @app.get("/api/jobs/{job_id}")

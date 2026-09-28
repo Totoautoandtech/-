@@ -18,6 +18,8 @@ Une référence de style facultative peut guider approximativement le rythme, le
 
 Les jobs publient les états `queued`, `validating`, `downloading`, `analysing`, `selecting`, `editing`, `subtitling`, `uploading`, `completed` ou `failed`, avec progression et détail. L'identifiant est gardé dans `localStorage` : une actualisation reprend le suivi. Les erreurs réseau/502/503/504 sont retentées avec backoff et un travail peut être annulé.
 
+Il est possible de préparer **jusqu'à six projets complets et différents** (titre, script, 1–20 sources, référence de style et réglages propres), puis de lancer le lot. Render Free les traite séquentiellement pour rester sous 512 Mo. La file et les résultats sont visibles pendant six heures dans le même navigateur ; chaque vidéo terminée est aussi envoyée vers Drive si le compte est connecté. Six travaux proches de la limite individuelle de 9 min 30 représentent environ 57 minutes de file.
+
 ## Déploiement Render
 
 Le dépôt contient `render.yaml` et un `Dockerfile`. Le Dockerfile installe FFmpeg, FFprobe, libass via FFmpeg, fontconfig, DejaVu et Liberation. La sonde est `/api/sante`.
@@ -65,7 +67,7 @@ https://VOTRE-SERVICE.onrender.com/api/oauth/google/callback
 
 TikTok utilise `user.info.basic`. Google utilise `drive.file`, limité aux fichiers créés par l'application. Les jetons restent côté serveur. Une vidéo terminée est envoyée automatiquement vers Drive si le compte est connecté ; une erreur Drive ne supprime pas le rendu local et le bouton manuel reste disponible.
 
-Les sessions OAuth et jobs sont en mémoire. Une actualisation du navigateur est prise en charge, mais un redémarrage complet de l'instance efface l'état serveur ; le navigateur explique alors que le job a expiré au lieu d'afficher une simple erreur 502/503.
+Les sessions OAuth et jobs sont en mémoire. La file continue côté serveur sans dépendre de la page ouverte et une actualisation du navigateur est prise en charge. En revanche, Render Free ne garantit pas un processus continu pendant une heure : une mise en veille, un redémarrage ou un redéploiement efface la file en mémoire. Drive reste donc la récupération la plus fiable pour les vidéos déjà terminées ; l'interface n'annonce jamais qu'un lot est garanti tant que ces limites gratuites existent.
 
 ## Performances attendues sur Render gratuit
 

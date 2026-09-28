@@ -136,6 +136,56 @@ def test_idempotence_double_clic_et_reprise_apres_actualisation(client, monkeypa
     assert cancelled.status_code == 200
 
 
+def test_lot_de_six_projets_independants_et_historique(client, monkeypatch):
+    gate = asyncio.Event()
+
+    async def production(requete, contexte, _session_id=""):
+        contexte.update(statut="analysing", progress=35, detail=f"Analyse de {requete.titre}")
+        await gate.wait()
+        return {"url": f"/videos/{requete.idempotency_key}.mp4"}
+
+    monkeypatch.setattr(app, "_produire_montage", production)
+    projets = [{
+        "titre": f"Projet {index + 1}",
+        "hook": f"Accroche {index + 1}",
+        "corps": f"Corps différent {index + 1}.",
+        "liens_videos": [f"https://www.tiktok.com/@test/video/{1000 + index}"],
+        "idempotency_key": f"projet-{index + 1}",
+    } for index in range(6)]
+    response = client.post("/api/jobs/montage/batch", json={
+        "projets": projets, "idempotency_key": "lot-six"
+    })
+    assert response.status_code == 202, response.text
+    assert response.json()["count"] == 6
+    assert len({job["job_id"] for job in response.json()["jobs"]}) == 6
+
+    history = client.get("/api/jobs")
+    assert history.status_code == 200
+    jobs = history.json()["jobs"]
+    assert len(jobs) == 6
+    assert {job["title"] for job in jobs} == {f"Projet {index + 1}" for index in range(6)}
+    assert all(job["batch_total"] == 6 for job in jobs)
+    assert history.json()["retention_seconds"] >= 6 * 60 * 60
+
+    # L'historique reste accessible après l'équivalent d'une heure.
+    for job in app.JOBS.values():
+        job["created_at"] -= 3600
+        job["updated_at"] -= 3600
+    assert len(client.get("/api/jobs").json()["jobs"]) == 6
+
+    for job_id in list(app.JOBS):
+        client.post(f"/api/jobs/{job_id}/cancel", json={})
+
+
+def test_lot_refuse_plus_de_six_projets(client):
+    projet = {
+        "titre": "Projet", "hook": "Accroche", "corps": "Corps.",
+        "liens_videos": ["https://www.tiktok.com/@test/video/123"],
+    }
+    response = client.post("/api/jobs/montage/batch", json={"projets": [projet] * 7})
+    assert response.status_code == 422
+
+
 def test_limite_estimee_demande_confirmation(client):
     response = client.post("/api/jobs/montage", json={
         "hook": "Accroche", "corps": "Corps.",
