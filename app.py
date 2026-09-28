@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -36,7 +37,6 @@ import random
 import re
 import secrets
 import shutil
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -51,6 +51,18 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+
+from studio_montage import (
+    ConfigurationMontage,
+    ErreurMontage,
+    Rapporteur,
+    TravailAnnule,
+    construire_montage_professionnel,
+    diagnostiquer_montage,
+    executer_commande,
+    normaliser_lien_tiktok,
+    normaliser_liens_tiktok,
+)
 
 # ======================================================================================
 # LOGGING & CONFIG
@@ -78,6 +90,17 @@ class Config:
     google_client_id: str
     google_client_secret: str
     url_publique: str
+    duree_max_source: int
+    delai_job: int
+    delai_ffmpeg: int
+    delai_gemini: int
+    delai_tikwm: int
+    delai_telechargement: int
+    analyses_concurrentes: int
+    budget_disque_sources: int
+    preset_export: str
+    threads_ffmpeg: int
+    autoriser_export_1080: bool
 
     @classmethod
     def charger(cls) -> "Config":
@@ -98,10 +121,22 @@ class Config:
             logger.warning("DUREE_CIBLE_SECONDES invalide : 30 secondes utilisées.")
             duree_cible = 30
 
+        def entier(nom: str, defaut: int, minimum: int, maximum: int) -> int:
+            try:
+                return max(minimum, min(maximum, int(_env(nom, str(defaut)))))
+            except ValueError:
+                logger.warning("%s invalide : %s utilisé.", nom, defaut)
+                return defaut
+
         if not cles:
             logger.warning("GEMINI_API_KEYS absent : les endpoints IA seront indisponibles.")
         if not pexels:
             logger.warning("PEXELS_API_KEY absent : la génération B-roll sera indisponible.")
+
+        preset = _env("FFMPEG_PRESET", "ultrafast").lower()
+        if preset not in {"ultrafast", "superfast", "veryfast"}:
+            logger.warning("FFMPEG_PRESET invalide : ultrafast utilisé.")
+            preset = "ultrafast"
 
         return cls(
             gemini_api_keys=cles,
@@ -116,6 +151,17 @@ class Config:
             google_client_id=_env("GOOGLE_CLIENT_ID"),
             google_client_secret=_env("GOOGLE_CLIENT_SECRET"),
             url_publique=_env("APP_BASE_URL") or _env("RENDER_EXTERNAL_URL"),
+            duree_max_source=entier("DUREE_MAX_SOURCE_SECONDES", 180, 15, 600),
+            delai_job=entier("JOB_TIMEOUT_SECONDES", 570, 60, 900),
+            delai_ffmpeg=entier("FFMPEG_TIMEOUT_SECONDES", 240, 30, 540),
+            delai_gemini=entier("GEMINI_TIMEOUT_SECONDES", 120, 15, 240),
+            delai_tikwm=entier("TIKWM_TIMEOUT_SECONDES", 30, 5, 90),
+            delai_telechargement=entier("DOWNLOAD_TIMEOUT_SECONDES", 120, 15, 300),
+            analyses_concurrentes=entier("GEMINI_ANALYSES_CONCURRENTES", 1, 1, 2),
+            budget_disque_sources=entier("BUDGET_DISQUE_SOURCES_MO", 700, 100, 1500) * 1024 * 1024,
+            preset_export=preset,
+            threads_ffmpeg=entier("FFMPEG_THREADS", 1, 1, 2),
+            autoriser_export_1080=_env("AUTORISER_EXPORT_1080", "false").lower() in {"1", "true", "oui"},
         )
 
 
@@ -131,7 +177,24 @@ DOSSIER_TRAVAIL.mkdir(exist_ok=True)
 
 TAILLE_MAX_TELECHARGEMENT = 100 * 1024 * 1024  # évite de remplir le disque avec un lien distant
 TAILLE_MAX_PAGE_SOURCE = 2 * 1024 * 1024
-DUREE_MAX_APERCU_IA = 90  # analyse visuelle bornée pour rester compatible avec 512 Mo de RAM
+DUREE_MAX_APERCU_IA = CONFIG.duree_max_source  # compatibilité des anciens helpers
+
+
+def _configuration_montage() -> ConfigurationMontage:
+    return ConfigurationMontage(
+        dossier_travail=DOSSIER_TRAVAIL,
+        dossier_videos=DOSSIER_VIDEOS,
+        duree_max_source=float(CONFIG.duree_max_source),
+        delai_ffmpeg=float(CONFIG.delai_ffmpeg),
+        delai_gemini=float(CONFIG.delai_gemini),
+        delai_job=float(CONFIG.delai_job),
+        budget_disque_sources=CONFIG.budget_disque_sources,
+        analyses_concurrentes=CONFIG.analyses_concurrentes,
+        preset=CONFIG.preset_export,
+        threads_ffmpeg=CONFIG.threads_ffmpeg,
+        autoriser_1080=CONFIG.autoriser_export_1080,
+    )
+
 
 FONT_CANDIDATS = [
     RACINE / "static/fonts/Sous-titres.ttf",  # ajoutez votre propre police ici pour un rendu garanti
@@ -286,21 +349,38 @@ async def _telecharger_fichier(session: aiohttp.ClientSession, url: str, destina
             destination.unlink(missing_ok=True)
             raise
 
-    await _avec_retry(_appel, etape=f"téléchargement {destination.name}")
+    try:
+        await asyncio.wait_for(
+            _avec_retry(_appel, etape=f"téléchargement {destination.name}"),
+            timeout=CONFIG.delai_telechargement,
+        )
+    except asyncio.TimeoutError as exc:
+        destination.unlink(missing_ok=True)
+        raise ErreurApp(
+            f"Téléchargement de {destination.name} interrompu après "
+            f"{CONFIG.delai_telechargement} secondes."
+        ) from exc
 
 
 async def _resoudre_video_tiktok(session: aiohttp.ClientSession, url: str) -> str:
-    """Résout un lien TikTok vers son fichier vidéo direct (sans watermark), via TikWM."""
-    url = _valider_url(url, "Lien TikTok")
+    """Résout un lien TikTok nettoyé vers son fichier direct, avec timeout borné."""
+    try:
+        url = normaliser_lien_tiktok(url)
+    except ErreurMontage as exc:
+        raise ErreurApp(str(exc)) from exc
 
     async def _appel():
-        async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}) as resp:
-            if resp.status != 200:
-                raise ErreurApp(f"TikWM inaccessible ({resp.status})")
-            try:
-                donnees = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
-                raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        try:
+            async with asyncio.timeout(CONFIG.delai_tikwm):
+                async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}) as resp:
+                    if resp.status != 200:
+                        raise ErreurApp(f"TikWM inaccessible ({resp.status})")
+                    try:
+                        donnees = await resp.json(content_type=None)
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                        raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        except asyncio.TimeoutError as exc:
+            raise ErreurApp(f"TikWM n’a pas répondu sous {CONFIG.delai_tikwm} secondes.") from exc
         if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
             message = donnees.get("msg", "réponse invalide") if isinstance(donnees, dict) else "réponse invalide"
             raise ErreurApp(f"TikWM : {message}")
@@ -388,6 +468,9 @@ async def extraire_source(url: str) -> str:
 # GEMINI (rotation multi-clés)
 # ======================================================================================
 
+# Même si plusieurs jobs sont en file, jamais plus de deux requêtes Gemini lourdes.
+GEMINI_SEMAPHORE = asyncio.Semaphore(2)
+
 PROMPT_SCRIPT = (
     "Tu es un scénariste spécialisé dans les vidéos courtes virales (TikTok/Reels/Shorts). "
     "On te donne un contenu source (transcription ou article). Réponds UNIQUEMENT avec un JSON "
@@ -423,15 +506,21 @@ async def _appel_gemini_brut(
             payload["generationConfig"]["responseMimeType"] = "application/json"
 
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
-                async def _appel():
-                    async with session.post(url, headers=headers, json=payload) as resp:
-                        if resp.status != 200:
-                            texte = await resp.text()
-                            raise ErreurApp(f"Gemini a répondu {resp.status} : {texte[:200]}")
-                        return await resp.json()
+            async with GEMINI_SEMAPHORE:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=CONFIG.delai_gemini, connect=15)
+                ) as session:
+                    async def _appel():
+                        async with session.post(url, headers=headers, json=payload) as resp:
+                            if resp.status != 200:
+                                texte = await resp.text()
+                                raise ErreurApp(f"Gemini a répondu {resp.status} : {texte[:200]}")
+                            return await resp.json()
 
-                data = await _avec_retry(_appel, tentatives=2, etape="appel Gemini")
+                    data = await asyncio.wait_for(
+                        _avec_retry(_appel, tentatives=2, etape="appel Gemini"),
+                        timeout=CONFIG.delai_gemini,
+                    )
             return data["candidates"][0]["content"]["parts"][0]["text"]
         except Exception as exc:  # noqa: BLE001
             derniere = exc
@@ -494,10 +583,10 @@ async def _transcrire_video(video_path: Path) -> str:
         "ffmpeg", "-y", "-i", str(video_path), "-vn", "-acodec", "libmp3lame",
         "-ac", "1", "-ar", "16000", "-b:a", "48k", str(audio_path),
     ]
-    proc = await asyncio.create_subprocess_exec(*commande, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise ErreurApp(f"Extraction audio échouée : {stderr.decode(errors='ignore')[-200:]}")
+    await executer_commande(
+        commande, etape="extraction audio", timeout=CONFIG.delai_ffmpeg,
+        sortie_attendue=audio_path,
+    )
 
     if not audio_path.exists() or audio_path.stat().st_size > 12 * 1024 * 1024:
         raise ErreurApp("Audio trop volumineux pour la transcription.")
@@ -627,11 +716,10 @@ async def _creer_apercu_video(video_path: Path) -> Path:
         "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
         "-maxrate", "500k", "-bufsize", "1000k", "-pix_fmt", "yuv420p", str(apercu),
     ]
-    proc = await asyncio.create_subprocess_exec(*commande, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        apercu.unlink(missing_ok=True)
-        raise ErreurApp(f"Préparation de l'aperçu échouée : {stderr.decode(errors='ignore')[-200:]}")
+    await executer_commande(
+        commande, etape="préparation de l’aperçu historique",
+        timeout=CONFIG.delai_ffmpeg, sortie_attendue=apercu,
+    )
     return apercu
 
 
@@ -725,26 +813,26 @@ def _decouper_en_cues(hook: str, corps: str, mots_par_seconde: float = 2.3, mots
 async def _normaliser_clip(source: Path, destination: Path, duree: float, debut: float = 0.0) -> None:
     commande = [
         "ffmpeg", "-y", "-ss", str(debut), "-i", str(source), "-t", str(duree),
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30",
-        "-an", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", str(destination),
+        "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=24",
+        "-an", "-c:v", "libx264", "-preset", CONFIG.preset_export,
+        "-pix_fmt", "yuv420p", "-threads", str(CONFIG.threads_ffmpeg), str(destination),
     ]
-    proc = await asyncio.create_subprocess_exec(*commande, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise ErreurApp(f"Normalisation vidéo échouée : {stderr.decode(errors='ignore')[-200:]}")
+    await executer_commande(
+        commande, etape="normalisation vidéo", timeout=CONFIG.delai_ffmpeg,
+        sortie_attendue=destination,
+    )
 
 
 async def _assembler_clips(normalises: list[Path], dossier: Path) -> Path:
     liste = dossier / "liste.txt"
     liste.write_text("".join(f"file '{c.resolve()}'\n" for c in normalises), encoding="utf-8")
     assemble = dossier / "assemble.mp4"
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(liste), "-c", "copy", str(assemble),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    await executer_commande(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(liste),
+         "-c", "copy", str(assemble)],
+        etape="assemblage vidéo", timeout=CONFIG.delai_ffmpeg,
+        sortie_attendue=assemble,
     )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise ErreurApp(f"Assemblage vidéo échoué : {stderr.decode(errors='ignore')[-200:]}")
     return assemble
 
 
@@ -768,15 +856,14 @@ async def _incruster_sous_titres(assemble: Path, cues: list[dict], style: str, d
         )
 
     sortie = DOSSIER_VIDEOS / f"{uuid.uuid4().hex}.mp4"
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", str(assemble),
-        "-vf", ",".join(filtres),
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-an", str(sortie),
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    await executer_commande(
+        ["ffmpeg", "-y", "-i", str(assemble), "-vf", ",".join(filtres),
+         "-c:v", "libx264", "-preset", CONFIG.preset_export, "-pix_fmt", "yuv420p",
+         "-r", "24", "-threads", str(CONFIG.threads_ffmpeg), "-movflags", "+faststart",
+         "-an", str(sortie)],
+        etape="incrustation des sous-titres", timeout=CONFIG.delai_ffmpeg,
+        sortie_attendue=sortie,
     )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise ErreurApp(f"Incrustation des sous-titres échouée : {stderr.decode(errors='ignore')[-200:]}")
     return sortie
 
 
@@ -976,18 +1063,24 @@ async def _jeton_google_valide(integration: dict[str, Any]) -> str:
 
 
 async def _sauvegarder_sur_drive(session_id: str, chemin: Path) -> dict[str, str]:
+    """Envoie le fichier depuis le disque : aucun ``read_bytes`` de la vidéo en RAM."""
     integration = SESSIONS_INTEGRATIONS.get(session_id, {}).get("google_drive")
     if not integration:
         raise ErreurApp("Connecte Google Drive avant de sauvegarder la vidéo.")
+    chemin = chemin.resolve()
+    if chemin.parent != DOSSIER_VIDEOS.resolve() or not chemin.is_file():
+        raise ErreurApp("Fichier vidéo Drive invalide ou expiré.")
     jeton = await _jeton_google_valide(integration)
     metadata = {"name": chemin.name, "description": "Créée avec ς੮ ς८Րɿƿ੮"}
-    formulaire = aiohttp.FormData()
-    formulaire.add_field("metadata", json.dumps(metadata), content_type="application/json; charset=UTF-8")
-    formulaire.add_field("file", chemin.read_bytes(), filename=chemin.name, content_type="video/mp4")
-    donnees = await _requete_json(
-        "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink",
-        headers={"Authorization": f"Bearer {jeton}"}, data=formulaire,
-    )
+    with chemin.open("rb") as flux:
+        formulaire = aiohttp.FormData()
+        formulaire.add_field("metadata", json.dumps(metadata), content_type="application/json; charset=UTF-8")
+        formulaire.add_field("file", flux, filename=chemin.name, content_type="video/mp4")
+        donnees = await _requete_json(
+            "POST", "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink",
+            headers={"Authorization": f"Bearer {jeton}"}, data=formulaire,
+            timeout=aiohttp.ClientTimeout(total=120, connect=15, sock_read=100),
+        )
     return {"id": donnees["id"], "name": donnees.get("name", chemin.name),
             "url": donnees.get("webViewLink", f"https://drive.google.com/open?id={donnees['id']}")}
 
@@ -1003,10 +1096,12 @@ app.mount("/videos", StaticFiles(directory=str(DOSSIER_VIDEOS)), name="videos")
 
 class RequeteAnalyser(BaseModel):
     lien: str = Field(min_length=1, max_length=2048)
+    idempotency_key: str = Field(default="", max_length=80)
 
 
 class RequeteReference(BaseModel):
     lien: str = Field(min_length=1, max_length=2048)
+    idempotency_key: str = Field(default="", max_length=80)
 
 
 class RequeteVideo(BaseModel):
@@ -1014,36 +1109,95 @@ class RequeteVideo(BaseModel):
     corps: str = Field(min_length=1, max_length=12000)
     mot_cle_broll: str = Field(min_length=1, max_length=200)
     style: str = Field(default="classique", max_length=32)
+    idempotency_key: str = Field(default="", max_length=80)
 
 
 class RequeteMontage(BaseModel):
     hook: str = Field(min_length=1, max_length=4000)
     corps: str = Field(min_length=1, max_length=12000)
     liens_videos: list[str] = Field(min_length=1, max_length=20)
+    lien_reference_style: str = Field(default="", max_length=2048)
     style: str = Field(default="classique", max_length=32)
+    resolution: str = Field(default="720", pattern="^(720|1080)$")
+    estimated_seconds: int = Field(default=0, ge=0, le=7200)
+    accepter_risque: bool = False
+    idempotency_key: str = Field(default="", max_length=80)
+
+
+class RequeteDiagnosticMontage(BaseModel):
+    liens_videos: list[str] = Field(min_length=1, max_length=20)
+    lien_reference_style: str = Field(default="", max_length=2048)
 
 
 class RequeteSauvegardeDrive(BaseModel):
     url: str = Field(min_length=1, max_length=500)
 
 
-# Render limite la durée de vie des requêtes HTTP. Les générations vidéo sont donc
-# lancées en arrière-plan et l'interface suit leur état avec un petit polling.
+# Une seule génération lourde à la fois sur Render Free. Les analyses internes sont
+# elles-mêmes limitées à deux par le pipeline, une par défaut avec 512 Mo de RAM.
 JOBS: dict[str, dict[str, Any]] = {}
 JOB_TASKS: dict[str, asyncio.Task] = {}
+JOB_INDEX: dict[str, str] = {}
 JOB_SEMAPHORE = asyncio.Semaphore(1)
-DUREE_VIE_JOB = 60 * 60
+DUREE_VIE_JOB = 6 * 60 * 60
+
+
+class ContexteJob:
+    def __init__(self, job_id: str, job: dict[str, Any], delai: Optional[float] = None) -> None:
+        self.job_id = job_id
+        self.job = job
+        self.debut = time.monotonic()
+        self.delai = float(delai or CONFIG.delai_job)
+        self.derniere_etape = "initialisation"
+
+    def update(self, **valeurs: Any) -> None:
+        detail = str(valeurs.get("detail", self.job.get("detail", "")))
+        statut = str(valeurs.get("statut", valeurs.get("status", self.job.get("status", "running"))))
+        valeurs.pop("statut", None)
+        valeurs["status"] = statut
+        valeurs["updated_at"] = time.monotonic()
+        self.job.update(valeurs)
+        self.derniere_etape = detail or self.derniere_etape
+        logger.info("[%s] %s %s%% — %s", self.job_id, statut, self.job.get("progress", 0), detail)
+
+    def annule(self) -> bool:
+        return bool(self.job.get("cancel_requested"))
+
+    def restant(self) -> float:
+        return self.delai - (time.monotonic() - self.debut)
+
+    def rapporteur(self) -> Rapporteur:
+        return Rapporteur(self.update, self.annule, self.restant)
+
 
 
 def _purger_jobs() -> None:
+    """Expire états, rendus et dossiers orphelins sans toucher aux travaux actifs."""
     maintenant = time.monotonic()
     expires = [
-        job_id for job_id, job in JOBS.items()
-        if job.get("status") in {"completed", "failed"} and maintenant - job.get("updated_at", maintenant) > DUREE_VIE_JOB
+        identifiant for identifiant, job in JOBS.items()
+        if job.get("status") in {"completed", "failed", "cancelled"}
+        and maintenant - float(job.get("updated_at", maintenant)) > DUREE_VIE_JOB
     ]
-    for job_id in expires:
-        JOBS.pop(job_id, None)
-        JOB_TASKS.pop(job_id, None)
+    for identifiant in expires:
+        job = JOBS.pop(identifiant, {})
+        JOB_TASKS.pop(identifiant, None)
+        empreinte = job.get("fingerprint")
+        if empreinte and JOB_INDEX.get(empreinte) == identifiant:
+            JOB_INDEX.pop(empreinte, None)
+        url = str(job.get("url", ""))
+        nom = Path(urlparse(url).path).name
+        if urlparse(url).path == f"/videos/{nom}" and re.fullmatch(r"[a-f0-9]{32}\.mp4", nom):
+            (DOSSIER_VIDEOS / nom).unlink(missing_ok=True)
+
+    seuil = time.time() - max(DUREE_VIE_JOB, CONFIG.delai_job * 2)
+    for dossier in DOSSIER_TRAVAIL.iterdir():
+        try:
+            if dossier.is_dir() and dossier.stat().st_mtime < seuil:
+                shutil.rmtree(dossier, ignore_errors=True)
+        except OSError:
+            logger.warning("Nettoyage impossible pour %s", dossier)
+
 
 
 def _valider_requete_video(requete: RequeteVideo) -> None:
@@ -1053,73 +1207,200 @@ def _valider_requete_video(requete: RequeteVideo) -> None:
         raise ErreurApp("Le thème visuel est requis.")
 
 
+
 def _valider_requete_montage(requete: RequeteMontage) -> list[str]:
     if not requete.hook.strip() or not requete.corps.strip():
-        raise ErreurApp("Hook et corps du script requis.")
-    liens = [lien.strip() for lien in requete.liens_videos if lien.strip()]
-    if not liens:
-        raise ErreurApp("Ajoute au moins un lien de vidéo source.")
-    return [_valider_url(lien, "Lien vidéo") for lien in liens]
+        raise ErreurApp("Accroche et corps du script requis.")
+    propres, erreurs, _ = normaliser_liens_tiktok(requete.liens_videos)
+    if not propres:
+        detail = erreurs[0]["error"] if erreurs else "ajoute au moins un lien"
+        raise ErreurApp(f"Aucune vidéo source valide : {detail}")
+    if len(propres) > 20:
+        raise ErreurApp("20 liens TikTok uniques maximum.")
+    if requete.lien_reference_style.strip():
+        try:
+            normaliser_lien_tiktok(requete.lien_reference_style)
+        except ErreurMontage as exc:
+            raise ErreurApp(f"Vidéo de référence invalide : {exc}") from exc
+    if requete.resolution == "1080" and not CONFIG.autoriser_export_1080:
+        raise ErreurApp("L’export 1080 × 1920 est désactivé sur cette instance.")
+    return propres
 
 
-async def _produire_video(requete: RequeteVideo) -> dict[str, str]:
+async def _produire_video(requete: RequeteVideo, contexte: Optional[ContexteJob] = None) -> dict[str, Any]:
     _valider_requete_video(requete)
+    if contexte:
+        contexte.update(statut="selecting", progress=8, detail="Recherche du B-roll vertical")
     cues = _decouper_en_cues(requete.hook, requete.corps)
     duree_totale = cues[-1]["fin"] if cues else float(CONFIG.duree_cible)
     liens_broll = await chercher_broll(requete.mot_cle_broll, duree_totale)
+    if contexte:
+        contexte.update(statut="editing", progress=45, detail="Téléchargement et montage du B-roll")
     chemin = await construire_video(liens_broll, cues, duree_totale, requete.style)
     await envoyer_script_et_video(requete.hook, requete.corps, chemin)
-    return {"url": f"/videos/{chemin.name}"}
+    return {"url": f"/videos/{chemin.name}", "path": chemin}
 
 
-async def _produire_montage(requete: RequeteMontage) -> dict[str, str]:
-    liens = _valider_requete_montage(requete)
-    chemin = await construire_montage(liens, requete.hook, requete.corps, requete.style)
-    await envoyer_script_et_video(requete.hook, requete.corps, chemin)
-    return {"url": f"/videos/{chemin.name}"}
+async def _produire_montage(
+    requete: RequeteMontage, contexte: ContexteJob, session_id: str = ""
+) -> dict[str, Any]:
+    _valider_requete_montage(requete)
+    resultat = await construire_montage_professionnel(
+        liens=requete.liens_videos,
+        lien_reference=requete.lien_reference_style.strip(),
+        hook=requete.hook.strip(),
+        corps=requete.corps.strip(),
+        resolution=requete.resolution,
+        style_sous_titres=requete.style,
+        config=_configuration_montage(),
+        rapporteur=contexte.rapporteur(),
+        resolveur=_resoudre_video_tiktok,
+        telechargeur=_telecharger_fichier,
+        appel_gemini=_appel_gemini_brut,
+    )
+    await envoyer_script_et_video(requete.hook, requete.corps, resultat["path"])
+    return resultat
 
 
-async def _produire_reference(requete: RequeteReference) -> dict[str, str]:
+async def _produire_reference(requete: RequeteReference, contexte: Optional[ContexteJob] = None) -> dict[str, Any]:
     if not requete.lien.strip():
         raise ErreurApp("Lien vide.")
+    if contexte:
+        contexte.update(statut="analysing", progress=15, detail="Transcription de la référence")
     return await generer_script_depuis_reference(requete.lien.strip())
 
 
-async def _produire_analyser(requete: RequeteAnalyser) -> dict[str, str]:
+async def _produire_analyser(requete: RequeteAnalyser, contexte: Optional[ContexteJob] = None) -> dict[str, Any]:
     if not requete.lien.strip():
         raise ErreurApp("Lien vide.")
+    if contexte:
+        contexte.update(statut="analysing", progress=15, detail="Lecture et analyse du contenu")
     source_texte = await extraire_source(requete.lien.strip())
     return await generer_script(source_texte)
 
 
-async def _executer_job(job_id: str, fabrique) -> None:
+async def _sauvegarde_auto_drive(
+    contexte: ContexteJob, session_id: str, chemin: Path
+) -> dict[str, Any]:
+    if not SESSIONS_INTEGRATIONS.get(session_id, {}).get("google_drive"):
+        return {"status": "not_connected", "message": "Google Drive n’est pas connecté."}
+    contexte.update(
+        statut="uploading", progress=97, detail="Sauvegarde automatique sur Google Drive",
+        drive={"status": "uploading", "message": "Sauvegarde en cours…"},
+    )
+    try:
+        donnees = await _sauvegarder_sur_drive(session_id, chemin)
+        return {"status": "completed", **donnees, "message": "Sauvegarde Drive réussie."}
+    except Exception as exc:  # la vidéo locale reste disponible
+        logger.exception("[%s] sauvegarde Drive échouée", contexte.job_id)
+        return {"status": "failed", "error": str(exc), "message": "La sauvegarde Drive a échoué."}
+
+
+async def _executer_job(job_id: str, fabrique, session_id: str) -> None:
     job = JOBS[job_id]
+    contexte = ContexteJob(job_id, job)
     try:
         async with JOB_SEMAPHORE:
-            job["status"] = "running"
-            job["updated_at"] = time.monotonic()
-            resultat = await fabrique()
-        job.update(resultat, status="completed", updated_at=time.monotonic())
-    except ErreurApp as exc:
-        job.update(status="failed", error=str(exc), updated_at=time.monotonic())
+            contexte.debut = time.monotonic()  # la limite globale commence après la file d'attente
+            contexte.update(statut="validating", progress=1, detail="Démarrage et validation")
+            resultat = await asyncio.wait_for(fabrique(contexte), timeout=CONFIG.delai_job)
+            chemin = resultat.pop("path", None)
+            if chemin and not isinstance(chemin, Path):
+                chemin = Path(chemin)
+            if chemin:
+                # Drive fait partie de la limite globale, même si son échec ne détruit pas le rendu.
+                resultat["drive"] = await asyncio.wait_for(
+                    _sauvegarde_auto_drive(contexte, session_id, chemin),
+                    timeout=max(0.2, contexte.restant()),
+                )
+            contexte.update(**resultat, statut="completed", progress=100, detail="Travail terminé")
+    except TravailAnnule as exc:
+        contexte.update(statut="cancelled", detail=str(exc), error=str(exc))
+    except asyncio.CancelledError:
+        contexte.update(
+            statut="cancelled", detail="Travail annulé à la demande de l’utilisateur.",
+            error="Travail annulé à la demande de l’utilisateur.",
+        )
+    except asyncio.TimeoutError:
+        contexte.update(
+            statut="failed",
+            detail=f"Limite globale atteinte pendant « {contexte.derniere_etape} »",
+            error=(
+                f"Le travail a dépassé la limite globale de {CONFIG.delai_job // 60} min "
+                f"{CONFIG.delai_job % 60:02d} pendant « {contexte.derniere_etape} ». "
+                "Réduis le nombre ou la durée des sources."
+            ),
+        )
+    except (ErreurApp, ErreurMontage) as exc:
+        contexte.update(statut="failed", detail="Travail interrompu", error=str(exc))
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Job %s échoué.", job_id)
-        job.update(status="failed", error=f"Erreur inattendue : {exc}", updated_at=time.monotonic())
+        logger.exception("[%s] erreur inattendue", job_id)
+        contexte.update(
+            statut="failed", detail="Erreur serveur détaillée",
+            error=f"Erreur inattendue pendant « {contexte.derniere_etape} » : {exc}",
+        )
     finally:
         JOB_TASKS.pop(job_id, None)
 
 
-def _demarrer_job(fabrique) -> str:
+
+def _empreinte_job(type_job: str, donnees: dict[str, Any], session_id: str) -> str:
+    copie = {k: v for k, v in donnees.items() if k != "idempotency_key"}
+    cle_client = str(donnees.get("idempotency_key") or "")
+    materiau = json.dumps(
+        {"type": type_job, "session": session_id, "client": cle_client, "payload": copie},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return hashlib.sha256(materiau.encode("utf-8")).hexdigest()
+
+
+
+def _demarrer_job(type_job: str, modele: BaseModel, session_id: str, fabrique) -> tuple[str, bool]:
     _purger_jobs()
+    donnees = modele.model_dump()
+    empreinte = _empreinte_job(type_job, donnees, session_id)
+    existant = JOB_INDEX.get(empreinte)
+    if existant and existant in JOBS and JOBS[existant].get("status") not in {"failed", "cancelled"}:
+        logger.info("Job idempotent réutilisé : %s", existant)
+        return existant, True
+
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {"job_id": job_id, "status": "queued", "created_at": time.monotonic(), "updated_at": time.monotonic()}
-    JOB_TASKS[job_id] = asyncio.create_task(_executer_job(job_id, fabrique))
-    return job_id
+    maintenant = time.monotonic()
+    JOBS[job_id] = {
+        "job_id": job_id, "type": type_job, "owner": session_id, "status": "queued",
+        "progress": 0, "detail": "En attente sur Render", "created_at": maintenant,
+        "updated_at": maintenant, "source_errors": [], "sources": [],
+        "drive": {"status": "pending"}, "fingerprint": empreinte,
+    }
+    JOB_INDEX[empreinte] = job_id
+    JOB_TASKS[job_id] = asyncio.create_task(_executer_job(job_id, fabrique, session_id))
+    return job_id, False
+
+
+
+def _reponse_nouveau_job(
+    request: Request, session_id: str, nouveau_cookie: bool, job_id: str, reused: bool
+) -> JSONResponse:
+    response = JSONResponse(
+        {"job_id": job_id, "status": JOBS[job_id]["status"], "reused": reused}, status_code=202
+    )
+    if nouveau_cookie:
+        _poser_cookie(response, session_id, request)
+    return response
+
+
+
+def _job_autorise(job_id: str, request: Request) -> dict[str, Any]:
+    _purger_jobs()
+    job = JOBS.get(job_id)
+    session_id = request.cookies.get("creator_session", "")
+    if not job or not session_id or job.get("owner") != session_id:
+        raise HTTPException(404, "Travail introuvable ou expiré. Relance un diagnostic.")
+    return job
 
 
 @app.get("/")
 async def racine() -> FileResponse:
-    # Empêche le CDN et le navigateur de conserver l'ancien tableau de bord après un déploiement.
     return FileResponse(
         RACINE / "static" / "index.html",
         headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
@@ -1128,14 +1409,29 @@ async def racine() -> FileResponse:
 
 @app.get("/api/sante")
 async def sante() -> dict[str, Any]:
-    """Endpoint léger pour les sondes de déploiement et le diagnostic."""
     return {
         "ok": True,
         "gemini_configure": bool(CONFIG.gemini_api_keys),
         "pexels_configure": bool(CONFIG.pexels_api_key),
         "ffmpeg_installe": shutil.which("ffmpeg") is not None,
+        "ffprobe_installe": shutil.which("ffprobe") is not None,
         "tiktok_configure": bool(CONFIG.tiktok_client_key and CONFIG.tiktok_client_secret),
         "google_drive_configure": bool(CONFIG.google_client_id and CONFIG.google_client_secret),
+        "job_timeout_seconds": CONFIG.delai_job,
+        "max_source_seconds": CONFIG.duree_max_source,
+    }
+
+
+@app.get("/api/config")
+async def configuration_publique() -> dict[str, Any]:
+    return {
+        "max_links": 20,
+        "max_source_seconds": CONFIG.duree_max_source,
+        "job_timeout_seconds": CONFIG.delai_job,
+        "analysis_fps": 6,
+        "analysis_resolution": "360p",
+        "default_export": "720x1280@24",
+        "allow_1080": CONFIG.autoriser_export_1080,
     }
 
 
@@ -1163,7 +1459,7 @@ async def statut_integrations(request: Request):
 @app.get("/api/oauth/tiktok/start")
 async def connecter_tiktok(request: Request):
     if not (CONFIG.tiktok_client_key and CONFIG.tiktok_client_secret):
-        raise HTTPException(503, "Ajoute TIKTOK_CLIENT_KEY et TIKTOK_CLIENT_SECRET dans Render.")
+        raise HTTPException(503, "TikTok OAuth n’est pas configuré : ajoute les variables serveur requises.")
     session_id, nouveau = _session_id(request)
     etat = _nouvel_etat_oauth(session_id, "tiktok")
     callback = f"{_url_publique(request)}/api/oauth/tiktok/callback"
@@ -1210,7 +1506,7 @@ async def callback_tiktok(request: Request, code: str = "", state: str = "", err
 @app.get("/api/oauth/google/start")
 async def connecter_google(request: Request):
     if not (CONFIG.google_client_id and CONFIG.google_client_secret):
-        raise HTTPException(503, "Ajoute GOOGLE_CLIENT_ID et GOOGLE_CLIENT_SECRET dans Render.")
+        raise HTTPException(503, "Google Drive OAuth n’est pas configuré : ajoute les variables serveur requises.")
     session_id, nouveau = _session_id(request)
     etat = _nouvel_etat_oauth(session_id, "google")
     callback = f"{_url_publique(request)}/api/oauth/google/callback"
@@ -1282,97 +1578,143 @@ async def sauvegarder_drive(requete: RequeteSauvegardeDrive, request: Request):
 
 
 @app.get("/api/styles")
-async def styles() -> dict:
+async def styles() -> dict[str, Any]:
     return {"styles": list(STYLES_SOUS_TITRES.keys())}
 
 
+@app.post("/api/montage/diagnostic")
+async def diagnostic_montage(requete: RequeteDiagnosticMontage) -> dict[str, Any]:
+    try:
+        return await diagnostiquer_montage(
+            requete.liens_videos, requete.lien_reference_style,
+            _configuration_montage(), _resoudre_video_tiktok,
+        )
+    except ErreurMontage as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(504, "Le diagnostic a dépassé son délai. Réessaie avec moins de sources.") from exc
+
+
 @app.post("/api/jobs/analyser", status_code=202)
-async def lancer_job_analyser(requete: RequeteAnalyser) -> dict[str, str]:
+async def lancer_job_analyser(requete: RequeteAnalyser, request: Request):
     if not requete.lien.strip():
         raise HTTPException(400, "Lien vide.")
-    return {"job_id": _demarrer_job(lambda: _produire_analyser(requete)), "status": "queued"}
+    session_id, nouveau = _session_id(request)
+    job_id, reused = _demarrer_job(
+        "analyser", requete, session_id, lambda contexte: _produire_analyser(requete, contexte)
+    )
+    return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 
 
 @app.post("/api/jobs/video", status_code=202)
-async def lancer_job_video(requete: RequeteVideo) -> dict[str, str]:
+async def lancer_job_video(requete: RequeteVideo, request: Request):
     try:
         _valider_requete_video(requete)
     except ErreurApp as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"job_id": _demarrer_job(lambda: _produire_video(requete)), "status": "queued"}
+    session_id, nouveau = _session_id(request)
+    job_id, reused = _demarrer_job(
+        "video", requete, session_id, lambda contexte: _produire_video(requete, contexte)
+    )
+    return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 
 
 @app.post("/api/jobs/montage", status_code=202)
-async def lancer_job_montage(requete: RequeteMontage) -> dict[str, str]:
+async def lancer_job_montage(requete: RequeteMontage, request: Request):
     try:
         _valider_requete_montage(requete)
-    except ErreurApp as exc:
+    except (ErreurApp, ErreurMontage) as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"job_id": _demarrer_job(lambda: _produire_montage(requete)), "status": "queued"}
+    if requete.estimated_seconds > 540 and not requete.accepter_risque:
+        raise HTTPException(
+            409,
+            "Le diagnostic prévoit plus de 9 minutes. Confirme le risque ou réduis les sources avant le lancement.",
+        )
+    session_id, nouveau = _session_id(request)
+    job_id, reused = _demarrer_job(
+        "montage", requete, session_id,
+        lambda contexte: _produire_montage(requete, contexte, session_id),
+    )
+    return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 
 
 @app.post("/api/jobs/reference", status_code=202)
-async def lancer_job_reference(requete: RequeteReference) -> dict[str, str]:
+async def lancer_job_reference(requete: RequeteReference, request: Request):
     if not requete.lien.strip():
         raise HTTPException(400, "Lien vide.")
-    return {"job_id": _demarrer_job(lambda: _produire_reference(requete)), "status": "queued"}
+    session_id, nouveau = _session_id(request)
+    job_id, reused = _demarrer_job(
+        "reference", requete, session_id, lambda contexte: _produire_reference(requete, contexte)
+    )
+    return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 
 
 @app.get("/api/jobs/{job_id}")
-async def etat_job(job_id: str) -> dict[str, Any]:
-    _purger_jobs()
-    job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job introuvable ou expiré.")
-    return {key: value for key, value in job.items() if key not in {"created_at", "updated_at"}}
+async def etat_job(job_id: str, request: Request) -> dict[str, Any]:
+    if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+        raise HTTPException(404, "Identifiant de travail invalide.")
+    job = _job_autorise(job_id, request)
+    return {
+        key: value for key, value in job.items()
+        if key not in {"created_at", "updated_at", "owner", "fingerprint", "cancel_requested"}
+    }
 
 
+@app.post("/api/jobs/{job_id}/cancel")
+async def annuler_job(job_id: str, request: Request) -> dict[str, Any]:
+    job = _job_autorise(job_id, request)
+    if job.get("status") in {"completed", "failed", "cancelled"}:
+        return {"ok": True, "status": job["status"], "message": "Ce travail est déjà terminé."}
+    job["cancel_requested"] = True
+    tache = JOB_TASKS.get(job_id)
+    if tache:
+        tache.cancel()
+    return {"ok": True, "status": "cancelling", "message": "Annulation demandée."}
+
+
+# Endpoints synchrones historiques conservés pour compatibilité. Le tableau de bord utilise
+# les jobs afin de survivre à une actualisation et aux réponses temporaires 502/503 de Render.
 @app.post("/api/analyser")
-async def analyser(requete: RequeteAnalyser) -> dict:
-    if not requete.lien.strip():
-        raise HTTPException(400, "Lien vide.")
+async def analyser(requete: RequeteAnalyser) -> dict[str, Any]:
     try:
-        source_texte = await extraire_source(requete.lien.strip())
-        script = await generer_script(source_texte)
-    except ErreurApp as exc:
+        return await _produire_analyser(requete)
+    except (ErreurApp, ErreurMontage) as exc:
         raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Erreur inattendue dans /api/analyser.")
-        raise HTTPException(500, f"Erreur inattendue : {exc}") from exc
-    return script
 
 
 @app.post("/api/reference")
-async def reference(requete: RequeteReference) -> dict:
-    """Mode « vidéo de référence » : reprend le script d'une vidéo TikTok existante, hook préservé."""
+async def reference(requete: RequeteReference) -> dict[str, Any]:
     try:
         return await _produire_reference(requete)
-    except ErreurApp as exc:
+    except (ErreurApp, ErreurMontage) as exc:
         raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Erreur inattendue dans /api/reference.")
-        raise HTTPException(500, f"Erreur inattendue : {exc}") from exc
 
 
 @app.post("/api/video")
-async def video(requete: RequeteVideo) -> dict:
-    """Mode « thème libre » : B-roll cherché sur Pexels."""
+async def video(requete: RequeteVideo) -> dict[str, Any]:
     try:
-        return await _produire_video(requete)
-    except ErreurApp as exc:
+        resultat = await _produire_video(requete)
+        resultat.pop("path", None)
+        return resultat
+    except (ErreurApp, ErreurMontage) as exc:
         raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Erreur inattendue dans /api/video.")
-        raise HTTPException(500, f"Erreur inattendue : {exc}") from exc
 
 
 @app.post("/api/montage")
-async def montage(requete: RequeteMontage) -> dict:
-    """Mode « montage multi-vidéos » : l'IA repère les bons passages dans TES vidéos."""
+async def montage(requete: RequeteMontage, request: Request) -> dict[str, Any]:
+    session_id, _ = _session_id(request)
+    temporaire = {
+        "status": "validating", "progress": 0, "detail": "Démarrage",
+        "created_at": time.monotonic(), "updated_at": time.monotonic(),
+    }
+    contexte = ContexteJob("legacy-" + uuid.uuid4().hex[:8], temporaire)
     try:
-        return await _produire_montage(requete)
-    except ErreurApp as exc:
+        resultat = await asyncio.wait_for(
+            _produire_montage(requete, contexte, session_id), timeout=CONFIG.delai_job
+        )
+        resultat.pop("path", None)
+        return resultat
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(504, f"Limite globale dépassée pendant « {contexte.derniere_etape} ».") from exc
+    except (ErreurApp, ErreurMontage) as exc:
         raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Erreur inattendue dans /api/montage.")
-        raise HTTPException(500, f"Erreur inattendue : {exc}") from exc
