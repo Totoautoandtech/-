@@ -136,3 +136,52 @@ def test_plan_accroche_rapide_puis_plans_cinq_secondes():
     assert all(plan[i]["source"] != plan[i - 1]["source"] for i in range(1, min(3, len(plan))))
     assert all(p["transition_duree"] <= 0.4 for p in plan)
     assert len({p["transition"] for p in plan[1:]}) > 1
+
+
+def test_intensite_transitions_0_ne_garde_que_les_coupes():
+    segments = montage.creer_segments_script(
+        "Voici le secret incroyable",
+        "La première scène explique le contexte. La seconde montre le résultat final."
+    )
+    analyses, metadata = {}, {}
+    for index in range(3):
+        nom = f"source_{index}"
+        metadata[nom] = {"duration": 30.0}
+        analyses[nom] = [{
+            "debut": 1.0, "fin": 8.0, "sujet": "test", "action_mouvement": "dynamique",
+            "qualite": "bonne", "nettete": 0.9, "cadrage": "vertical", "texte_visible": False,
+            "watermark": False,
+            "pertinence_script": [{"id": s["id"], "score": 0.9} for s in segments],
+            "rythme": "dynamique", "transition_recommandee": "fade", "score_pertinence": 0.9,
+        }]
+
+    assert montage.borner_intensite_transitions(-3) == 0
+    assert montage.borner_intensite_transitions("2") == 2
+    assert montage.borner_intensite_transitions(9) == 3
+    assert montage.borner_intensite_transitions(None) == 2
+
+    plan = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT, 0)
+    assert plan[0]["transition"] == "none"
+    assert all(p["transition"] == "cut" for p in plan[1:])
+    assert all(p["transition_duree"] <= 0.06 for p in plan[1:])
+
+
+def test_intensite_transitions_forte_allonge_les_transitions():
+    segments = montage.creer_segments_script("Une accroche marquante", "Une phrase complète. Une autre phrase.")
+    scene = [{
+        "debut": 0.0, "fin": 30.0, "sujet": "test", "action_mouvement": "dynamique",
+        "qualite": "bonne", "nettete": 0.9, "cadrage": "vertical", "texte_visible": False,
+        "watermark": False,
+        "pertinence_script": [{"id": s["id"], "score": 0.9} for s in segments],
+        "rythme": "dynamique", "transition_recommandee": "fade", "score_pertinence": 0.9,
+    }]
+    analyses = {"source_0": scene}
+    metadata = {"source_0": {"duration": 30.0}}
+
+    legere = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT, 1)
+    forte = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT, 3)
+    fondu_legers = [p["transition_duree"] for p in legere[1:] if p["transition"] != "cut"]
+    fondu_forts = [p["transition_duree"] for p in forte[1:] if p["transition"] != "cut"]
+    assert fondu_legers and fondu_forts
+    assert max(fondu_forts) > max(fondu_legers)
+    assert all(p["transition_duree"] <= 0.55 for p in forte)

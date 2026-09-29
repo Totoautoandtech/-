@@ -41,15 +41,23 @@ def test_smoke_accueil_sante_et_statiques(client):
     accueil = client.get("/")
     assert accueil.status_code == 200
     assert "Montage multi-source" in accueil.text
+    assert "RsT" in accueil.text
+    assert "Lien → vidéo" in accueil.text
+    assert "Trouver les vidéos et créer" in accueil.text
+    assert "Vidéos trouvées par RsT" in accueil.text
+    assert "Mes créations" in accueil.text and "Connexions" in accueil.text and "Paramètres" in accueil.text
     sante = client.get("/api/sante")
     assert sante.status_code == 200
     assert sante.json()["ok"] is True
     assert "ffprobe_installe" in sante.json()
-    assert client.get("/static/app.js").status_code == 200
+    assert client.get("/static/main.js").status_code == 200
+    assert client.get("/static/styles.css").status_code == 200
     assert client.get("/static/job-utils.js").status_code == 200
     config = client.get("/api/config").json()
     assert config["max_links"] == 20
     assert config["analysis_fps"] == 6
+    assert config["rst"]["candidats_max"] >= 10
+    assert config["rst"]["sources_max"] >= 5
 
 
 @pytest.mark.parametrize("nombre", [1, 4, 20])
@@ -218,3 +226,139 @@ def test_drive_automatique_reussite_et_echec(tmp_path, monkeypatch):
     resultat = asyncio.run(app._sauvegarde_auto_drive(contexte, session_id, fichier))
     assert resultat["status"] == "failed"
     assert "quota Drive" in resultat["error"]
+
+
+def test_mode_qualite_affine_l_encodage():
+    rapide = app._configuration_montage("rapide")
+    qualite = app._configuration_montage("qualite")
+    assert qualite.crf < rapide.crf
+    assert qualite.crf >= 14
+
+
+def _attendre_job(client, job_id, delai=30.0):
+    """Interroge un job jusqu'à un état final (les recherches RsT sont cadencées)."""
+    limite = time.time() + delai
+    while time.time() < limite:
+        etat = client.get(f"/api/jobs/{job_id}")
+        assert etat.status_code == 200, etat.text
+        if etat.json()["status"] in {"completed", "failed", "cancelled"}:
+            return etat.json()
+        time.sleep(0.25)
+    raise AssertionError("Le job n'a pas atteint d'état final dans le délai imparti.")
+
+
+def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
+    appels = []
+
+    async def donnees_tikwm(_session, chemin, params):
+        appels.append((chemin, dict(params)))
+        if chemin == "/":
+            return {
+                "id": "111", "title": "Recette de pancakes faciles #cuisine #food",
+                "duration": 21, "author": {"unique_id": "chef", "nickname": "Chef"},
+            }
+        if chemin == "/user/posts":
+            videos = [{
+                # La vidéo de départ ne doit jamais devenir candidate.
+                "video_id": "111", "title": "seed", "duration": 21,
+                "author": {"unique_id": "chef"},
+            }]
+            for i in range(20):
+                videos.append({
+                    "video_id": f"1{i + 12}", "title": f"Recette numéro {i}",
+                    "duration": 12 + i % 5, "author": {"unique_id": "chef"},
+                })
+            videos.append({"video_id": "900", "title": "trop long", "duration": 400, "author": {"unique_id": "chef"}})
+            videos.append({"video_id": "901", "title": "trop court", "duration": 2, "author": {"unique_id": "chef"}})
+            videos.append({"video_id": "902", "title": "durée inconnue", "duration": None, "author": {"unique_id": "chef"}})
+            return {"videos": videos}
+        if chemin == "/feed/search":
+            return {"videos": [
+                {"video_id": f"2{i:03d}", "title": f"vidéo de recherche {i}",
+                 "duration": 14 + i % 3, "author": {"unique_id": f"auteur{i}"}}
+                for i in range(20)
+            ]}
+        raise AssertionError(f"endpoint TikWM inattendu : {chemin}")
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def script(_texte):
+        return {"hook": "Hook RsT", "corps": "Corps du script RsT.", "mot_cle_broll": "cuisine maison"}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    montages = []
+
+    async def montage_fake(**kwargs):
+        montages.append(kwargs)
+        return {
+            "url": "/videos/rst.mp4", "path": app.DOSSIER_VIDEOS / "rst.mp4",
+            "sources": [], "source_errors": [],
+        }
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    response = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@chef/video/111?is_copy_url=1",
+        "mode": "rapide", "intensite_transitions": 1,
+    })
+    assert response.status_code == 202, response.text
+    job = _attendre_job(client, response.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+    assert job["url"] == "/videos/rst.mp4"
+    assert job["script"]["hook"] == "Hook RsT"
+
+    # Vidéos réellement trouvées : seed exclue, plafonnées au maximum configuré.
+    trouves = job["found_videos"]
+    assert 20 <= len(trouves) <= app.CONFIG.rst_candidats_max
+    assert all(v["video_id"] != "111" for v in trouves)
+    assert all(v["url"].startswith("https://www.tiktok.com/@") for v in trouves)
+    retenues = [v for v in trouves if v["selected"]]
+    assert len(retenues) == min(20, app.CONFIG.rst_sources_max)
+
+    # Les durées hors limites sont signalées honnêtement, jamais retenues.
+    hors_limites = [v for v in trouves if v["video_id"] in {"900", "901", "902"}]
+    assert hors_limites
+    assert all(not v["selected"] and v["rejet"] for v in hors_limites)
+
+    # Le montage reçoit exactement les sources retenues et les réglages demandés.
+    assert len(montages) == 1
+    assert montages[0]["liens"] == [v["url"] for v in retenues]
+    assert montages[0]["intensite_transitions"] == 1
+    assert montages[0]["resolution"] == "720"
+    assert montages[0]["hook"] == "Hook RsT"
+
+    # Les recherches réellement effectuées sont exposées, l'historique aussi.
+    assert any("cuisine" in requete for requete in job["search_queries"])
+    historique = client.get("/api/jobs").json()["jobs"]
+    assert any(
+        entree["type"] == "rst" and entree.get("found_count") == len(trouves)
+        for entree in historique
+    )
+
+
+def test_rst_rejette_lien_non_tiktok(client):
+    response = client.post("/api/jobs/rst", json={"lien": "https://example.com/article"})
+    assert response.status_code == 400
+    assert "invalide" in response.json()["detail"]
+
+
+def test_rst_aucune_video_trouvee_echoue_honnetement(client, monkeypatch):
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            return {"id": "111", "title": "Sujet très pointu #rare", "duration": 12,
+                    "author": {"unique_id": "auteur"}}
+        return {"videos": []}
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def script(_texte):
+        return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "rare"}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    response = client.post("/api/jobs/rst", json={"lien": "https://www.tiktok.com/@auteur/video/111"})
+    assert response.status_code == 202
+    job = _attendre_job(client, response.json()["job_id"])
+    assert job["status"] == "failed"
+    assert "aucune autre vidéo TikTok" in job["error"]

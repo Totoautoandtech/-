@@ -1,6 +1,22 @@
-# ς੮ ς८Րɿƿ੮
+# ς੮ ς८Րɿƿ┮
 
 Tableau de bord privé de création de vidéos verticales avec FastAPI, JavaScript natif, FFmpeg/FFprobe, Gemini, TikWM, Pexels, TikTok OAuth et Google Drive OAuth.
+
+## Interface
+
+Le dashboard (sombre, premium, responsive) est construit en HTML/CSS/JS natif uniquement :
+
+- `static/index.html` — structure des vues ;
+- `static/styles.css` — thème sombre complet, mobile inclus ;
+- `static/main.js` — logique des trois sections, suivi des jobs, historique, OAuth.
+
+La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **Paramètres**. La vue Créer propose exactement trois sections :
+
+1. **Lien → vidéo** — un lien d'article, de page ou de TikTok devient un script éditable (accroche + corps + univers visuel), puis une vidéo verticale sous-titrée à partir de B-roll Pexels.
+2. **RsT** — un seul lien TikTok de départ. RsT lit la légende réelle, rédige le script, interroge TikWM (publications du créateur + recherches par mots-clés tirés des hashtags et de la légende) pour trouver jusqu'à 40 vidéos candidates réelles, affiche la liste « Vidéos trouvées par RsT » (durée, auteur, origine, raison d'exclusion), retient jusqu'à 20 bonnes sources dans les limites de durée et de temps Render, puis lance automatiquement le montage. Aucune vidéo, résultat ou miniature inventé : si TikWM ne renvoie rien, le travail échoue avec un message honnête.
+3. **Montage multi-source** — jusqu'à 20 liens collés manuellement, organisés en onglets Script / Sources / Référence / Réglages, avec les boutons Coller, Valider et Tout supprimer. La validation affiche l'état réel de chaque source (accessible, durée, dimensions, codec, erreur).
+
+Les **modes Rapide et Qualité** (720 × 1280 priorité vitesse, ou CRF 21 + 1080 × 1920 si `AUTORISER_EXPORT_1080`) et l'**intensité des transitions** (aucune, légère, modérée, forte) sont réglables dans Paramètres et dans l'onglet Réglages ; ils s'appliquent aux trois sections. Le suivi de génération est réel (états, progression, état par source), l'historique des 6 dernières heures permet lecture, téléchargement, Drive et annulation, et un travail en cours est repris après actualisation de la page. Aucun faux compte, aucune fausse donnée, aucun abonnement payant.
 
 ## Montage multi-source
 
@@ -55,6 +71,8 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 | `FFMPEG_PRESET` | `ultrafast` | `ultrafast`, `superfast` ou `veryfast` |
 | `FFMPEG_THREADS` | `1` | `1` conseillé sur Render Free, maximum `2` |
 | `AUTORISER_EXPORT_1080` | `false` | affiche l'option 1080 × 1920, nettement plus lente |
+| `RST_CANDIDATS_MAX` | `40` | vidéos TikTok candidates recherchées par RsT |
+| `RST_SOURCES_MAX` | `20` | sources retenues par RsT pour le montage final |
 
 ### OAuth
 
@@ -88,14 +106,14 @@ Des sources proches de 180 s, un Render froid, TikWM lent, les quotas Gemini ou 
 python -m pip install -r requirements-dev.txt
 python -m py_compile app.py studio_montage.py
 pytest -q
-node --check static/app.js
+node --check static/main.js
 node --check static/job-utils.js
 node --test tests/js/job-utils.test.cjs
 git diff --check
 uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-Smoke tests locaux : `/`, `/api/sante`, `/api/config`, `/api/styles`, `/static/app.js` et le cycle création/lecture/annulation d'un job.
+Smoke tests locaux : `/`, `/api/sante`, `/api/config`, `/api/styles`, `/static/main.js`, `/static/styles.css` et le cycle création/lecture/annulation d'un job (y compris un job RsT simulé).
 
 Test de l'image quand Docker est disponible :
 

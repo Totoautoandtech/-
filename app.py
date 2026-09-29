@@ -59,6 +59,7 @@ from studio_montage import (
     TravailAnnule,
     construire_montage_professionnel,
     diagnostiquer_montage,
+    estimer_duree_traitement,
     executer_commande,
     normaliser_lien_tiktok,
     normaliser_liens_tiktok,
@@ -101,6 +102,8 @@ class Config:
     preset_export: str
     threads_ffmpeg: int
     autoriser_export_1080: bool
+    rst_candidats_max: int
+    rst_sources_max: int
 
     @classmethod
     def charger(cls) -> "Config":
@@ -162,6 +165,8 @@ class Config:
             preset_export=preset,
             threads_ffmpeg=entier("FFMPEG_THREADS", 1, 1, 2),
             autoriser_export_1080=_env("AUTORISER_EXPORT_1080", "false").lower() in {"1", "true", "oui"},
+            rst_candidats_max=entier("RST_CANDIDATS_MAX", 40, 10, 60),
+            rst_sources_max=entier("RST_SOURCES_MAX", 20, 5, 20),
         )
 
 
@@ -180,7 +185,9 @@ TAILLE_MAX_PAGE_SOURCE = 2 * 1024 * 1024
 DUREE_MAX_APERCU_IA = CONFIG.duree_max_source  # compatibilité des anciens helpers
 
 
-def _configuration_montage() -> ConfigurationMontage:
+def _configuration_montage(mode: str = "rapide") -> ConfigurationMontage:
+    """Configuration du pipeline ; le mode « qualite » privilégie un encodage plus fin."""
+    qualite = str(mode).lower() == "qualite"
     return ConfigurationMontage(
         dossier_travail=DOSSIER_TRAVAIL,
         dossier_videos=DOSSIER_VIDEOS,
@@ -191,6 +198,7 @@ def _configuration_montage() -> ConfigurationMontage:
         budget_disque_sources=CONFIG.budget_disque_sources,
         analyses_concurrentes=CONFIG.analyses_concurrentes,
         preset=CONFIG.preset_export,
+        crf=21 if qualite else 23,
         threads_ffmpeg=CONFIG.threads_ffmpeg,
         autoriser_1080=CONFIG.autoriser_export_1080,
     )
@@ -810,10 +818,14 @@ def _decouper_en_cues(hook: str, corps: str, mots_par_seconde: float = 2.3, mots
     return cues
 
 
-async def _normaliser_clip(source: Path, destination: Path, duree: float, debut: float = 0.0) -> None:
+async def _normaliser_clip(
+    source: Path, destination: Path, duree: float, debut: float = 0.0,
+    largeur: int = 720, hauteur: int = 1280,
+) -> None:
     commande = [
         "ffmpeg", "-y", "-ss", str(debut), "-i", str(source), "-t", str(duree),
-        "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=24",
+        "-vf", f"scale={largeur}:{hauteur}:force_original_aspect_ratio=increase,"
+               f"crop={largeur}:{hauteur},fps=24",
         "-an", "-c:v", "libx264", "-preset", CONFIG.preset_export,
         "-pix_fmt", "yuv420p", "-threads", str(CONFIG.threads_ffmpeg), str(destination),
     ]
@@ -836,21 +848,25 @@ async def _assembler_clips(normalises: list[Path], dossier: Path) -> Path:
     return assemble
 
 
-async def _incruster_sous_titres(assemble: Path, cues: list[dict], style: str, dossier: Path) -> Path:
+async def _incruster_sous_titres(
+    assemble: Path, cues: list[dict], style: str, dossier: Path,
+    largeur: int = 720, hauteur: int = 1280, crf: int = 23,
+) -> Path:
     """Fichiers texte par cue (textfile= évite tout souci d'échappement des apostrophes/accents)."""
     if style not in STYLES_SOUS_TITRES:
         style = "classique"
     reglage = STYLES_SOUS_TITRES[style]
 
     police = _police()
+    taille_police = max(28, int(64 * hauteur / 1280))
     filtres = []
-    positions = {"bas": "h-320", "centre": "(h-text_h)/2", "haut": "160"}
-    y = positions.get(reglage["position"], "h-320")
+    positions = {"bas": f"h-{int(320 * hauteur / 1280)}", "centre": "(h-text_h)/2", "haut": f"{int(160 * hauteur / 1280)}"}
+    y = positions.get(reglage["position"], positions["bas"])
     for i, cue in enumerate(cues):
         fichier_texte = dossier / f"cue_{i}.txt"
         fichier_texte.write_text(cue["texte"], encoding="utf-8")
         filtres.append(
-            f"drawtext=fontfile={police}:textfile={fichier_texte}:fontsize=64:"
+            f"drawtext=fontfile={police}:textfile={fichier_texte}:fontsize={taille_police}:"
             f"fontcolor={reglage['couleur']}:borderw=4:bordercolor={reglage['contour']}:"
             f"x=(w-text_w)/2:y={y}:enable='between(t,{cue['debut']:.2f},{cue['fin']:.2f})'"
         )
@@ -858,7 +874,8 @@ async def _incruster_sous_titres(assemble: Path, cues: list[dict], style: str, d
     sortie = DOSSIER_VIDEOS / f"{uuid.uuid4().hex}.mp4"
     await executer_commande(
         ["ffmpeg", "-y", "-i", str(assemble), "-vf", ",".join(filtres),
-         "-c:v", "libx264", "-preset", CONFIG.preset_export, "-pix_fmt", "yuv420p",
+         "-c:v", "libx264", "-preset", CONFIG.preset_export, "-crf", str(max(14, min(30, int(crf)))),
+         "-pix_fmt", "yuv420p",
          "-r", "24", "-threads", str(CONFIG.threads_ffmpeg), "-movflags", "+faststart",
          "-an", str(sortie)],
         etape="incrustation des sous-titres", timeout=CONFIG.delai_ffmpeg,
@@ -867,13 +884,19 @@ async def _incruster_sous_titres(assemble: Path, cues: list[dict], style: str, d
     return sortie
 
 
-async def construire_video(liens_broll: list[str], cues: list[dict], duree_totale: float, style: str) -> Path:
+async def construire_video(
+    liens_broll: list[str], cues: list[dict], duree_totale: float, style: str,
+    resolution: str = "720", crf: int = 23,
+) -> Path:
     """Mode « thème libre » : B-roll cherché sur Pexels."""
     _verifier_ffmpeg()
     dossier = DOSSIER_TRAVAIL / uuid.uuid4().hex
     dossier.mkdir(parents=True, exist_ok=True)
 
     try:
+        if resolution == "1080" and not CONFIG.autoriser_export_1080:
+            resolution = "720"
+        largeur, hauteur = (1080, 1920) if resolution == "1080" else (720, 1280)
         duree_par_clip = duree_totale / len(liens_broll)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
             bruts = []
@@ -885,11 +908,13 @@ async def construire_video(liens_broll: list[str], cues: list[dict], duree_total
         normalises = []
         for i, brut in enumerate(bruts):
             cible = dossier / f"norm_{i}.mp4"
-            await _normaliser_clip(brut, cible, duree_par_clip)
+            await _normaliser_clip(brut, cible, duree_par_clip, largeur=largeur, hauteur=hauteur)
             normalises.append(cible)
 
         assemble = await _assembler_clips(normalises, dossier)
-        return await _incruster_sous_titres(assemble, cues, style, dossier)
+        return await _incruster_sous_titres(
+            assemble, cues, style, dossier, largeur=largeur, hauteur=hauteur, crf=crf
+        )
     finally:
         shutil.rmtree(dossier, ignore_errors=True)
 
@@ -979,6 +1004,263 @@ async def construire_montage(liens_videos: list[str], hook: str, corps: str, sty
         return await _incruster_sous_titres(assemble, cues, style, dossier)
     finally:
         shutil.rmtree(dossier, ignore_errors=True)
+
+
+# ======================================================================================
+# MODE « RsT » : un seul lien TikTok de départ → script + vraies vidéos trouvées → montage
+# ======================================================================================
+
+DUREE_MIN_SOURCE_RST = 5.0
+
+_MOTS_VIDES_RST = {
+    "avec", "bien", "cette", "dans", "depuis", "des", "elle", "elles", "est", "les", "leur",
+    "mais", "moins", "mes", "meme", "nous", "parce", "pour", "puis", "que", "qui", "sans",
+    "ses", "son", "sont", "sous", "sur", "tant", "tout", "tous", "tres", "vous", "was",
+    "this", "that", "with", "from", "have", "just", "like", "when", "what", "your",
+    "tiktok", "video", "vidéo", "videos", "fyp", "pourtoi", "pourtoii", "foryou",
+    "foryoupage", "viral", "funny", "comedy", "follow",
+}
+
+
+async def _donnees_tikwm(session: aiohttp.ClientSession, chemin: str, params: dict) -> Any:
+    """Appelle l'API publique TikWM et renvoie son bloc « data » — rien n'est inventé ici."""
+    url = f"https://www.tikwm.com/api{chemin}"
+
+    async def _appel():
+        async with session.get(url, params=params) as resp:
+            if resp.status != 200:
+                raise ErreurApp(f"TikWM inaccessible ({resp.status})")
+            try:
+                return await resp.json(content_type=None)
+            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+
+    donnees = await _avec_retry(_appel, tentatives=2, etape=f"TikWM {chemin}")
+    if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
+        message = donnees.get("msg", "réponse invalide") if isinstance(donnees, dict) else "réponse invalide"
+        raise ErreurApp(f"TikWM : {message}")
+    return donnees["data"]
+
+
+def _normaliser_candidat_rst(video: Any, origine: str) -> Optional[dict]:
+    """Convertit une vidéo réellement renvoyée par TikWM en candidate RsT, ou None."""
+    if not isinstance(video, dict):
+        return None
+    auteur = video.get("author") if isinstance(video.get("author"), dict) else {}
+    identifiant = str(video.get("video_id") or video.get("id") or "").strip()
+    pseudo = str(auteur.get("unique_id") or "").strip().lstrip("@")
+    if not identifiant or not pseudo:
+        return None
+    try:
+        duree = round(float(video.get("duration") or 0), 1)
+    except (TypeError, ValueError):
+        duree = 0.0
+    return {
+        "url": f"https://www.tiktok.com/@{pseudo}/video/{identifiant}",
+        "video_id": identifiant,
+        "author": pseudo,
+        "author_name": str(auteur.get("nickname") or pseudo).strip() or pseudo,
+        "title": str(video.get("title") or "").strip(),
+        "duration": duree,
+        "origin": origine,
+    }
+
+
+def _extraire_mots_cles_rst(texte: str, mot_cle_broll: str = "", limite: int = 3) -> list[str]:
+    """Mots-clés de recherche réels : hashtags de la légende, thème visuel, mots fréquents."""
+    retenus: list[str] = []
+
+    def ajouter(valeur: str) -> None:
+        propre = valeur.strip().lstrip("#").strip()
+        if 3 <= len(propre) <= 40 and propre.lower() not in {m.lower() for m in retenus}:
+            retenus.append(propre)
+
+    for etiquette in re.findall(r"#([\wÀ-ÿ]+)", texte):
+        ajouter(etiquette)
+    if mot_cle_broll.strip():
+        ajouter(mot_cle_broll.strip())
+    occurrences: dict[str, int] = {}
+    for mot in re.findall(r"[\wÀ-ÿ']+", texte):
+        propre = mot.strip("'-").lower()
+        if len(propre) < 4 or propre in _MOTS_VIDES_RST or propre.isdigit():
+            continue
+        occurrences[propre] = occurrences.get(propre, 0) + 1
+    for mot in sorted(occurrences, key=occurrences.get, reverse=True):
+        if len(retenus) >= limite:
+            break
+        ajouter(mot)
+    return retenus[:limite]
+
+
+def _selectionner_sources_rst(
+    candidats: list[dict], limite: int, duree_max: float
+) -> tuple[list[dict], list[dict]]:
+    """Retient jusqu'à `limite` candidates dont la durée réelle est exploisable."""
+    for candidate in candidats:
+        candidate.setdefault("selected", False)
+        candidate.setdefault("rejet", "")
+    retenues: list[dict] = []
+    for candidate in candidats:
+        if len(retenues) >= limite:
+            if not candidate.get("rejet"):
+                candidate["rejet"] = "quota de sources atteint"
+            continue
+        duree = float(candidate.get("duration") or 0)
+        if duree <= 0:
+            candidate["rejet"] = "durée inconnue"
+            continue
+        if duree < DUREE_MIN_SOURCE_RST:
+            candidate["rejet"] = f"durée {duree:.0f} s trop courte"
+            continue
+        if duree > duree_max:
+            candidate["rejet"] = f"durée {duree:.0f} s au-delà de la limite de {duree_max:.0f} s"
+            continue
+        candidate["selected"] = True
+        retenues.append(candidate)
+    return retenues, candidats
+
+
+def _reduire_selon_estimation(
+    sources: list[dict], config: ConfigurationMontage, plafond: int = 540
+) -> list[dict]:
+    """Retire les dernières sources tant que l'estimation dépasse le plafond prudent."""
+    while len(sources) > 3:
+        estimation = estimer_duree_traitement(
+            [float(s.get("duration") or 0) for s in sources], 0.0, config
+        )
+        if estimation["estimated_seconds"] <= plafond:
+            break
+        retiree = sources.pop()
+        retiree["selected"] = False
+        retiree["rejet"] = "retirée pour rester sous la limite de temps Render"
+    return sources
+
+
+def _rapporteur_decale(contexte: "ContexteJob", base: float, amplitude: float) -> Rapporteur:
+    """Traduit la progression d'un sous-pipeline dans la fenêtre [base, base+amplitude]."""
+
+    def mise_a_jour(statut: str, progress: int, detail: str, **extras: Any) -> None:
+        brut = max(0, min(100, int(progress)))
+        contexte.update(
+            statut=statut, progress=int(round(base + amplitude * brut)), detail=detail, **extras
+        )
+
+    return Rapporteur(mise_a_jour, contexte.annule, contexte.restant)
+
+
+async def _produire_rst(requete: "RequeteRst", contexte: "ContexteJob") -> dict[str, Any]:
+    """Mode RsT : analyse un lien TikTok, trouve de vraies vidéos, monte automatiquement."""
+    try:
+        lien = normaliser_lien_tiktok(requete.lien.strip())
+    except ErreurMontage as exc:
+        raise ErreurApp(f"Lien TikTok de départ invalide : {exc}") from exc
+
+    contexte.update(statut="analysing", progress=4, detail="Lecture de la vidéo TikTok de départ")
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=75, connect=15)) as session:
+        donnees = await _donnees_tikwm(session, "/", {"url": lien, "hd": "1"})
+        legende = str(donnees.get("title") or "").strip()
+        if not legende:
+            raise ErreurApp("Cette vidéo TikTok n'a pas de légende exploitable comme point de départ.")
+        auteur = str((donnees.get("author") or {}).get("unique_id") or "").strip().lstrip("@")
+        identifiant_depart = str(donnees.get("id") or donnees.get("video_id") or "").strip()
+
+        contexte.update(statut="analysing", progress=12, detail="Rédaction du script à partir de la légende")
+        script = await generer_script(legende)
+        contexte.update(
+            statut="analysing", progress=20, detail="Script prêt — recherche de vidéos candidates",
+            script=script,
+            seed={
+                "url": lien, "title": legende[:200], "author": auteur,
+                "duration": donnees.get("duration"),
+            },
+        )
+
+        requetes_reelles: list[str] = []
+        candidats: dict[str, dict] = {}
+
+        async def accumuler(videos: Any, origine: str) -> None:
+            for video in videos or []:
+                candidate = _normaliser_candidat_rst(video, origine)
+                if not candidate or candidate["video_id"] == identifiant_depart:
+                    continue
+                candidats.setdefault(candidate["video_id"], candidate)
+
+        def publier(detail: str, progression: int) -> None:
+            contexte.update(
+                statut="searching", progress=progression, detail=detail,
+                found_videos=list(candidats.values()), search_queries=list(requetes_reelles),
+            )
+
+        # 1) Les autres publications réelles du créateur de la vidéo de départ.
+        if auteur:
+            requetes_reelles.append(f"@{auteur}")
+            contexte.update(statut="searching", progress=24, detail=f"Publications de @{auteur}")
+            try:
+                await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
+                publications = await _donnees_tikwm(
+                    session, "/user/posts",
+                    {"unique_id": auteur, "count": str(min(CONFIG.rst_candidats_max, 40))},
+                )
+                await accumuler(publications.get("videos") or [], f"publications de @{auteur}")
+            except ErreurApp as exc:
+                logger.warning("[RsT] publications de @%s indisponibles : %s", auteur, exc)
+            publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", 30)
+
+        # 2) Recherches TikTok par mots-clés tirés de la vraie légende.
+        for mot_cle in _extraire_mots_cles_rst(legende, script.get("mot_cle_broll", "")):
+            if len(candidats) >= CONFIG.rst_candidats_max:
+                break
+            requetes_reelles.append(mot_cle)
+            contexte.update(statut="searching", progress=34, detail=f"Recherche TikTok « {mot_cle} »")
+            try:
+                await asyncio.sleep(1.0)
+                resultats = await _donnees_tikwm(
+                    session, "/feed/search", {"keywords": mot_cle, "count": "20"}
+                )
+                await accumuler(resultats.get("videos") or [], f"recherche « {mot_cle} »")
+            except ErreurApp as exc:
+                logger.warning("[RsT] recherche « %s » indisponible : %s", mot_cle, exc)
+            publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", 38)
+
+    trouves = list(candidats.values())[: CONFIG.rst_candidats_max]
+    contexte.update(
+        statut="searching", progress=42,
+        detail=f"{len(trouves)} vidéo(s) trouvée(s) — sélection des meilleures sources",
+        found_videos=trouves, search_queries=requetes_reelles,
+    )
+    if not trouves:
+        raise ErreurApp("RsT n'a trouvé aucune autre vidéo TikTok exploitable pour ce point de départ.")
+
+    selectionnees, trouves = _selectionner_sources_rst(
+        trouves, CONFIG.rst_sources_max, float(CONFIG.duree_max_source)
+    )
+    selectionnees = _reduire_selon_estimation(selectionnees, _configuration_montage(requete.mode))
+    if not selectionnees:
+        raise ErreurApp("Aucune vidéo trouvée n'entre dans les limites de durée utilisables.")
+    contexte.update(
+        statut="selecting", progress=44,
+        detail=f"{len(selectionnees)} source(s) retenue(s) sur {len(trouves)} trouvée(s)",
+        found_videos=trouves, search_queries=requetes_reelles,
+    )
+
+    resolution = "1080" if (requete.mode == "qualite" and CONFIG.autoriser_export_1080) else "720"
+    resultat = await construire_montage_professionnel(
+        liens=[candidate["url"] for candidate in selectionnees],
+        lien_reference="",
+        hook=script["hook"].strip(),
+        corps=script["corps"].strip(),
+        resolution=resolution,
+        style_sous_titres="classique",
+        config=_configuration_montage(requete.mode),
+        rapporteur=_rapporteur_decale(contexte, 45.0, 0.55),
+        resolveur=_resoudre_video_tiktok,
+        telechargeur=_telecharger_fichier,
+        appel_gemini=_appel_gemini_brut,
+        intensite_transitions=requete.intensite_transitions,
+    )
+    await envoyer_script_et_video(script["hook"], script["corps"], resultat["path"])
+    resultat.update(script=script, found_videos=trouves, search_queries=requetes_reelles)
+    return resultat
 
 
 # ======================================================================================
@@ -1109,6 +1391,7 @@ class RequeteVideo(BaseModel):
     corps: str = Field(min_length=1, max_length=12000)
     mot_cle_broll: str = Field(min_length=1, max_length=200)
     style: str = Field(default="classique", max_length=32)
+    mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
     idempotency_key: str = Field(default="", max_length=80)
 
 
@@ -1120,8 +1403,19 @@ class RequeteMontage(BaseModel):
     lien_reference_style: str = Field(default="", max_length=2048)
     style: str = Field(default="classique", max_length=32)
     resolution: str = Field(default="720", pattern="^(720|1080)$")
+    mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
+    intensite_transitions: int = Field(default=2, ge=0, le=3)
     estimated_seconds: int = Field(default=0, ge=0, le=7200)
     accepter_risque: bool = False
+    idempotency_key: str = Field(default="", max_length=80)
+
+
+class RequeteRst(BaseModel):
+    """Mode RsT : un seul lien TikTok de départ suffit."""
+    titre: str = Field(default="", max_length=120)
+    lien: str = Field(min_length=1, max_length=2048)
+    mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
+    intensite_transitions: int = Field(default=2, ge=0, le=3)
     idempotency_key: str = Field(default="", max_length=80)
 
 
@@ -1243,7 +1537,11 @@ async def _produire_video(requete: RequeteVideo, contexte: Optional[ContexteJob]
     liens_broll = await chercher_broll(requete.mot_cle_broll, duree_totale)
     if contexte:
         contexte.update(statut="editing", progress=45, detail="Téléchargement et montage du B-roll")
-    chemin = await construire_video(liens_broll, cues, duree_totale, requete.style)
+    resolution = "1080" if (requete.mode == "qualite" and CONFIG.autoriser_export_1080) else "720"
+    chemin = await construire_video(
+        liens_broll, cues, duree_totale, requete.style,
+        resolution=resolution, crf=21 if requete.mode == "qualite" else 23,
+    )
     await envoyer_script_et_video(requete.hook, requete.corps, chemin)
     return {"url": f"/videos/{chemin.name}", "path": chemin}
 
@@ -1259,11 +1557,12 @@ async def _produire_montage(
         corps=requete.corps.strip(),
         resolution=requete.resolution,
         style_sous_titres=requete.style,
-        config=_configuration_montage(),
+        config=_configuration_montage(requete.mode),
         rapporteur=contexte.rapporteur(),
         resolveur=_resoudre_video_tiktok,
         telechargeur=_telecharger_fichier,
         appel_gemini=_appel_gemini_brut,
+        intensite_transitions=requete.intensite_transitions,
     )
     await envoyer_script_et_video(requete.hook, requete.corps, resultat["path"])
     return resultat
@@ -1383,9 +1682,10 @@ def _demarrer_job(
     job_id = uuid.uuid4().hex
     maintenant = time.monotonic()
     titre = str(getattr(modele, "titre", "") or "").strip()
+    titre_defaut = "Création RsT" if type_job == "rst" else "Création vidéo"
     JOBS[job_id] = {
         "job_id": job_id, "type": type_job, "owner": session_id, "status": "queued",
-        "title": titre or (f"Création {batch_index + 1}" if batch_total > 1 else "Création vidéo"),
+        "title": titre or (f"Création {batch_index + 1}" if batch_total > 1 else titre_defaut),
         "batch_id": batch_id, "batch_index": batch_index, "batch_total": batch_total,
         "progress": 0,
         "detail": (
@@ -1457,6 +1757,10 @@ async def configuration_publique() -> dict[str, Any]:
         "analysis_resolution": "360p",
         "default_export": "720x1280@24",
         "allow_1080": CONFIG.autoriser_export_1080,
+        "rst": {
+            "candidats_max": CONFIG.rst_candidats_max,
+            "sources_max": CONFIG.rst_sources_max,
+        },
     }
 
 
@@ -1663,6 +1967,23 @@ async def lancer_job_montage(requete: RequeteMontage, request: Request):
     return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 
 
+@app.post("/api/jobs/rst", status_code=202)
+async def lancer_job_rst(requete: RequeteRst, request: Request):
+    """Mode RsT : un lien TikTok de départ, puis recherche et montage automatiques."""
+    lien = requete.lien.strip()
+    if not lien:
+        raise HTTPException(400, "Lien vide.")
+    try:
+        normaliser_lien_tiktok(lien)
+    except ErreurMontage as exc:
+        raise HTTPException(400, f"Lien TikTok de départ invalide : {exc}") from exc
+    session_id, nouveau = _session_id(request)
+    job_id, reused = _demarrer_job(
+        "rst", requete, session_id, lambda contexte: _produire_rst(requete, contexte)
+    )
+    return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
+
+
 @app.post("/api/jobs/montage/batch", status_code=202)
 async def lancer_lot_montages(requete: RequeteLotMontages, request: Request):
     """Place jusqu’à six projets indépendants dans la file séquentielle Render Free."""
@@ -1743,6 +2064,8 @@ async def historique_jobs(request: Request):
         resume = {cle: job[cle] for cle in champs if cle in job}
         resume["queue_position"] = positions.get(identifiant, 0)
         resume["source_error_count"] = len(job.get("source_errors") or [])
+        if job.get("type") == "rst":
+            resume["found_count"] = len(job.get("found_videos") or [])
         historique.append(resume)
     historique.sort(key=lambda item: float(item.get("created_at_unix", 0)), reverse=True)
     response = JSONResponse({"jobs": historique, "retention_seconds": DUREE_VIE_JOB})
