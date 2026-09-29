@@ -39,6 +39,11 @@ services:
         value: "1"
       - key: AUTORISER_EXPORT_1080
         value: "false"
+      # Mode RsT : vidéos candidates recherchées puis sources retenues.
+      - key: RST_CANDIDATS_MAX
+        value: "40"
+      - key: RST_SOURCES_MAX
+        value: "20"
       - key: GMAIL_ADRESSE
         sync: false
       - key: GMAIL_MOT_DE_PASSE_APP

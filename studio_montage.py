@@ -52,6 +52,7 @@ class ConfigurationMontage:
     hauteur: int = 1280
     fps: int = 24
     preset: str = "ultrafast"
+    crf: int = 23
     threads_ffmpeg: int = 1
     autoriser_1080: bool = False
 
@@ -510,6 +511,16 @@ async def analyser_style_reference(
 # Plan de montage : hook rapide, scènes ~5 secondes et alternance des sources
 # --------------------------------------------------------------------------------------
 
+# Intensité des transitions, de 0 (coupes franches seules) à 3 (transitions appuyées).
+ECHELLES_INTENSITE_TRANSITIONS = {0: 0.15, 1: 0.6, 2: 1.0, 3: 1.35}
+
+
+def borner_intensite_transitions(valeur: Any) -> int:
+    try:
+        return max(0, min(3, int(valeur)))
+    except (TypeError, ValueError):
+        return 2
+
 
 def _groupes_equilibres(mots: list[str], nombre: int) -> list[list[str]]:
     groupes: list[list[str]] = []
@@ -573,6 +584,7 @@ def selectionner_plan(
     analyses: dict[str, list[dict[str, Any]]],
     metadonnees: dict[str, dict[str, Any]],
     style: StyleReference,
+    intensite_transitions: int = 2,
 ) -> list[dict[str, Any]]:
     if not metadonnees:
         raise ErreurMontage("Aucune source valide n’est disponible pour le montage.")
@@ -583,9 +595,17 @@ def selectionner_plan(
     curseurs_repli = {nom: 0.0 for nom in sources}
     autorisees = {"cut", "fade", "slide", "zoom"}
     style_cycle = [str(t).lower() for t in style.transitions + style.coupes if str(t).lower() in autorisees]
-    cycle = style_cycle or ["cut", "fade", "cut", "zoom", "slide"]
-    if len(set(cycle)) == 1:
+    intensite = borner_intensite_transitions(intensite_transitions)
+    if intensite == 0:
+        # Coupes franches uniquement : aucune transition temporelle.
+        cycle = ["cut"]
+    elif intensite == 1:
+        cycle = ["cut", "fade"]
+    else:
+        cycle = style_cycle or ["cut", "fade", "cut", "zoom", "slide"]
+    if intensite > 0 and len(set(cycle)) == 1:
         cycle.append("fade" if cycle[0] != "fade" else "cut")
+    echelle_intensite = ECHELLES_INTENSITE_TRANSITIONS[intensite]
 
     for index, segment in enumerate(segments):
         cible = float(segment["duree_cible"])
@@ -630,7 +650,7 @@ def selectionner_plan(
             recommandation if recommandation in autorisees and recommandation in cycle
             else cycle[index % len(cycle)]
         )
-        if transition == transition_precedente:
+        if len(cycle) > 1 and transition == transition_precedente:
             transition = next(
                 candidate for candidate in cycle[index % len(cycle):] + cycle[:index % len(cycle)]
                 if candidate != transition_precedente
@@ -640,8 +660,8 @@ def selectionner_plan(
         elif transition == "cut":
             transition_duree = 0.05  # xfade quasi instantané, visuellement une coupe franche
         else:
-            transition_duree = (0.22, 0.28, 0.34)[index % 3]
-        transition_duree = min(0.4, transition_duree, max(0.02, duree / 3))
+            transition_duree = (0.22, 0.28, 0.34)[index % 3] * echelle_intensite
+        transition_duree = min(0.55, transition_duree, max(0.02, duree / 3))
 
         plan.append({
             **segment, "source": source, "debut": round(debut, 3),
@@ -823,7 +843,7 @@ async def exporter_plan(
     sortie = config.dossier_videos / f"{uuid.uuid4().hex}.mp4"
     commande += [
         "-filter_complex", ";".join(filtres), "-map", "[final]", "-an",
-        "-c:v", "libx264", "-preset", config.preset, "-crf", "23",
+        "-c:v", "libx264", "-preset", config.preset, "-crf", str(max(14, min(30, int(config.crf)))),
         "-pix_fmt", "yuv420p", "-r", str(config.fps), "-threads", str(config.threads_ffmpeg),
         "-movflags", "+faststart", str(sortie),
     ]
@@ -863,6 +883,7 @@ async def construire_montage_professionnel(
     resolveur: Resolveur,
     telechargeur: Telechargeur,
     appel_gemini: AppelGemini,
+    intensite_transitions: int = 2,
 ) -> dict[str, Any]:
     debut_global = time.monotonic()
     propres, erreurs_forme, doublons = normaliser_liens_tiktok(liens)
@@ -1024,7 +1045,7 @@ async def construire_montage_professionnel(
             style_reference = style_reference.model_copy(update={"position_sous_titres": "centre"})
 
         rapporteur.update("selecting", 76, "Sélection et alternance des meilleurs plans")
-        plan = selectionner_plan(segments, analyses, metadonnees, style_reference)
+        plan = selectionner_plan(segments, analyses, metadonnees, style_reference, intensite_transitions)
         rapporteur.update(
             "editing", 82,
             f"Plan prêt : {len(plan)} plans, accroche rapide puis scènes principales de 5 s",
