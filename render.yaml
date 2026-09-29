@@ -16,6 +16,29 @@ services:
         value: gemini-2.5-flash
       - key: DUREE_CIBLE_SECONDES
         value: "30"
+      # Garde-fous adaptés à Render Free (512 Mo). La limite globale vaut 9 min 30.
+      - key: DUREE_MAX_SOURCE_SECONDES
+        value: "180"
+      - key: JOB_TIMEOUT_SECONDES
+        value: "570"
+      - key: FFMPEG_TIMEOUT_SECONDES
+        value: "240"
+      - key: GEMINI_TIMEOUT_SECONDES
+        value: "120"
+      - key: TIKWM_TIMEOUT_SECONDES
+        value: "30"
+      - key: DOWNLOAD_TIMEOUT_SECONDES
+        value: "120"
+      - key: GEMINI_ANALYSES_CONCURRENTES
+        value: "1"
+      - key: BUDGET_DISQUE_SOURCES_MO
+        value: "700"
+      - key: FFMPEG_PRESET
+        value: ultrafast
+      - key: FFMPEG_THREADS
+        value: "1"
+      - key: AUTORISER_EXPORT_1080
+        value: "false"
       - key: GMAIL_ADRESSE
         sync: false
       - key: GMAIL_MOT_DE_PASSE_APP
