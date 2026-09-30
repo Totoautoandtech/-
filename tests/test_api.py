@@ -1,3 +1,4 @@
+import ast
 import os
 import asyncio
 import time
@@ -59,6 +60,88 @@ def test_smoke_accueil_sante_et_statiques(client):
     assert config["analysis_fps"] == 6
     assert config["rst"]["candidats_max"] >= 10
     assert config["rst"]["sources_max"] >= 5
+
+
+
+# ======================================================================================
+# TIKWM : les recherches publiques exigent une identification de navigateur sur Render
+# ======================================================================================
+
+
+def test_entetes_tikwm_identifient_honnetement_un_navigateur():
+    assert app.ENTETES_TIKWM["User-Agent"].startswith("Mozilla/5.0")
+    assert app.ENTETES_TIKWM["Accept"] == "application/json, text/plain, */*"
+    assert app.ENTETES_TIKWM["Accept-Language"].startswith("fr-FR")
+    assert app.ENTETES_TIKWM["Referer"] == "https://www.tikwm.com/"
+
+
+class _ReponseTikwm:
+    status = 200
+
+    def __init__(self, donnees):
+        self.donnees = donnees
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def json(self, **_kwargs):
+        return self.donnees
+
+
+class _SessionTikwm:
+    def __init__(self, reponses):
+        self.reponses = list(reponses)
+        self.appels = []
+
+    def get(self, url, **kwargs):
+        self.appels.append({"url": url, **kwargs})
+        return _ReponseTikwm(self.reponses.pop(0))
+
+
+def test_appels_tikwm_transmettent_les_entetes_navigateur():
+    session = _SessionTikwm([
+        {"code": 0, "data": {"play": "https://cdn.example/video.mp4"}},
+        {"code": 0, "data": {"title": "Une vraie légende"}},
+        {"code": 0, "data": {"videos": []}},
+    ])
+
+    assert asyncio.run(app._resoudre_video_tiktok(
+        session, "https://www.tiktok.com/@demo/video/123"
+    )) == "https://cdn.example/video.mp4"
+    assert asyncio.run(app._extraire_texte_tiktok(
+        session, "https://www.tiktok.com/@demo/video/123"
+    )) == "Une vraie légende"
+    assert asyncio.run(app._donnees_tikwm(session, "/feed/search", {"keywords": "demo"})) == {
+        "videos": []
+    }
+    assert len(session.appels) == 3
+    assert all(appel["headers"] == app.ENTETES_TIKWM for appel in session.appels)
+
+
+def test_aucun_appel_tikwm_ne_peut_oublier_les_entetes_navigateur():
+    """Garde-fou source : les trois accès TikWM doivent rester protégés à l'avenir."""
+    arbre = ast.parse(Path(app.__file__).read_text(encoding="utf-8"))
+    fonctions = {
+        noeud.name: noeud for noeud in arbre.body
+        if isinstance(noeud, ast.AsyncFunctionDef)
+        and noeud.name in {"_resoudre_video_tiktok", "_extraire_texte_tiktok", "_donnees_tikwm"}
+    }
+    assert set(fonctions) == {"_resoudre_video_tiktok", "_extraire_texte_tiktok", "_donnees_tikwm"}
+    for nom, fonction in fonctions.items():
+        appels_get = [
+            noeud for noeud in ast.walk(fonction)
+            if isinstance(noeud, ast.Call)
+            and isinstance(noeud.func, ast.Attribute)
+            and isinstance(noeud.func.value, ast.Name)
+            and noeud.func.value.id == "session"
+            and noeud.func.attr == "get"
+        ]
+        assert len(appels_get) == 1, nom
+        entete = next((mot for mot in appels_get[0].keywords if mot.arg == "headers"), None)
+        assert isinstance(entete.value, ast.Name) and entete.value.id == "ENTETES_TIKWM", nom
 
 
 @pytest.mark.parametrize("nombre", [1, 4, 20])
@@ -802,7 +885,7 @@ def test_synthese_vocale_injoignable_ne_laisse_aucun_fichier(tmp_path, monkeypat
 
 
 def test_livraison_ecrit_le_script_meme_si_la_voix_echoue(monkeypatch):
-    async def synthese_ko(_texte, chemin):
+    async def synthese_ko(_texte, chemin, budget=app.EDGE_TTS_DELAI):
         raise app.ErreurApp("speech.platform.bing.com injoignable")
 
     monkeypatch.setattr(app, "synthetiser_voix_off", synthese_ko)
@@ -818,7 +901,7 @@ def test_livraison_ecrit_le_script_meme_si_la_voix_echoue(monkeypatch):
 
 
 def test_livraison_complete_expose_script_et_mp3(monkeypatch):
-    async def synthese_ok(_texte, chemin):
+    async def synthese_ok(_texte, chemin, budget=app.EDGE_TTS_DELAI):
         Path(chemin).write_bytes(b"ID3fauxmp3")
         return 10
 
@@ -833,6 +916,118 @@ def test_livraison_complete_expose_script_et_mp3(monkeypatch):
     assert Path(livraison["script_url"]).stem == Path(livraison["voix_url"]).stem
     for url in (livraison["script_url"], livraison["voix_url"]):
         (app.DOSSIER_VIDEOS / Path(url).name).unlink(missing_ok=True)
+
+
+
+def test_synthese_vocale_borne_son_delai_au_budget(tmp_path, monkeypatch):
+    delais = []
+
+    class DelaiObserve:
+        def __init__(self, delai):
+            delais.append(delai)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class CommunicateOk:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def save(self, chemin):
+            Path(chemin).write_bytes(b"ID3fauxmp3")
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "edge_tts", type("M", (), {"Communicate": CommunicateOk})
+    )
+    monkeypatch.setattr(app.asyncio, "timeout", DelaiObserve)
+    cible = tmp_path / "voix.mp3"
+    assert asyncio.run(app.synthetiser_voix_off("Bonjour", cible, budget=7.5)) == 10
+    assert delais == [7.5]
+
+
+def test_livraison_signale_erreur_ecriture_script_sans_lever(tmp_path, monkeypatch):
+    def ecriture_impossible(*_args, **_kwargs):
+        raise OSError("disque plein")
+
+    async def synthese_ok(_texte, chemin, budget=app.EDGE_TTS_DELAI):
+        Path(chemin).write_bytes(b"ID3fauxmp3")
+        return 10
+
+    monkeypatch.setattr(Path, "write_text", ecriture_impossible)
+    monkeypatch.setattr(app, "synthetiser_voix_off", synthese_ok)
+    livraison = asyncio.run(app.livrer_script_et_voix({"hook": "H", "corps": "C."}))
+
+    assert livraison["script_url"] == ""
+    assert "disque plein" in livraison["script_erreur"]
+    assert livraison["voix_url"].endswith(".mp3")
+    (app.DOSSIER_VIDEOS / Path(livraison["voix_url"]).name).unlink(missing_ok=True)
+
+
+def test_livraison_saute_la_voix_si_le_budget_est_trop_court(monkeypatch):
+    appels = []
+
+    async def synthese_ne_doit_pas_etre_appelee(*_args, **_kwargs):
+        appels.append(True)
+        raise AssertionError("edge-tts ne doit pas être appelé")
+
+    monkeypatch.setattr(app, "synthetiser_voix_off", synthese_ne_doit_pas_etre_appelee)
+    livraison = asyncio.run(app.livrer_script_et_voix(
+        {"hook": "H", "corps": "C."}, budget=app.EDGE_TTS_MINIMUM - 0.1
+    ))
+
+    assert appels == []
+    assert livraison["script_url"].endswith(".txt")
+    assert livraison["voix_url"] == ""
+    assert "ignorée" in livraison["voix_erreur"]
+    (app.DOSSIER_VIDEOS / Path(livraison["script_url"]).name).unlink(missing_ok=True)
+
+
+def test_rst_conserve_le_rendu_si_la_livraison_leve(client, monkeypatch):
+    """Un souci tardif de livraison ne doit jamais faire échouer une vidéo déjà rendue."""
+    async def donnees_tikwm(_session, chemin, _params):
+        if chemin == "/":
+            return {
+                "id": "7", "title": "Paris prépare les Jeux", "duration": 15,
+                "author": {"unique_id": "sport"},
+            }
+        if chemin == "/user/posts":
+            return {"videos": []}
+        return {"videos": [
+            {"video_id": "source-1", "title": "source", "duration": 11,
+             "author": {"unique_id": "auteur"}},
+        ]}
+
+    async def script(_texte):
+        return {"hook": "Paris se prépare", "corps": "Le compte à rebours commence.", "mot_cle_broll": "Paris"}
+
+    async def noms(_legende, _nombre, _broll=""):
+        return ["Paris"]
+
+    async def montage_fake(**_kwargs):
+        return {
+            "url": "/videos/muet-deja-rendu.mp4",
+            "path": app.DOSSIER_VIDEOS / "muet-deja-rendu.mp4",
+            "sources": [], "source_errors": [],
+        }
+
+    async def livraison_ko(*_args, **_kwargs):
+        raise OSError("stockage complémentaire indisponible")
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    monkeypatch.setattr(app, "generer_script", script)
+    monkeypatch.setattr(app, "extraire_noms_rst", noms)
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+    monkeypatch.setattr(app, "livrer_script_et_voix", livraison_ko)
+
+    reponse = client.post("/api/jobs/rst", json={"lien": "https://www.tiktok.com/@sport/video/7"})
+    job = _attendre_job(client, reponse.json()["job_id"])
+
+    assert job["status"] == "completed", job.get("error")
+    assert job["url"] == "/videos/muet-deja-rendu.mp4"
+    assert "stockage complémentaire indisponible" in job["livraison_erreur"]
 
 
 def test_rst_livre_video_muette_script_et_voix_off(client, monkeypatch):
@@ -867,7 +1062,7 @@ def test_rst_livre_video_muette_script_et_voix_off(client, monkeypatch):
 
     monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
 
-    async def synthese_ok(texte, chemin):
+    async def synthese_ok(texte, chemin, budget=app.EDGE_TTS_DELAI):
         assert "Le PSG gagne" in texte
         Path(chemin).write_bytes(b"ID3fauxmp3")
         return 10
@@ -923,6 +1118,7 @@ def test_interface_annonce_la_livraison_separee():
     requirements = (racine / "requirements.txt").read_text(encoding="utf-8")
     assert "edge-tts" in html and "edge-tts" in requirements
     assert "script_url" in js and "voix_url" in js
+    assert "livraison_erreur" in js and "script_erreur" in js
     assert "Script .txt" in js and "Voix off .mp3" in js
     assert "Vidéo (muette)" in js
 
@@ -996,7 +1192,7 @@ def test_rst_sans_aucun_nom_elargit_la_recherche_aux_mots_cles(client, monkeypat
 
     monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
 
-    async def synthese(_texte, chemin):
+    async def synthese(_texte, chemin, budget=app.EDGE_TTS_DELAI):
         Path(chemin).write_bytes(b"ID3")
         return 3
 

@@ -872,6 +872,14 @@
       if (data.error) carte.append(el('p', 'job-error', data.error));
 
       // Livraison séparée : la vidéo reste muette, le script et le MP3 se prennent à côté.
+      if (data.livraison_erreur) {
+        carte.append(el('p', 'job-note',
+          `Livraison complémentaire incomplète : ${data.livraison_erreur} La vidéo déjà rendue reste téléchargeable.`));
+      }
+      if (data.script_erreur) {
+        carte.append(el('p', 'job-note',
+          `Script .txt non livré : ${data.script_erreur} La vidéo reste téléchargeable.`));
+      }
       if (data.voix_erreur) {
         carte.append(el('p', 'job-note', `Voix off non générée : ${data.voix_erreur} Le script reste téléchargeable.`));
       }
