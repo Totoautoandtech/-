@@ -3,8 +3,9 @@
 
    Trois sections de création :
      1. « Lien → vidéo »     : un lien → script éditable → vidéo verticale.
-     2. « RsT »               : un lien TikTok → analyse, script, recherche de
-                                vidéos réellement trouvées, sélection, montage.
+     2. « RsT »               : jusqu'à 6 liens TikTok, un travail indépendant par
+                                lien → analyse, script, recherche de vidéos réellement
+                                trouvées, sélection, montage. Voix off importée possible.
      3. « Montage multi-source » : 1 à 20 liens collés, validés un par un.
 
    Tout ce qui est affiché provient de l'API : aucune donnée inventée.
