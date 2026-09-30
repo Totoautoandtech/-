@@ -349,6 +349,13 @@
       complet.append(el('div', 'server-row',
         `Voix off importée : ${voixOffMaxMo()} Mo maximum · ${voixOffExtensions().join(' ')}`));
     }
+    if (serverConfig && serverConfig.voix_off_generee) {
+      const vog = serverConfig.voix_off_generee;
+      complet.append(ligneServeur('Voix off générée', Boolean(sante.voix_off_generee_disponible),
+        `${vog.moteur} · ${vog.voix} · gratuit, sans clé`));
+      complet.append(el('div', 'server-row',
+        'Livraison RsT : vidéo muette + script .txt + voix off .mp3, téléchargés séparément'));
+    }
     const top = $('top-status');
     top.querySelector('span').textContent = sante.ok ? 'Studio opérationnel' : 'Service indisponible';
   }
@@ -656,6 +663,13 @@
      RsT : « Vidéos trouvées par RsT » (données réelles uniquement)
   ------------------------------------------------------------------ */
 
+  function lienTelechargement(url, libelle, nomFichier) {
+    const lien = el('a', '', libelle);
+    lien.href = url;
+    lien.download = nomFichier || '';
+    return lien;
+  }
+
   function foundItem(video) {
     const item = el('div', `found-item${video.selected ? ' selected' : ''}`);
 
@@ -850,13 +864,18 @@
       }
       if (data.error) carte.append(el('p', 'job-error', data.error));
 
+      // Livraison séparée : la vidéo reste muette, le script et le MP3 se prennent à côté.
+      if (data.voix_erreur) {
+        carte.append(el('p', 'job-note', `Voix off non générée : ${data.voix_erreur} Le script reste téléchargeable.`));
+      }
+
       const actions = el('div', 'job-actions');
       if (data.url) {
         actions.append(boutonAction('Voir', () => showResult(data.url, data.drive, data.title || entree.titre)));
-        const telecharger = el('a', '', 'Télécharger');
-        telecharger.href = data.url; telecharger.download = '';
-        actions.append(telecharger);
+        actions.append(lienTelechargement(data.url, 'Vidéo (muette)', ''));
       }
+      if (data.script_url) actions.append(lienTelechargement(data.script_url, 'Script .txt', data.script_nom || 'script.txt'));
+      if (data.voix_url) actions.append(lienTelechargement(data.voix_url, 'Voix off .mp3', data.voix_nom || 'voix-off.mp3'));
       if (!fini) {
         actions.append(boutonAction('Annuler', async (evenement) => {
           const bouton = evenement.currentTarget;

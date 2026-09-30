@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -99,6 +100,17 @@ RST_NOMS_CHOIX = (3, 5)
 RST_NOMS_DEFAUT = 3
 # Aucun plan du montage RsT ne dépasse 5 secondes.
 RST_DUREE_MAX_PLAN = 5.0
+
+# Livraison séparée : la vidéo finale reste MUETTE. Le script est livré en .txt et la
+# voix off est synthétisée en .mp3 par edge-tts — gratuit, sans clé d'API et sans compte.
+# Speechma a été écarté : payant. Les deux fichiers se téléchargent à côté de la vidéo.
+EDGE_TTS_VOIX = _env("EDGE_TTS_VOIX", "fr-FR-DeniseNeural")
+EDGE_TTS_DEBIT = _env("EDGE_TTS_DEBIT", "+0%")
+# edge-tts appelle speech.platform.bing.com : sur un réseau qui le bloque, la synthèse
+# échoue proprement et le travail se termine quand même avec la vidéo et le script.
+EDGE_TTS_DELAI = 45.0
+# Marge de sécurité : au-delà, la synthèse dépasserait le temps imparti sur Render Free.
+VOIX_OFF_TEXTE_MAX = 4000
 
 
 @dataclass
@@ -1280,6 +1292,124 @@ async def construire_montage(liens_videos: list[str], hook: str, corps: str, sty
 
 
 # ======================================================================================
+# LIVRAISON SÉPARÉE : script .txt + voix off .mp3 générée (edge-tts), vidéo muette
+# ======================================================================================
+#
+# La vidéo finale ne contient AUCUNE piste audio générée : elle reste muette. Le script
+# et sa lecture à voix haute se téléchargent à côté, en deux fichiers indépendants.
+# L'utilisateur reste libre de les monter lui-même, ou d'importer sa propre voix off.
+
+
+def composer_script_txt(
+    script: dict[str, Any],
+    seed: Optional[dict[str, Any]] = None,
+    noms: Optional[list[str]] = None,
+) -> str:
+    """Met en forme le script livré en .txt — uniquement des données réelles du travail."""
+    hook = str(script.get("hook") or "").strip()
+    corps = str(script.get("corps") or "").strip()
+    lignes = ["SCRIPT", "=" * 6, "", "ACCROCHE", hook or "(vide)", "", "CORPS", corps or "(vide)"]
+
+    if noms:
+        lignes += ["", "NOMS RECHERCHÉS", ", ".join(noms)]
+    if seed:
+        titre = str(seed.get("title") or "").strip()
+        auteur = str(seed.get("author") or "").strip()
+        lignes += ["", "VIDÉO DE DÉPART"]
+        if auteur:
+            lignes.append(f"Auteur : @{auteur}")
+        if titre:
+            lignes.append(f"Légende : {titre}")
+        if seed.get("url"):
+            lignes.append(f"Lien : {seed['url']}")
+
+    mot_cle = str(script.get("mot_cle_broll") or "").strip()
+    if mot_cle:
+        lignes += ["", "UNIVERS VISUEL", mot_cle]
+    lignes += [
+        "", "-" * 60,
+        "La vidéo livrée est muette : ce script et le MP3 de voix off se téléchargent à part.",
+    ]
+    return "\n".join(lignes) + "\n"
+
+
+def texte_a_dire(script: dict[str, Any]) -> str:
+    """Texte réellement lu par la voix off : l'accroche puis le corps, rien d'autre."""
+    hook = str(script.get("hook") or "").strip()
+    corps = str(script.get("corps") or "").strip()
+    parle = " ".join(part for part in (hook, corps) if part).strip()
+    return parle[:VOIX_OFF_TEXTE_MAX]
+
+
+async def synthetiser_voix_off(texte: str, destination: Path) -> int:
+    """Génère un MP3 avec edge-tts (gratuit, sans clé). Retourne la taille écrite.
+
+    Lève ErreurApp si le service est injoignable ou renvoie un fichier vide : aucun
+    fichier factice n'est laissé derrière, et l'appelant reste libre de continuer.
+    """
+    propre = str(texte or "").strip()
+    if not propre:
+        raise ErreurApp("Script vide : il n'y a rien à lire pour la voix off.")
+    try:
+        import edge_tts  # import tardif : le module n'est requis qu'à la synthèse
+    except ImportError as exc:  # pragma: no cover - dépendance déclarée dans requirements
+        raise ErreurApp("edge-tts n'est pas installé sur le serveur.") from exc
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        communicate = edge_tts.Communicate(propre, EDGE_TTS_VOIX, rate=EDGE_TTS_DEBIT)
+        async with asyncio.timeout(EDGE_TTS_DELAI):
+            await communicate.save(str(destination))
+    except asyncio.TimeoutError as exc:
+        destination.unlink(missing_ok=True)
+        raise ErreurApp(
+            f"La synthèse vocale n'a pas répondu sous {EDGE_TTS_DELAI:.0f} s."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - edge-tts remonte des erreurs réseau variées
+        destination.unlink(missing_ok=True)
+        raise ErreurApp(f"Synthèse vocale indisponible : {exc}") from exc
+
+    taille = destination.stat().st_size if destination.is_file() else 0
+    if taille <= 0:
+        destination.unlink(missing_ok=True)
+        raise ErreurApp("La synthèse vocale a renvoyé un fichier audio vide.")
+    return taille
+
+
+async def livrer_script_et_voix(
+    script: dict[str, Any],
+    seed: Optional[dict[str, Any]] = None,
+    noms: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Écrit le script .txt puis tente le MP3. Un échec de synthèse ne perd pas le script."""
+    base = uuid.uuid4().hex
+    chemin_txt = DOSSIER_VIDEOS / f"{base}.txt"
+    chemin_txt.write_text(composer_script_txt(script, seed, noms), encoding="utf-8")
+
+    livraison: dict[str, Any] = {
+        "script_url": f"/videos/{chemin_txt.name}",
+        "script_nom": "script.txt",
+        "voix_url": "",
+        "voix_nom": "",
+        "voix_erreur": "",
+        "voix_moteur": f"edge-tts · {EDGE_TTS_VOIX}",
+    }
+
+    chemin_mp3 = DOSSIER_VIDEOS / f"{base}.mp3"
+    try:
+        taille = await synthetiser_voix_off(texte_a_dire(script), chemin_mp3)
+    except ErreurApp as exc:
+        # Honnêteté : on dit pourquoi le MP3 manque, on ne livre pas d'audio factice.
+        logger.warning("[voix off] synthèse impossible : %s", exc)
+        livraison["voix_erreur"] = str(exc)
+    else:
+        livraison["voix_url"] = f"/videos/{chemin_mp3.name}"
+        livraison["voix_nom"] = "voix-off.mp3"
+        livraison["voix_octets"] = taille
+    return livraison
+
+
+# ======================================================================================
 # MODE « RsT » : un seul lien TikTok de départ → script + vraies vidéos trouvées → montage
 # ======================================================================================
 
@@ -1480,15 +1610,16 @@ async def _produire_rst(
         auteur = str((donnees.get("author") or {}).get("unique_id") or "").strip().lstrip("@")
         identifiant_depart = str(donnees.get("id") or donnees.get("video_id") or "").strip()
 
+        seed_infos = {
+            "url": lien, "title": legende[:200], "author": auteur,
+            "duration": donnees.get("duration"),
+        }
+
         contexte.update(statut="analysing", progress=12, detail="Rédaction du script à partir de la légende")
         script = await generer_script(legende)
         contexte.update(
             statut="analysing", progress=18, detail="Script prêt — extraction des noms à chercher",
-            script=script,
-            seed={
-                "url": lien, "title": legende[:200], "author": auteur,
-                "duration": donnees.get("duration"),
-            },
+            script=script, seed=seed_infos,
         )
 
         # TOP N : 3 ou 5 noms tirés de la vraie légende, chacun cherché séparément.
@@ -1661,10 +1792,18 @@ async def _produire_rst(
         voix_off=_resoudre_voix_off(session_id, requete.voix_off),
     )
     await envoyer_script_et_video(script["hook"], script["corps"], resultat["path"])
+
+    # Livraison séparée : la vidéo reste muette, le script et la voix off partent à côté.
+    contexte.update(
+        statut="delivering", progress=92,
+        detail="Écriture du script et génération de la voix off",
+    )
+    livraison = await livrer_script_et_voix(script, seed_infos, noms)
+
     resultat.update(
         script=script, found_videos=trouves, search_queries=requetes_reelles,
         noms=noms, nombre_noms=nombre_noms, noms_couverts=noms_couverts,
-        duree_max_plan=RST_DUREE_MAX_PLAN,
+        duree_max_plan=RST_DUREE_MAX_PLAN, **livraison,
     )
     return resultat
 
@@ -1905,10 +2044,15 @@ def _purger_jobs() -> None:
         empreinte = job.get("fingerprint")
         if empreinte and JOB_INDEX.get(empreinte) == identifiant:
             JOB_INDEX.pop(empreinte, None)
-        url = str(job.get("url", ""))
-        nom = Path(urlparse(url).path).name
-        if urlparse(url).path == f"/videos/{nom}" and re.fullmatch(r"[a-f0-9]{32}\.mp4", nom):
-            (DOSSIER_VIDEOS / nom).unlink(missing_ok=True)
+        # Vidéo, script .txt et voix off .mp3 expirent ensemble avec leur travail.
+        for cle in ("url", "script_url", "voix_url"):
+            url = str(job.get(cle, ""))
+            nom = Path(urlparse(url).path).name
+            if (
+                urlparse(url).path == f"/videos/{nom}"
+                and re.fullmatch(r"[a-f0-9]{32}\.(mp4|txt|mp3)", nom)
+            ):
+                (DOSSIER_VIDEOS / nom).unlink(missing_ok=True)
 
     seuil = time.time() - max(DUREE_VIE_JOB, CONFIG.delai_job * 2)
     for dossier in DOSSIER_TRAVAIL.iterdir():
@@ -2186,6 +2330,8 @@ async def sante() -> dict[str, Any]:
         "google_drive_configure": bool(CONFIG.google_client_id and CONFIG.google_client_secret),
         "job_timeout_seconds": CONFIG.delai_job,
         "max_source_seconds": CONFIG.duree_max_source,
+        # Synthèse vocale gratuite et sans clé : on signale seulement si le module est là.
+        "voix_off_generee_disponible": importlib.util.find_spec("edge_tts") is not None,
     }
 
 
@@ -2209,6 +2355,12 @@ async def configuration_publique() -> dict[str, Any]:
         },
         "voix_off_max_mo": VOIX_OFF_MAX_MO,
         "voix_off_extensions": sorted(VOIX_OFF_EXTENSIONS),
+        "voix_off_generee": {
+            "moteur": "edge-tts",
+            "voix": EDGE_TTS_VOIX,
+            "gratuit": True,
+            "livraison": "separee",
+        },
         "gemini_modeles": _modeles_gemini(),
     }
 

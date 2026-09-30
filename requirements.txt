@@ -4,3 +4,5 @@ aiohttp>=3.9,<4
 aiofiles>=23.2,<24
 beautifulsoup4>=4.12,<5
 pydantic>=2.6,<3
+# Synthèse vocale gratuite et sans clé d'API (voix Microsoft Edge en ligne).
+edge-tts>=6.1,<8
