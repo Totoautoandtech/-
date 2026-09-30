@@ -4,8 +4,14 @@
    Trois sections de création :
      1. « Lien → vidéo »     : un lien → script éditable → vidéo verticale.
      2. « RsT »               : jusqu'à 6 liens TikTok, un travail indépendant par
-                                lien → analyse, script, recherche de vidéos réellement
-                                trouvées, sélection, montage. Voix off importée possible.
+                                lien → analyse, script, extraction de 3 ou 5 noms
+                                (TOP N), une recherche TikTok par nom, sélection des
+                                sources réellement trouvées, montage en plans de 5 s
+                                maximum. Livraison séparée : la vidéo reste muette,
+                                le script .txt et la voix off .mp3 générée par
+                                edge-tts se téléchargent à côté. Une voix off
+                                importée par l'utilisateur reste possible, et
+                                celle-là est incrustée dans la vidéo.
      3. « Montage multi-source » : 1 à 20 liens collés, validés un par un.
 
    Tout ce qui est affiché provient de l'API : aucune donnée inventée.
