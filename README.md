@@ -17,7 +17,15 @@ La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **
    Tout supprimer). Chaque lien lance **son propre travail** `POST /api/jobs/rst` et dispose d'une
    carte de suivi indépendante (progression, annulation, bouton Voir) ainsi que de son propre bloc
    « Vidéos trouvées par RsT ». Le suivi de tous ces travaux reprend après actualisation de la page.
-   Pour chaque lien : RsT lit la légende réelle, rédige le script, interroge TikWM (publications du créateur + recherches par mots-clés tirés des hashtags et de la légende) pour trouver jusqu'à 40 vidéos candidates réelles, affiche la liste « Vidéos trouvées par RsT » (durée, auteur, origine, raison d'exclusion), retient jusqu'à 20 bonnes sources dans les limites de durée et de temps Render, puis lance automatiquement le montage. Aucune vidéo, résultat ou miniature inventé : si TikWM ne renvoie rien, le travail échoue avec un message honnête.
+   Pour chaque lien, le pipeline **TOP N** : RsT lit la légende réelle, rédige le script, puis demande
+   à l'IA les **3 ou 5 noms** réellement cités (personnes, lieux, marques, œuvres…) — choix fait dans
+   l'interface. **Chaque nom donne lieu à sa propre recherche TikTok**, les candidates sont réparties
+   nom par nom (tour de rôle) pour qu'aucun nom n'écrase les autres, puis RsT retient jusqu'à 20 bonnes
+   sources dans les limites de durée et de temps Render et lance le montage en **plans de 5 s maximum**.
+   La liste « Vidéos trouvées par RsT » affiche durée, auteur, origine, nom recherché et raison
+   d'exclusion. Si l'IA ne trouve aucun nom, RsT retombe sur les mots-clés réellement présents dans la
+   légende (hashtags, thème visuel, mots fréquents). Aucune vidéo, résultat ou miniature inventé : si
+   TikWM ne renvoie rien, le travail échoue avec un message qui détaille les recherches tentées.
 3. **Montage multi-source** — jusqu'à 20 liens collés manuellement, organisés en onglets Script / Sources / Référence / Réglages, avec les boutons Coller, Valider et Tout supprimer. La validation affiche l'état réel de chaque source (accessible, durée, dimensions, codec, erreur).
 
 Les **modes Rapide et Qualité** (720 × 1280 priorité vitesse, ou CRF 21 + 1080 × 1920 si `AUTORISER_EXPORT_1080`) et l'**intensité des transitions** (aucune, légère, modérée, forte) sont réglables dans Paramètres et dans l'onglet Réglages ; ils s'appliquent aux trois sections. Le suivi de génération est réel (états, progression, état par source), l'historique des 6 dernières heures permet lecture, téléchargement, Drive et annulation, et un travail en cours est repris après actualisation de la page. Aucun faux compte, aucune fausse donnée, aucun abonnement payant.
@@ -78,6 +86,10 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 | `AUTORISER_EXPORT_1080` | `false` | affiche l'option 1080 × 1920, nettement plus lente |
 | `RST_CANDIDATS_MAX` | `40` | vidéos TikTok candidates recherchées par RsT |
 | `RST_SOURCES_MAX` | `20` | sources retenues par RsT pour le montage final |
+
+Le TOP N (3 ou 5 noms) et le plafond de 5 s par plan ne sont pas configurables par variable
+d'environnement : ce sont des constantes du pipeline (`RST_NOMS_CHOIX`, `RST_DUREE_MAX_PLAN`),
+exposées en lecture via `/api/config`.
 
 ### OAuth
 

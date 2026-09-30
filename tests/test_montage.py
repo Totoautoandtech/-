@@ -200,3 +200,60 @@ def test_arguments_audio_avec_voix_off_mappe_une_piste_aac():
     assert entrees == ["-i", "/tmp/voix.mp3"]
     assert filtres == ["[4:a]apad[a]"]
     assert sortie == ["-map", "[a]", "-c:a", "aac", "-b:a", "160k", "-shortest"]
+
+
+def _analyses_longues(segments, nombre=3, duree=30.0):
+    """Sources longues et parfaitement pertinentes : rien ne bride la durée des plans."""
+    analyses, metadata = {}, {}
+    for index in range(nombre):
+        nom = f"source_{index}"
+        metadata[nom] = {"duration": duree}
+        analyses[nom] = [{
+            "debut": 0.0, "fin": duree, "sujet": "test", "action_mouvement": "dynamique",
+            "qualite": "bonne", "nettete": 0.9, "cadrage": "vertical", "texte_visible": False,
+            "watermark": False,
+            "pertinence_script": [{"id": s["id"], "score": 0.9} for s in segments],
+            "rythme": "dynamique", "transition_recommandee": "cut", "score_pertinence": 0.9,
+        }]
+    return analyses, metadata
+
+
+def test_aucun_plan_ne_depasse_cinq_secondes_meme_avec_un_style_lent():
+    """Un style de référence très lent ne doit jamais produire de plan de plus de 5 s."""
+    segments = montage.creer_segments_script(
+        "Voici le secret incroyable",
+        "La première scène explique le contexte. La seconde montre le résultat final.",
+    )
+    assert all(s["duree_cible"] <= montage.DUREE_MAX_PLAN_DEFAUT for s in segments)
+
+    style_lent = montage.STYLE_DEFAUT.model_copy(deep=True, update={"duree_moyenne_plans": 9.5})
+    analyses, metadata = _analyses_longues(segments)
+    plan = montage.selectionner_plan(segments, analyses, metadata, style_lent)
+    assert plan
+    assert all(p["duree"] <= montage.DUREE_MAX_PLAN_DEFAUT for p in plan)
+    # Les plans du corps restent « pleins » : on plafonne sans raboter le rythme.
+    assert all(p["duree"] == montage.DUREE_MAX_PLAN_DEFAUT for p in plan if not p["hook"])
+
+
+def test_duree_max_plan_personnalisee_borne_segments_et_plan():
+    """Le plafond est configurable de bout en bout : segments, plan et garde-fou final."""
+    segments = montage.creer_segments_script(
+        "Une accroche marquante", "Une phrase complète. Une autre phrase.", 3.0
+    )
+    assert all(s["duree_cible"] <= 3.0 for s in segments)
+
+    analyses, metadata = _analyses_longues(segments)
+    plan = montage.selectionner_plan(
+        segments, analyses, metadata, montage.STYLE_DEFAUT, 2, 3.0
+    )
+    assert all(p["duree"] <= 3.0 for p in plan)
+
+
+@pytest.mark.parametrize("valeur", [0, -4, None, "abc", float("nan")])
+def test_duree_max_plan_invalide_retombe_sur_cinq_secondes(valeur):
+    assert montage._borner_duree_plan(valeur) == montage.DUREE_MAX_PLAN_DEFAUT
+
+
+def test_configuration_montage_porte_la_duree_max_plan(tmp_path):
+    config = montage.ConfigurationMontage(dossier_travail=tmp_path, dossier_videos=tmp_path)
+    assert config.duree_max_plan == montage.DUREE_MAX_PLAN_DEFAUT

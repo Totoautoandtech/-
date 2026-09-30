@@ -159,7 +159,7 @@
                 <h2>RsT</h2>
                 <span class="chip">02</span>
               </div>
-              <p class="lead">Colle <strong>jusqu’à 6 liens TikTok de départ</strong>, un par ligne. Chaque lien lance son propre travail : RsT analyse la vidéo, prépare le script, recherche jusqu’à 40 vidéos TikTok candidates, sélectionne jusqu’à 20 bonnes sources, puis crée automatiquement le montage final. Seules les vidéos réellement trouvées sont affichées.</p>
+              <p class="lead">Colle <strong>jusqu’à 6 liens TikTok de départ</strong>, un par ligne. Chaque lien lance son propre travail : RsT analyse la vidéo, prépare le script, en extrait <strong>3 ou 5 noms</strong>, lance une recherche TikTok par nom, sélectionne les meilleures sources, puis crée automatiquement le montage final en <strong>plans de 5 s maximum</strong>. Seules les vidéos réellement trouvées sont affichées.</p>
 
               <div class="field">
                 <div class="field-label-row">
@@ -172,6 +172,17 @@
                   <button class="btn ghost" id="rst-coller" type="button">Coller</button>
                   <button class="btn ghost danger" id="rst-clear" type="button">Tout supprimer</button>
                 </div>
+              </div>
+
+              <div class="field">
+                <div class="field-label-row">
+                  <label class="field-label" for="rst-noms-choices">Nombre de noms recherchés (TOP N)</label>
+                </div>
+                <div class="seg choices" id="rst-noms-choices">
+                  <button class="seg-item active" data-noms="3" type="button">3 noms</button>
+                  <button class="seg-item" data-noms="5" type="button">5 noms</button>
+                </div>
+                <p class="hint" id="rst-noms-hint">L’IA extrait les noms réellement cités dans la vidéo de départ (personnes, lieux, marques…). Chaque nom lance sa propre recherche TikTok, et chaque nom trouvé est représenté dans le montage.</p>
               </div>
 
               <div class="field voix-field">

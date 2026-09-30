@@ -264,7 +264,7 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
                 "video_id": "111", "title": "seed", "duration": 21,
                 "author": {"unique_id": "chef"},
             }]
-            for i in range(20):
+            for i in range(12):
                 videos.append({
                     "video_id": f"1{i + 12}", "title": f"Recette numéro {i}",
                     "duration": 12 + i % 5, "author": {"unique_id": "chef"},
@@ -274,10 +274,12 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
             videos.append({"video_id": "902", "title": "durée inconnue", "duration": None, "author": {"unique_id": "chef"}})
             return {"videos": videos}
         if chemin == "/feed/search":
+            # Chaque nom du TOP N ramène ses propres vidéos, jamais les mêmes.
+            mot = params["keywords"]
             return {"videos": [
-                {"video_id": f"2{i:03d}", "title": f"vidéo de recherche {i}",
-                 "duration": 14 + i % 3, "author": {"unique_id": f"auteur{i}"}}
-                for i in range(20)
+                {"video_id": f"2{abs(hash(mot)) % 900:03d}{i}", "title": f"{mot} {i}",
+                 "duration": 14 + i % 3, "author": {"unique_id": f"auteur_{i}"}}
+                for i in range(4)
             ]}
         raise AssertionError(f"endpoint TikWM inattendu : {chemin}")
 
@@ -312,6 +314,11 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
     # Vidéos réellement trouvées : seed exclue, plafonnées au maximum configuré.
     trouves = job["found_videos"]
     assert 20 <= len(trouves) <= app.CONFIG.rst_candidats_max
+    # Pipeline TOP N : trois noms par défaut, une recherche TikTok par nom.
+    assert job["nombre_noms"] == 3
+    assert 1 <= len(job["noms"]) <= 3
+    recherches = [params["keywords"] for chemin, params in appels if chemin == "/feed/search"]
+    assert recherches == job["noms"]
     assert all(v["video_id"] != "111" for v in trouves)
     assert all(v["url"].startswith("https://www.tiktok.com/@") for v in trouves)
     retenues = [v for v in trouves if v["selected"]]
@@ -615,3 +622,131 @@ def test_interface_contient_rst_multiple_et_voix_off():
     assert '"Inter"' in css and '"DM Mono"' in css
     assert "#7c5cff" not in css and "#43d9ff" not in css
     assert "--accent: #ffffff;" in css
+
+
+# ======================================================================================
+# PIPELINE RsT « TOP N » : 3 ou 5 noms, une recherche par nom, plans de 5 s maximum
+# ======================================================================================
+
+
+@pytest.mark.parametrize("demande,attendu", [(3, 3), (5, 5), (4, 3), (0, 3), (None, 3), ("x", 3)])
+def test_borner_nombre_noms_n_accepte_que_trois_ou_cinq(demande, attendu):
+    assert app.borner_nombre_noms_rst(demande) == attendu
+
+
+def test_noms_rst_nettoyes_dedupliques_et_ordonnes():
+    noms = app._deduplique_noms(
+        ["  #Paris ", "@Paris", "PARIS", "", "  ", "x", "a" * 60, "Tour Eiffel", "Louvre"], 3
+    )
+    # Casse et préfixes ignorés pour la déduplication, ordre d'importance préservé.
+    assert noms == ["Paris", "Tour Eiffel", "Louvre"]
+
+
+def test_rst_refuse_un_nombre_de_noms_hors_trois_et_cinq(client):
+    response = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@chef/video/111", "nombre_noms": 4,
+    })
+    assert response.status_code == 422
+
+
+def test_extraire_noms_rst_prefere_l_ia_puis_retombe_sur_la_legende(monkeypatch):
+    async def ia_ok(_parts, **_kwargs):
+        return '{"noms": ["Kylian Mbappé", "Real Madrid", "Bernabéu"]}'
+
+    monkeypatch.setattr(app, "_appel_gemini_brut", ia_ok)
+    noms = asyncio.run(app.extraire_noms_rst("Mbappé au Real #football", 3))
+    assert noms == ["Kylian Mbappé", "Real Madrid", "Bernabéu"]
+
+    # Gemini indisponible : on retombe sur les mots réellement présents, sans rien inventer.
+    async def ia_ko(_parts, **_kwargs):
+        raise app.ErreurApp("Gemini saturé")
+
+    monkeypatch.setattr(app, "_appel_gemini_brut", ia_ko)
+    replis = asyncio.run(app.extraire_noms_rst("Recette de pancakes #cuisine #food", 3))
+    assert replis
+    assert all(isinstance(nom, str) and nom.strip() for nom in replis)
+    assert "cuisine" in [nom.lower() for nom in replis]
+
+
+def test_repartir_par_nom_alterne_les_noms_et_relegue_le_fil_auteur():
+    candidats = [
+        {"video_id": "a1", "nom": "Paris"}, {"video_id": "a2", "nom": "Paris"},
+        {"video_id": "b1", "nom": "Lyon"},
+        {"video_id": "z1", "nom": ""},
+        {"video_id": "c1", "nom": "Nice"}, {"video_id": "c2", "nom": "Nice"},
+    ]
+    ordonnes = app._repartir_par_nom(candidats, ["Paris", "Lyon", "Nice"])
+    # Un tour complet par rang : chaque nom est servi avant que le premier ne se resserve.
+    assert [c["video_id"] for c in ordonnes] == ["a1", "b1", "c1", "a2", "c2", "z1"]
+
+
+def test_rst_cinq_noms_lance_cinq_recherches_et_couvre_chaque_nom(client, monkeypatch):
+    noms_ia = ["Mbappé", "Real Madrid", "Bernabéu", "Vinicius", "Ancelotti"]
+
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            return {"id": "42", "title": "Mbappé au Real Madrid", "duration": 18,
+                    "author": {"unique_id": "foot"}}
+        if chemin == "/user/posts":
+            return {"videos": []}
+        if chemin == "/feed/search":
+            mot = params["keywords"]
+            rang = noms_ia.index(mot)
+            return {"videos": [
+                {"video_id": f"{rang}{i}", "title": f"{mot} {i}", "duration": 12,
+                 "author": {"unique_id": f"src{rang}{i}"}}
+                for i in range(3)
+            ]}
+        raise AssertionError(chemin)
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def script(_texte):
+        return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "football"}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    async def noms(_legende, _nombre, _broll=""):
+        return list(noms_ia)
+
+    monkeypatch.setattr(app, "extraire_noms_rst", noms)
+
+    recus = []
+
+    async def montage_fake(**kwargs):
+        recus.append(kwargs)
+        return {"url": "/videos/top5.mp4", "path": app.DOSSIER_VIDEOS / "top5.mp4",
+                "sources": [], "source_errors": []}
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    reponse = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@foot/video/42", "nombre_noms": 5,
+    })
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+
+    assert job["nombre_noms"] == 5
+    assert job["noms"] == noms_ia
+    # Le fil de l'auteur ouvre la marche, puis une recherche par nom, dans l'ordre.
+    assert job["search_queries"] == ["@foot", *noms_ia]
+    assert sorted(job["noms_couverts"]) == sorted(noms_ia)  # aucun nom laissé de côté
+    # Le montage RsT impose des plans de 5 s maximum.
+    assert recus[0]["config"].duree_max_plan == app.RST_DUREE_MAX_PLAN == 5.0
+
+
+def test_config_publique_expose_le_top_n(client):
+    rst = client.get("/api/config").json()["rst"]
+    assert rst["noms_choix"] == [3, 5]
+    assert rst["noms_defaut"] == 3
+    assert rst["duree_max_plan"] == 5.0
+
+
+def test_interface_propose_le_choix_du_top_n():
+    racine = Path(__file__).parents[1]
+    html = (racine / "static" / "index.html").read_text(encoding="utf-8")
+    js = (racine / "static" / "main.js").read_text(encoding="utf-8")
+    assert 'id="rst-noms-choices"' in html
+    assert 'data-noms="3"' in html and 'data-noms="5"' in html
+    assert "nombre_noms" in js and "rstNombreNoms" in js

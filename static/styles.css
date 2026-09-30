@@ -779,6 +779,15 @@ input:focus, textarea:focus {
   font: 400 10px var(--font-mono);
 }
 
+/* Nom du TOP N qui a permis de trouver cette vidéo. */
+.found-nom {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font: 400 10px var(--font-mono);
+  opacity: 0.75;
+}
+
 .found-side { display: grid; gap: 6px; justify-items: end; flex: none; }
 
 .badge {
