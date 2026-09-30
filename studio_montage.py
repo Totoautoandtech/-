@@ -784,6 +784,26 @@ def _echapper_filtre(chemin: Path) -> str:
     return str(chemin.resolve()).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
 
 
+def _arguments_audio(
+    voix_off: Optional[Path], index_entree: int
+) -> tuple[list[str], list[str], list[str]]:
+    """Arguments FFmpeg pour la voix off importée.
+
+    Sans voix off, le montage reste muet (`-an`) comme avant. Avec une voix off, le
+    fichier devient une entrée supplémentaire, `apad` prolonge l'audio si la piste est
+    plus courte que l'image, et `-shortest` coupe à la fin du plus court des deux.
+
+    Retourne (entrées supplémentaires, filtres audio, arguments de sortie).
+    """
+    if not voix_off:
+        return [], [], ["-an"]
+    return (
+        ["-i", str(voix_off)],
+        [f"[{index_entree}:a]apad[a]"],
+        ["-map", "[a]", "-c:a", "aac", "-b:a", "160k", "-shortest"],
+    )
+
+
 async def exporter_plan(
     plan: list[dict[str, Any]],
     sources: dict[str, Path],
@@ -792,6 +812,7 @@ async def exporter_plan(
     rapporteur: Rapporteur,
     resolution: str,
     dossier: Path,
+    voix_off: Optional[Path] = None,
 ) -> Path:
     if resolution == "1080" and not config.autoriser_1080:
         raise ErreurMontage("L’export 1080 × 1920 est désactivé sur cette instance pour protéger ses ressources.")
@@ -840,9 +861,14 @@ async def exporter_plan(
         duree_courante += float(plan[i]["duree"]) - duree_transition
 
     filtres.append(f"[{courant}]ass=filename='{_echapper_filtre(ass)}'[final]")
+
+    entrees_audio, filtres_audio, sortie_audio = _arguments_audio(voix_off, len(plan))
+    commande += entrees_audio
+    filtres += filtres_audio
+
     sortie = config.dossier_videos / f"{uuid.uuid4().hex}.mp4"
     commande += [
-        "-filter_complex", ";".join(filtres), "-map", "[final]", "-an",
+        "-filter_complex", ";".join(filtres), "-map", "[final]", *sortie_audio,
         "-c:v", "libx264", "-preset", config.preset, "-crf", str(max(14, min(30, int(config.crf)))),
         "-pix_fmt", "yuv420p", "-r", str(config.fps), "-threads", str(config.threads_ffmpeg),
         "-movflags", "+faststart", str(sortie),
@@ -884,6 +910,7 @@ async def construire_montage_professionnel(
     telechargeur: Telechargeur,
     appel_gemini: AppelGemini,
     intensite_transitions: int = 2,
+    voix_off: Optional[Path] = None,
 ) -> dict[str, Any]:
     debut_global = time.monotonic()
     propres, erreurs_forme, doublons = normaliser_liens_tiktok(liens)
@@ -1055,7 +1082,8 @@ async def construire_montage_professionnel(
             } for p in plan],
         )
         sortie = await exporter_plan(
-            plan, sources, style_reference, config, rapporteur, resolution, dossier
+            plan, sources, style_reference, config, rapporteur, resolution, dossier,
+            voix_off=voix_off,
         )
         return {
             "path": sortie,

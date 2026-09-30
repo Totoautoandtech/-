@@ -14,6 +14,11 @@ services:
         sync: false
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
+      # Chaîne de modèles de secours essayée dans l'ordre. Quand Google répond 503
+      # « This model is currently experiencing high demand » (ou 429), l'appel bascule
+      # automatiquement sur le modèle suivant, puis sur la clé suivante.
+      - key: GEMINI_MODELES
+        value: gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash
       - key: DUREE_CIBLE_SECONDES
         value: "30"
       # Garde-fous adaptés à Render Free (512 Mo). La limite globale vaut 9 min 30.

@@ -13,7 +13,11 @@ Le dashboard (sombre, premium, responsive) est construit en HTML/CSS/JS natif un
 La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **Paramètres**. La vue Créer propose exactement trois sections :
 
 1. **Lien → vidéo** — un lien d'article, de page ou de TikTok devient un script éditable (accroche + corps + univers visuel), puis une vidéo verticale sous-titrée à partir de B-roll Pexels.
-2. **RsT** — un seul lien TikTok de départ. RsT lit la légende réelle, rédige le script, interroge TikWM (publications du créateur + recherches par mots-clés tirés des hashtags et de la légende) pour trouver jusqu'à 40 vidéos candidates réelles, affiche la liste « Vidéos trouvées par RsT » (durée, auteur, origine, raison d'exclusion), retient jusqu'à 20 bonnes sources dans les limites de durée et de temps Render, puis lance automatiquement le montage. Aucune vidéo, résultat ou miniature inventé : si TikWM ne renvoie rien, le travail échoue avec un message honnête.
+2. **RsT** — jusqu'à **6 liens TikTok de départ** (un par ligne, compteur `0/6`, boutons Coller et
+   Tout supprimer). Chaque lien lance **son propre travail** `POST /api/jobs/rst` et dispose d'une
+   carte de suivi indépendante (progression, annulation, bouton Voir) ainsi que de son propre bloc
+   « Vidéos trouvées par RsT ». Le suivi de tous ces travaux reprend après actualisation de la page.
+   Pour chaque lien : RsT lit la légende réelle, rédige le script, interroge TikWM (publications du créateur + recherches par mots-clés tirés des hashtags et de la légende) pour trouver jusqu'à 40 vidéos candidates réelles, affiche la liste « Vidéos trouvées par RsT » (durée, auteur, origine, raison d'exclusion), retient jusqu'à 20 bonnes sources dans les limites de durée et de temps Render, puis lance automatiquement le montage. Aucune vidéo, résultat ou miniature inventé : si TikWM ne renvoie rien, le travail échoue avec un message honnête.
 3. **Montage multi-source** — jusqu'à 20 liens collés manuellement, organisés en onglets Script / Sources / Référence / Réglages, avec les boutons Coller, Valider et Tout supprimer. La validation affiche l'état réel de chaque source (accessible, durée, dimensions, codec, erreur).
 
 Les **modes Rapide et Qualité** (720 × 1280 priorité vitesse, ou CRF 21 + 1080 × 1920 si `AUTORISER_EXPORT_1080`) et l'**intensité des transitions** (aucune, légère, modérée, forte) sont réglables dans Paramètres et dans l'onglet Réglages ; ils s'appliquent aux trois sections. Le suivi de génération est réel (états, progression, état par source), l'historique des 6 dernières heures permet lecture, téléchargement, Drive et annulation, et un travail en cours est repris après actualisation de la page. Aucun faux compte, aucune fausse donnée, aucun abonnement payant.
@@ -58,7 +62,8 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 
 | Variable | Défaut | Rôle |
 |---|---:|---|
-| `GEMINI_MODEL` | `gemini-2.5-flash` | modèle Gemini |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | modèle Gemini principal |
+| `GEMINI_MODELES` | `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash` | chaîne de modèles de secours, essayés dans l'ordre en cas de 503 / 429 |
 | `DUREE_CIBLE_SECONDES` | `30` | durée du mode B-roll |
 | `DUREE_MAX_SOURCE_SECONDES` | `180` | limite annoncée et appliquée par source/référence |
 | `JOB_TIMEOUT_SECONDES` | `570` | limite globale, soit 9 min 30 |
@@ -86,6 +91,40 @@ https://VOTRE-SERVICE.onrender.com/api/oauth/google/callback
 TikTok utilise `user.info.basic`. Google utilise `drive.file`, limité aux fichiers créés par l'application. Les jetons restent côté serveur. Une vidéo terminée est envoyée automatiquement vers Drive si le compte est connecté ; une erreur Drive ne supprime pas le rendu local et le bouton manuel reste disponible.
 
 Les sessions OAuth et jobs sont en mémoire. La file continue côté serveur sans dépendre de la page ouverte et une actualisation du navigateur est prise en charge. En revanche, Render Free ne garantit pas un processus continu pendant une heure : une mise en veille, un redémarrage ou un redéploiement efface la file en mémoire. Drive reste donc la récupération la plus fiable pour les vidéos déjà terminées ; l'interface n'annonce jamais qu'un lot est garanti tant que ces limites gratuites existent.
+
+## Résilience Gemini (erreurs 503 « high demand »)
+
+Gemini renvoie régulièrement `503 UNAVAILABLE — This model is currently experiencing high demand`
+lorsque le modèle demandé est temporairement saturé. L'application ne s'arrête plus là :
+
+1. **Chaîne de modèles de secours** — `GEMINI_MODELES` liste les modèles essayés dans l'ordre
+   (défaut `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash`). Dès qu'un modèle répond
+   `503`, `UNAVAILABLE` ou `429`, l'appel bascule sur le modèle suivant, puis sur la clé suivante
+   de `GEMINI_API_KEYS`.
+2. **Retry renforcé** — pour les statuts `503`, `429` et `500`, jusqu'à **5 tentatives par modèle**
+   avec backoff exponentiel (2, 4, 8, 16 s), toujours dans la limite de `GEMINI_TIMEOUT_SECONDES`.
+   Une erreur définitive (`400`, clé invalide…) n'est pas réessayée : on passe directement au modèle
+   suivant.
+3. **Message clair** — si tous les modèles et toutes les clés sont saturés, l'interface affiche
+   exactement : « Gemini est momentanément saturé (503). Réessaie dans quelques minutes. »
+
+`GET /api/config` expose la chaîne réellement active dans `gemini_modeles`.
+
+## Voix off importée
+
+Les vidéos ne sont plus muettes : chaque section accepte un fichier **« Voix off · facultatif »**.
+
+- `POST /api/voixoff?nom=fichier.mp3` — le fichier audio est envoyé dans le **corps HTTP brut**,
+  25 Mo maximum, extensions `.mp3`, `.wav`, `.m4a`, `.aac`, `.ogg`, `.opus`.
+- Le serveur vérifie la présence d'une vraie piste audio avec **FFprobe** (`_sonder_audio`), stocke
+  le fichier dans `travail/voixoff/<session>/`, le lie à la session du navigateur et le purge au
+  bout de 6 h comme les rendus.
+- L'identifiant renvoyé est transmis dans le champ `voix_off` de `/api/jobs/video`,
+  `/api/jobs/montage` et `/api/jobs/rst`.
+- Intégration FFmpeg réelle : le montage ajoute l'audio via `[N:a]apad[a]` puis
+  `-map [a] -c:a aac -b:a 160k -shortest` (sans voix off, le rendu reste `-an`).
+
+Aucune synthèse vocale payante : c'est l'enregistrement fourni par l'utilisateur qui est monté.
 
 ## Performances attendues sur Render gratuit
 

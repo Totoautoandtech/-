@@ -1,3 +1,4 @@
+import os
 import asyncio
 import time
 from pathlib import Path
@@ -362,3 +363,255 @@ def test_rst_aucune_video_trouvee_echoue_honnetement(client, monkeypatch):
     job = _attendre_job(client, response.json()["job_id"])
     assert job["status"] == "failed"
     assert "aucune autre vidéo TikTok" in job["error"]
+
+
+# ======================================================================================
+# RÉSILIENCE GEMINI : 503 « high demand », chaîne de modèles et backoff
+# ======================================================================================
+
+
+class _FausseReponseGemini:
+    def __init__(self, statut: int, texte: str) -> None:
+        self.status = statut
+        self._texte = texte
+
+    async def text(self) -> str:
+        return self._texte
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _FausseSessionGemini:
+    """Remplace aiohttp.ClientSession : renvoie une réponse par modèle appelé."""
+
+    appels: list[str] = []
+    reponses_par_modele: dict[str, tuple[int, str]] = {}
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    def post(self, url, headers=None, json=None):  # noqa: A002
+        modele = url.rsplit("/", 1)[-1].split(":", 1)[0]
+        type(self).appels.append(modele)
+        statut, corps = type(self).reponses_par_modele.get(
+            modele, (503, '{"error":{"code":503,"message":"high demand"}}')
+        )
+        return _FausseReponseGemini(statut, corps)
+
+
+REPONSE_GEMINI_OK = '{"candidates":[{"content":{"parts":[{"text":"réponse modèle de secours"}]}}]}'
+REPONSE_GEMINI_503 = (
+    '{"error":{"code":503,"status":"UNAVAILABLE",'
+    '"message":"This model is currently experiencing high demand."}}'
+)
+
+
+@pytest.fixture
+def gemini_simule(monkeypatch):
+    """Isole les appels Gemini : pas de réseau, pas d'attente réelle."""
+    _FausseSessionGemini.appels = []
+    _FausseSessionGemini.reponses_par_modele = {}
+    monkeypatch.setattr(app.aiohttp, "ClientSession", _FausseSessionGemini)
+    monkeypatch.setattr(app, "GEMINI_BACKOFF", (0, 0, 0, 0))
+    monkeypatch.setattr(app.CONFIG, "gemini_api_keys", ["cle-de-test"])
+    monkeypatch.setattr(
+        app.CONFIG, "gemini_modeles", ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    )
+    return _FausseSessionGemini
+
+
+def test_chaine_de_modeles_par_defaut_et_variable_denvironnement(monkeypatch):
+    monkeypatch.delenv("GEMINI_MODELES", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    defaut = app.Config.charger()
+    assert defaut.gemini_modeles == ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+
+    monkeypatch.setenv("GEMINI_MODELES", "modele-a, modele-b ,")
+    personnalise = app.Config.charger()
+    assert personnalise.gemini_modeles[:2] == ["modele-a", "modele-b"]
+
+    render = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
+    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "GEMINI_MODELES" in render and "GEMINI_MODELES" in readme
+
+
+def test_gemini_503_bascule_sur_le_modele_suivant(gemini_simule):
+    """Le premier modèle est saturé (503) : le suivant prend le relais automatiquement."""
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash": (503, REPONSE_GEMINI_503),
+        "gemini-2.5-flash-lite": (200, REPONSE_GEMINI_OK),
+    }
+
+    texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+
+    assert texte == "réponse modèle de secours"
+    # 5 tentatives sur le modèle saturé, puis succès immédiat sur le modèle de secours.
+    assert gemini_simule.appels.count("gemini-2.5-flash") == app.GEMINI_TENTATIVES_PAR_MODELE
+    assert gemini_simule.appels[-1] == "gemini-2.5-flash-lite"
+
+
+def test_gemini_429_bascule_aussi_sur_le_modele_suivant(gemini_simule):
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash": (429, '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}'),
+        "gemini-2.5-flash-lite": (503, REPONSE_GEMINI_503),
+        "gemini-2.0-flash": (200, REPONSE_GEMINI_OK),
+    }
+    texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+    assert texte == "réponse modèle de secours"
+    assert gemini_simule.appels[-1] == "gemini-2.0-flash"
+
+
+def test_gemini_503_total_donne_un_message_clair_en_francais(gemini_simule):
+    """Tous les modèles et toutes les clés saturés : message explicite, pas de trace brute."""
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash": (503, REPONSE_GEMINI_503),
+        "gemini-2.5-flash-lite": (503, REPONSE_GEMINI_503),
+        "gemini-2.0-flash": (503, REPONSE_GEMINI_503),
+    }
+
+    with pytest.raises(app.ErreurApp) as erreur:
+        asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+
+    assert str(erreur.value) == "Gemini est momentanément saturé (503). Réessaie dans quelques minutes."
+    assert str(erreur.value) == app.GEMINI_MESSAGE_SATURE
+    # 3 modèles × 5 tentatives : le backoff exponentiel est bien appliqué par modèle.
+    assert len(gemini_simule.appels) == 3 * app.GEMINI_TENTATIVES_PAR_MODELE
+
+
+def test_gemini_erreur_definitive_ne_declenche_pas_cinq_tentatives(gemini_simule):
+    """Une erreur 400 n'est pas réessayable : on passe tout de suite au modèle suivant."""
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash": (400, '{"error":{"code":400,"message":"clé invalide"}}'),
+        "gemini-2.5-flash-lite": (400, '{"error":{"code":400,"message":"clé invalide"}}'),
+        "gemini-2.0-flash": (400, '{"error":{"code":400,"message":"clé invalide"}}'),
+    }
+    with pytest.raises(app.ErreurApp) as erreur:
+        asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+    assert "Toutes les clés Gemini ont échoué" in str(erreur.value)
+    assert len(gemini_simule.appels) == 3
+
+
+# ======================================================================================
+# VOIX OFF IMPORTÉE
+# ======================================================================================
+
+
+def test_config_publique_expose_rst_et_voix_off(client):
+    config = client.get("/api/config").json()
+    assert config["rst"]["liens_par_lancement"] == 6
+    assert config["voix_off_max_mo"] == 25
+    assert ".mp3" in config["voix_off_extensions"]
+
+
+def test_voix_off_refuse_une_extension_non_audio(client):
+    reponse = client.post("/api/voixoff?nom=script.txt", content=b"abc")
+    assert reponse.status_code == 400
+    assert "Format audio" in reponse.json()["detail"]
+
+
+def test_voix_off_refuse_un_fichier_vide_ou_trop_lourd(client):
+    assert client.post("/api/voixoff?nom=voix.mp3", content=b"").status_code == 400
+    trop = client.post(
+        "/api/voixoff?nom=voix.mp3",
+        content=b"0",
+        headers={"Content-Length": str(app.VOIX_OFF_MAX_OCTETS + 1)},
+    )
+    assert trop.status_code == 413
+    assert "25 Mo" in trop.json()["detail"]
+
+
+def test_voix_off_acceptee_puis_utilisable_et_liee_a_la_session(client, monkeypatch):
+    async def sonder(_chemin):
+        return 12.5
+
+    monkeypatch.setattr(app, "_sonder_audio", sonder)
+    reponse = client.post("/api/voixoff?nom=ma voix.mp3", content=b"faux-audio")
+    assert reponse.status_code == 200
+    donnees = reponse.json()
+    assert donnees["duree"] == 12.5 and donnees["extension"] == ".mp3"
+    identifiant = donnees["voix_off"]
+
+    session_id = client.cookies.get("creator_session")
+    chemin = app._chemin_voix_off(session_id, identifiant)
+    assert chemin is not None and chemin.read_bytes() == b"faux-audio"
+    # Une autre session ne peut pas réutiliser l'identifiant d'autrui.
+    assert app._chemin_voix_off("une-autre-session", identifiant) is None
+    assert app._resoudre_voix_off(session_id, identifiant) == chemin
+    chemin.unlink(missing_ok=True)
+
+
+def test_voix_off_expiree_renvoie_un_message_explicite():
+    with pytest.raises(app.ErreurApp) as erreur:
+        app._resoudre_voix_off("session-inconnue", "a" * 32)
+    assert "n'est plus disponible" in str(erreur.value)
+    assert app._resoudre_voix_off("session-inconnue", "") is None
+
+
+def test_voix_off_refusee_si_ffprobe_ne_trouve_aucune_piste(client, monkeypatch):
+    async def sonder(_chemin):
+        raise app.ErreurApp("Ce fichier ne contient aucune piste audio exploitable.")
+
+    monkeypatch.setattr(app, "_sonder_audio", sonder)
+    reponse = client.post("/api/voixoff?nom=image.wav", content=b"pas-de-son")
+    assert reponse.status_code == 400
+    assert "aucune piste audio" in reponse.json()["detail"]
+    # Le fichier refusé n'est pas conservé sur le disque.
+    dossier = app._dossier_voix_off(client.cookies.get("creator_session") or "")
+    assert not dossier.is_dir() or not list(dossier.iterdir())
+
+
+def test_requetes_acceptent_le_champ_voix_off():
+    assert app.RequeteRst(lien="https://www.tiktok.com/@a/video/1", voix_off="x" * 32).voix_off
+    assert app.RequeteVideo(hook="h", corps="c", mot_cle_broll="m", voix_off="y" * 32).voix_off
+    assert app.RequeteMontage(
+        hook="h", corps="c", liens_videos=["https://www.tiktok.com/@a/video/1"], voix_off="z" * 32
+    ).voix_off
+
+
+def test_purge_voix_off_supprime_les_fichiers_de_plus_de_six_heures():
+    dossier = app._dossier_voix_off("session-purge")
+    dossier.mkdir(parents=True, exist_ok=True)
+    ancien = dossier / f"{'a' * 32}.mp3"
+    ancien.write_bytes(b"vieux")
+    vieux = time.time() - app.DUREE_VIE_VOIX_OFF - 60
+    os.utime(ancien, (vieux, vieux))
+    app._purger_voix_off()
+    assert not ancien.exists()
+
+
+# ======================================================================================
+# INTERFACE : RsT multiple (jusqu'à 6 liens) et champs voix off
+# ======================================================================================
+
+
+def test_interface_contient_rst_multiple_et_voix_off():
+    racine = Path(__file__).parents[1]
+    html = (racine / "static" / "index.html").read_text(encoding="utf-8")
+    js = (racine / "static" / "main.js").read_text(encoding="utf-8")
+    utils = (racine / "static" / "job-utils.js").read_text(encoding="utf-8")
+    css = (racine / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="rst-liens"' in html and "0/6 liens" in html
+    assert 'id="job-list"' in html
+    assert html.count("Voix off") >= 3 and "facultatif" in html
+    assert 'id="voix-lien"' in html and 'id="voix-rst"' in html and 'id="voix-montage"' in html
+    assert "vesper.rstJobs.v1" in utils and "loadRstJobs" in js
+    assert "/api/voixoff" in js and "voix_off" in js
+    assert "job-card" in js and "found-bloc" in js
+    assert "rst-liens" in js and "parseRstLinks" in js
+
+    # Thème noir & blanc minimal : polices Inter + DM Mono, plus de violet ni de cyan.
+    assert "Inter" in html and "DM+Mono" in html
+    assert '"Inter"' in css and '"DM Mono"' in css
+    assert "#7c5cff" not in css and "#43d9ff" not in css
+    assert "--accent: #ffffff;" in css

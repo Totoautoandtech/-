@@ -185,3 +185,18 @@ def test_intensite_transitions_forte_allonge_les_transitions():
     assert fondu_legers and fondu_forts
     assert max(fondu_forts) > max(fondu_legers)
     assert all(p["transition_duree"] <= 0.55 for p in forte)
+
+
+def test_arguments_audio_sans_voix_off_reste_muet():
+    entrees, filtres, sortie = montage._arguments_audio(None, 3)
+    assert entrees == [] and filtres == []
+    assert sortie == ["-an"]
+
+
+def test_arguments_audio_avec_voix_off_mappe_une_piste_aac():
+    from pathlib import Path as _Path
+
+    entrees, filtres, sortie = montage._arguments_audio(_Path("/tmp/voix.mp3"), 4)
+    assert entrees == ["-i", "/tmp/voix.mp3"]
+    assert filtres == ["[4:a]apad[a]"]
+    assert sortie == ["-map", "[a]", "-c:a", "aac", "-b:a", "160k", "-shortest"]
