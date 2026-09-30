@@ -43,7 +43,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, quote_plus, urlencode, urlparse
 
 import aiofiles
 import aiohttp
@@ -101,6 +101,18 @@ ENTETES_TIKWM = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
     "Referer": "https://www.tikwm.com/",
+}
+
+# Urlebird : miroir public utilisé en repli RsT quand TikWM bloque les recherches
+# (/feed/search et /user/posts répondant 403 depuis l'IP de l'hébergeur).
+ENTETES_URLEBIRD = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://urlebird.com/",
 }
 
 # Mode RsT : nombre maximum de liens TikTok traités par lancement (un job indépendant chacun).
@@ -430,11 +442,18 @@ class ErreurApp(Exception):
     """Erreur métier, affichable telle quelle à l'utilisateur."""
 
 
+class ErreurTikwm403(ErreurApp):
+    """Erreur 403 renvoyée par TikWM signalant le blocage de la plage IP du serveur."""
+
+
 async def _avec_retry(fabrique, *, tentatives: int = 3, etape: str = ""):
     derniere: Optional[Exception] = None
     for essai in range(1, tentatives + 1):
         try:
             return await fabrique()
+        except ErreurTikwm403:
+            # 403 = IP bloquée, réessayer depuis la même IP est inutile
+            raise
         except Exception as exc:  # noqa: BLE001
             derniere = exc
             logger.warning("[%s] tentative %s/%s : %s", etape, essai, tentatives, exc)
@@ -1484,6 +1503,8 @@ async def _donnees_tikwm(session: aiohttp.ClientSession, chemin: str, params: di
 
     async def _appel():
         async with session.get(url, params=params, headers=ENTETES_TIKWM) as resp:
+            if resp.status == 403:
+                raise ErreurTikwm403(f"TikWM inaccessible (403)")
             if resp.status != 200:
                 raise ErreurApp(f"TikWM inaccessible ({resp.status})")
             try:
@@ -1496,6 +1517,87 @@ async def _donnees_tikwm(session: aiohttp.ClientSession, chemin: str, params: di
         message = donnees.get("msg", "réponse invalide") if isinstance(donnees, dict) else "réponse invalide"
         raise ErreurApp(f"TikWM : {message}")
     return donnees["data"]
+
+
+def _extraire_liens_urlebird(html: str, auteur_defaut: str = "") -> list[str]:
+    """Extrait de vrais liens TikTok à partir du HTML public d'une page Urlebird."""
+    if not html:
+        return []
+    liens: list[str] = []
+    vus: set[str] = set()
+
+    soup = BeautifulSoup(html, "html.parser")
+    for balise_a in soup.find_all("a", href=True):
+        href = balise_a["href"].strip()
+        match_tt = re.search(r"https?://(?:www\.)?tiktok\.com/@([^/]+)/video/(\d+)", href)
+        if match_tt:
+            pseudo = match_tt.group(1).strip().lstrip("@")
+            vid_id = match_tt.group(2)
+            url = f"https://www.tiktok.com/@{pseudo}/video/{vid_id}"
+            if vid_id not in vus:
+                vus.add(vid_id)
+                liens.append(url)
+            continue
+        match_vid = re.search(r"/video/(?:[\w\-]+-)?(\d{15,22})/?", href)
+        if match_vid:
+            vid_id = match_vid.group(1)
+            if vid_id in vus:
+                continue
+            parent = balise_a.find_parent(["div", "article", "li", "section"])
+            pseudo = auteur_defaut
+            if parent:
+                lien_user = parent.find("a", href=re.compile(r"/user/([^/]+)/?"))
+                if lien_user:
+                    match_u = re.search(r"/user/([^/]+)/?", lien_user["href"])
+                    if match_u:
+                        pseudo = match_u.group(1).strip().lstrip("@")
+            pseudo = pseudo.strip().lstrip("@") if pseudo else "tiktok"
+            url = f"https://www.tiktok.com/@{pseudo}/video/{vid_id}"
+            vus.add(vid_id)
+            liens.append(url)
+
+    for match_vid in re.finditer(r"/video/(?:[\w\-]+-)?(\d{15,22})/?", html):
+        vid_id = match_vid.group(1)
+        if vid_id not in vus:
+            vus.add(vid_id)
+            pseudo = auteur_defaut.strip().lstrip("@") if auteur_defaut else "tiktok"
+            liens.append(f"https://www.tiktok.com/@{pseudo}/video/{vid_id}")
+
+    return liens
+
+
+async def _decouvrir_urlebird(
+    session: aiohttp.ClientSession,
+    *,
+    auteur: str = "",
+    requete: str = "",
+    limite: int = 20,
+) -> list[str]:
+    """Découvre de vrais liens TikTok via les pages publiques Urlebird (aucun compte ni clé)."""
+    if auteur:
+        pseudo = auteur.strip().lstrip("@")
+        url = f"https://urlebird.com/user/{quote(pseudo)}/"
+    elif requete:
+        terme = requete.strip().lstrip("#")
+        url = f"https://urlebird.com/search/?q={quote_plus(terme)}"
+    else:
+        return []
+
+    async def _appel():
+        async with session.get(
+            url, headers=ENTETES_URLEBIRD, timeout=aiohttp.ClientTimeout(total=20)
+        ) as resp:
+            if resp.status != 200:
+                raise ErreurApp(f"Urlebird inaccessible ({resp.status})")
+            return await resp.text()
+
+    try:
+        html = await _avec_retry(_appel, tentatives=2, etape=f"Urlebird {url}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[RsT] découverte Urlebird impossible pour %s : %s", auteur or requete, exc)
+        return []
+
+    return _extraire_liens_urlebird(html, auteur_defaut=auteur)[:limite]
 
 
 def _normaliser_candidat_rst(video: Any, origine: str, nom: str = "") -> Optional[dict]:
@@ -1688,6 +1790,7 @@ async def _produire_rst(
 
         requetes_reelles: list[str] = []
         candidats: dict[str, dict] = {}
+        tikwm_recherche_bloquee = False
 
         async def accumuler(videos: Any, origine: str, nom: str = "") -> int:
             """Ajoute les vidéos réellement renvoyées et retourne le nombre de nouveautés."""
@@ -1701,6 +1804,26 @@ async def _produire_rst(
                     nouvelles += 1
             return nouvelles
 
+        async def valider_et_accumuler_urlebird(
+            liens_ub: list[str], origine: str, nom: str = "", limite_nouvelles: int = 20
+        ) -> int:
+            """Revalide chaque lien Urlebird via TikWM /api/ pour récupérer métadonnées réelles."""
+            nouvelles = 0
+            for lien_ub in liens_ub:
+                if len(candidats) >= CONFIG.rst_candidats_max or nouvelles >= limite_nouvelles:
+                    break
+                try:
+                    donnees_v = await _donnees_tikwm(session, "/", {"url": lien_ub, "hd": "1"})
+                    cand = _normaliser_candidat_rst(donnees_v, origine, nom)
+                    if not cand or cand["video_id"] == identifiant_depart:
+                        continue
+                    if cand["video_id"] not in candidats:
+                        candidats[cand["video_id"]] = cand
+                        nouvelles += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[RsT] revalidation TikWM échouée pour %s : %s", lien_ub, exc)
+            return nouvelles
+
         def publier(detail: str, progression: int) -> None:
             contexte.update(
                 statut="searching", progress=progression, detail=detail,
@@ -1712,20 +1835,39 @@ async def _produire_rst(
         if auteur:
             requetes_reelles.append(f"@{auteur}")
             contexte.update(statut="searching", progress=24, detail=f"Publications de @{auteur}")
-            try:
-                await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
-                publications = await _donnees_tikwm(
-                    session, "/user/posts",
-                    {"unique_id": auteur, "count": str(min(CONFIG.rst_candidats_max, 40))},
+            nouvelles = 0
+            if not tikwm_recherche_bloquee:
+                try:
+                    await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
+                    publications = await _donnees_tikwm(
+                        session, "/user/posts",
+                        {"unique_id": auteur, "count": str(min(CONFIG.rst_candidats_max, 40))},
+                    )
+                    nouvelles = await accumuler(
+                        publications.get("videos") or [], f"publications de @{auteur}"
+                    )
+                except ErreurTikwm403:
+                    logger.warning("[RsT] TikWM /user/posts bloqué (403) : repli Urlebird pour @%s", auteur)
+                    tikwm_recherche_bloquee = True
+                except ErreurApp as exc:
+                    logger.warning("[RsT] publications de @%s indisponibles : %s", auteur, exc)
+                    echecs_recherche.append(f"@{auteur} : {exc}")
+
+            if tikwm_recherche_bloquee:
+                contexte.update(
+                    statut="searching", progress=26,
+                    detail=f"Recherche Urlebird : publications de @{auteur}",
                 )
-                nouvelles = await accumuler(
-                    publications.get("videos") or [], f"publications de @{auteur}"
+                liens_ub = await _decouvrir_urlebird(
+                    session, auteur=auteur, limite=min(CONFIG.rst_candidats_max, 40)
                 )
-                if nouvelles == 0:
-                    echecs_recherche.append(f"@{auteur} : aucune autre publication")
-            except ErreurApp as exc:
-                logger.warning("[RsT] publications de @%s indisponibles : %s", auteur, exc)
-                echecs_recherche.append(f"@{auteur} : {exc}")
+                nouvelles = await valider_et_accumuler_urlebird(
+                    liens_ub, f"Urlebird : publications de @{auteur}",
+                    limite_nouvelles=min(CONFIG.rst_candidats_max, 40),
+                )
+
+            if nouvelles == 0 and not any(e.startswith(f"@{auteur}") for e in echecs_recherche):
+                echecs_recherche.append(f"@{auteur} : aucune autre publication")
             publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", 30)
 
         # 2) Une recherche TikTok par nom du TOP N, dans l'ordre d'importance.
@@ -1742,19 +1884,36 @@ async def _produire_rst(
                 detail=f"Recherche TikTok {rang}/{len(noms)} : « {nom} »",
                 noms=noms,
             )
-            try:
-                await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
-                resultats = await _donnees_tikwm(
-                    session, "/feed/search", {"keywords": nom, "count": str(part_par_nom)}
+            nouvelles = 0
+            if not tikwm_recherche_bloquee:
+                try:
+                    await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
+                    resultats = await _donnees_tikwm(
+                        session, "/feed/search", {"keywords": nom, "count": str(part_par_nom)}
+                    )
+                    nouvelles = await accumuler(
+                        resultats.get("videos") or [], f"recherche « {nom} »", nom
+                    )
+                except ErreurTikwm403:
+                    logger.warning("[RsT] TikWM /feed/search bloqué (403) : repli Urlebird pour « %s »", nom)
+                    tikwm_recherche_bloquee = True
+                except ErreurApp as exc:
+                    logger.warning("[RsT] recherche « %s » indisponible : %s", nom, exc)
+                    echecs_recherche.append(f"« {nom} » : {exc}")
+
+            if tikwm_recherche_bloquee:
+                contexte.update(
+                    statut="searching", progress=progression,
+                    detail=f"Recherche Urlebird {rang}/{len(noms)} : « {nom} »",
+                    noms=noms,
                 )
-                nouvelles = await accumuler(
-                    resultats.get("videos") or [], f"recherche « {nom} »", nom
+                liens_ub = await _decouvrir_urlebird(session, requete=nom, limite=part_par_nom)
+                nouvelles = await valider_et_accumuler_urlebird(
+                    liens_ub, f"Urlebird : recherche « {nom} »", nom, limite_nouvelles=part_par_nom
                 )
-                if nouvelles == 0:
-                    echecs_recherche.append(f"« {nom} » : aucun résultat")
-            except ErreurApp as exc:
-                logger.warning("[RsT] recherche « %s » indisponible : %s", nom, exc)
-                echecs_recherche.append(f"« {nom} » : {exc}")
+
+            if nouvelles == 0 and not any(e.startswith(f"« {nom} »") for e in echecs_recherche):
+                echecs_recherche.append(f"« {nom} » : aucun résultat")
             publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", progression)
 
         # 3) Filet de sécurité : si le TOP N n'a rien ramené, on réessaie avec les mots-clés
@@ -1773,19 +1932,31 @@ async def _produire_rst(
                     statut="searching", progress=39,
                     detail=f"Recherche élargie « {mot_cle} »", noms=noms,
                 )
-                try:
-                    await asyncio.sleep(1.0)
-                    resultats = await _donnees_tikwm(
-                        session, "/feed/search", {"keywords": mot_cle, "count": "20"}
+                nouvelles = 0
+                if not tikwm_recherche_bloquee:
+                    try:
+                        await asyncio.sleep(1.0)
+                        resultats = await _donnees_tikwm(
+                            session, "/feed/search", {"keywords": mot_cle, "count": "20"}
+                        )
+                        nouvelles = await accumuler(
+                            resultats.get("videos") or [], f"recherche élargie « {mot_cle} »"
+                        )
+                    except ErreurTikwm403:
+                        logger.warning("[RsT] TikWM /feed/search bloqué (403) : repli Urlebird pour « %s »", mot_cle)
+                        tikwm_recherche_bloquee = True
+                    except ErreurApp as exc:
+                        logger.warning("[RsT] recherche élargie « %s » indisponible : %s", mot_cle, exc)
+                        echecs_recherche.append(f"« {mot_cle} » : {exc}")
+
+                if tikwm_recherche_bloquee:
+                    liens_ub = await _decouvrir_urlebird(session, requete=mot_cle, limite=20)
+                    nouvelles = await valider_et_accumuler_urlebird(
+                        liens_ub, f"Urlebird : recherche élargie « {mot_cle} »", limite_nouvelles=20
                     )
-                    nouvelles = await accumuler(
-                        resultats.get("videos") or [], f"recherche élargie « {mot_cle} »"
-                    )
-                    if nouvelles == 0:
-                        echecs_recherche.append(f"« {mot_cle} » : aucun résultat")
-                except ErreurApp as exc:
-                    logger.warning("[RsT] recherche élargie « %s » indisponible : %s", mot_cle, exc)
-                    echecs_recherche.append(f"« {mot_cle} » : {exc}")
+
+                if nouvelles == 0 and not any(e.startswith(f"« {mot_cle} »") for e in echecs_recherche):
+                    echecs_recherche.append(f"« {mot_cle} » : aucun résultat")
                 publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", 40)
                 if candidats:
                     break
