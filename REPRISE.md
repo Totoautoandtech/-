@@ -52,7 +52,9 @@ Pour **chaque** lien de départ :
    lieux, marques, œuvres…). Le nombre est choisi dans l'interface.
    → `extraire_noms_rst()` dans `app.py`.
 4. **Recherche par nom** : une requête TikWM `/feed/search` **par nom**, plus les
-   publications du créateur de départ.
+   publications du créateur de départ. Tous les appels TikWM portent des en-têtes
+   de navigateur (`ENTETES_TIKWM`) : sans eux, `/feed/search` et `/user/posts`
+   peuvent répondre 403 depuis Render alors que la lecture initiale passe.
 5. **Répartition** : `_repartir_par_nom()` sert les candidates nom par nom, à tour
    de rôle, pour qu'un nom prolifique ne monopolise pas le quota de sources.
 6. **Sélection** : jusqu'à 20 sources dans les limites de durée et de temps Render.
@@ -91,7 +93,9 @@ Les trois se téléchargent depuis la carte du travail et expirent ensemble (6 h
 
 Si `speech.platform.bing.com` est injoignable, la synthèse échoue **proprement** :
 aucun MP3 factice, le travail se termine avec la vidéo et le script, et l'interface
-affiche la raison exacte. Ce chemin d'échec est testé.
+affiche la raison exacte. La livraison réserve aussi 15 s pour Drive et la
+finalisation : sous 5 s restantes, le MP3 est explicitement ignoré plutôt que de
+faire expirer un rendu déjà terminé. Ces chemins d'échec sont testés.
 
 ---
 
@@ -108,9 +112,11 @@ de développement, **pas** à un bug du code :
 | **`*.onrender.com`** | bloqué par l'allowlist réseau | `curl` vers la prod échoue |
 
 Conséquence directe : **le pipeline RsT n'a jamais tourné en conditions réelles.**
-Tous les tests reposent sur des doublures (`monkeypatch`). Le premier vrai test se
-fait **sur Render**, où ffmpeg est installé (voir le `Dockerfile`) et le réseau est
-ouvert.
+Les en-têtes TikWM corrigent le diagnostic le plus probable des 403, mais ne
+peuvent pas exclure un blocage de plage d'IP Render : seul un vrai lancement RsT
+le confirmera. Tous les tests réseau reposent sur des doublures (`monkeypatch`).
+Le premier vrai test se fait **sur Render**, où ffmpeg est installé (voir le
+`Dockerfile`) et le réseau est ouvert.
 
 Pour lire la production depuis une session d'agent, `curl` ne marche pas, mais un
 outil de récupération de page HTTP du côté agent y accède.
@@ -121,7 +127,7 @@ outil de récupération de page HTTP du côté agent y accède.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q                    # 78 tests
+.venv/bin/python -m pytest -q                    # 85 tests
 node --test tests/js/job-utils.test.cjs          # 7 tests
 ```
 

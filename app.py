@@ -90,6 +90,19 @@ VOIX_OFF_MAX_OCTETS = VOIX_OFF_MAX_MO * 1024 * 1024
 VOIX_OFF_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus"}
 DUREE_VIE_VOIX_OFF = 6 * 60 * 60
 
+# TikWM filtre les clients qui ne ressemblent pas à un navigateur : sans ces en-têtes,
+# /feed/search et /user/posts répondent 403 depuis un hébergeur, alors que /api/ passe.
+# Aucune clé, aucun compte, aucun abonnement : seulement une identification honnête.
+ENTETES_TIKWM = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+    "Referer": "https://www.tikwm.com/",
+}
+
 # Mode RsT : nombre maximum de liens TikTok traités par lancement (un job indépendant chacun).
 RST_LIENS_PAR_LANCEMENT = 6
 
@@ -109,6 +122,10 @@ EDGE_TTS_DEBIT = _env("EDGE_TTS_DEBIT", "+0%")
 # edge-tts appelle speech.platform.bing.com : sur un réseau qui le bloque, la synthèse
 # échoue proprement et le travail se termine quand même avec la vidéo et le script.
 EDGE_TTS_DELAI = 45.0
+# Sous ce budget restant, tenter edge-tts ne ferait que faire expirer le travail déjà rendu.
+EDGE_TTS_MINIMUM = 5.0
+# Une marge est conservée pour Drive et la finalisation du job après la livraison RsT.
+LIVRAISON_RESERVE = 15.0
 # Marge de sécurité : au-delà, la synthèse dépasserait le temps imparti sur Render Free.
 VOIX_OFF_TEXTE_MAX = 4000
 
@@ -499,7 +516,7 @@ async def _resoudre_video_tiktok(session: aiohttp.ClientSession, url: str) -> st
     async def _appel():
         try:
             async with asyncio.timeout(CONFIG.delai_tikwm):
-                async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}) as resp:
+                async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
                     if resp.status != 200:
                         raise ErreurApp(f"TikWM inaccessible ({resp.status})")
                     try:
@@ -534,7 +551,7 @@ async def _extraire_texte_tiktok(session: aiohttp.ClientSession, url: str) -> st
     url = _valider_url(url, "Lien TikTok")
 
     async def _appel():
-        async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}) as resp:
+        async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
             if resp.status != 200:
                 raise ErreurApp(f"TikWM inaccessible ({resp.status})")
             try:
@@ -1341,11 +1358,14 @@ def texte_a_dire(script: dict[str, Any]) -> str:
     return parle[:VOIX_OFF_TEXTE_MAX]
 
 
-async def synthetiser_voix_off(texte: str, destination: Path) -> int:
+async def synthetiser_voix_off(
+    texte: str, destination: Path, budget: float = EDGE_TTS_DELAI
+) -> int:
     """Génère un MP3 avec edge-tts (gratuit, sans clé). Retourne la taille écrite.
 
     Lève ErreurApp si le service est injoignable ou renvoie un fichier vide : aucun
     fichier factice n'est laissé derrière, et l'appelant reste libre de continuer.
+    Le délai ne dépasse jamais le budget restant du travail.
     """
     propre = str(texte or "").strip()
     if not propre:
@@ -1355,15 +1375,16 @@ async def synthetiser_voix_off(texte: str, destination: Path) -> int:
     except ImportError as exc:  # pragma: no cover - dépendance déclarée dans requirements
         raise ErreurApp("edge-tts n'est pas installé sur le serveur.") from exc
 
+    delai = max(1.0, min(EDGE_TTS_DELAI, float(budget)))
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         communicate = edge_tts.Communicate(propre, EDGE_TTS_VOIX, rate=EDGE_TTS_DEBIT)
-        async with asyncio.timeout(EDGE_TTS_DELAI):
+        async with asyncio.timeout(delai):
             await communicate.save(str(destination))
     except asyncio.TimeoutError as exc:
         destination.unlink(missing_ok=True)
         raise ErreurApp(
-            f"La synthèse vocale n'a pas répondu sous {EDGE_TTS_DELAI:.0f} s."
+            f"La synthèse vocale n'a pas répondu sous {delai:.0f} s."
         ) from exc
     except Exception as exc:  # noqa: BLE001 - edge-tts remonte des erreurs réseau variées
         destination.unlink(missing_ok=True)
@@ -1380,25 +1401,57 @@ async def livrer_script_et_voix(
     script: dict[str, Any],
     seed: Optional[dict[str, Any]] = None,
     noms: Optional[list[str]] = None,
+    budget: float = EDGE_TTS_DELAI,
 ) -> dict[str, Any]:
-    """Écrit le script .txt puis tente le MP3. Un échec de synthèse ne perd pas le script."""
+    """Livre au mieux le script et le MP3 sans jamais compromettre le rendu RsT.
+
+    Cette étape arrive après le montage. Une écriture disque ou edge-tts défaillant
+    est donc signalé dans le résultat, plutôt que de faire expirer un travail dont la
+    vidéo est déjà prête.
+    """
     base = uuid.uuid4().hex
     chemin_txt = DOSSIER_VIDEOS / f"{base}.txt"
-    chemin_txt.write_text(composer_script_txt(script, seed, noms), encoding="utf-8")
-
+    chemin_mp3 = DOSSIER_VIDEOS / f"{base}.mp3"
     livraison: dict[str, Any] = {
-        "script_url": f"/videos/{chemin_txt.name}",
-        "script_nom": "script.txt",
+        "script_url": "",
+        "script_nom": "",
+        "script_erreur": "",
         "voix_url": "",
         "voix_nom": "",
         "voix_erreur": "",
         "voix_moteur": f"edge-tts · {EDGE_TTS_VOIX}",
+        "livraison_erreur": "",
     }
 
-    chemin_mp3 = DOSSIER_VIDEOS / f"{base}.mp3"
     try:
-        taille = await synthetiser_voix_off(texte_a_dire(script), chemin_mp3)
-    except ErreurApp as exc:
+        chemin_txt.write_text(composer_script_txt(script, seed, noms), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("[livraison] écriture du script impossible : %s", exc)
+        livraison["script_erreur"] = f"Écriture du script impossible : {exc}"
+    except Exception as exc:  # noqa: BLE001 - la livraison ne doit jamais casser le rendu
+        logger.exception("[livraison] préparation du script impossible")
+        livraison["script_erreur"] = f"Préparation du script impossible : {exc}"
+    else:
+        livraison["script_url"] = f"/videos/{chemin_txt.name}"
+        livraison["script_nom"] = "script.txt"
+
+    try:
+        budget_restant = float(budget)
+    except (TypeError, ValueError) as exc:
+        livraison["voix_erreur"] = f"Budget de synthèse invalide : {exc}"
+        return livraison
+    if budget_restant < EDGE_TTS_MINIMUM:
+        livraison["voix_erreur"] = (
+            "Synthèse vocale ignorée : moins de "
+            f"{EDGE_TTS_MINIMUM:.0f} s restaient pour finaliser le travail."
+        )
+        return livraison
+
+    try:
+        taille = await synthetiser_voix_off(
+            texte_a_dire(script), chemin_mp3, budget=budget_restant
+        )
+    except Exception as exc:  # noqa: BLE001 - edge-tts remonte des erreurs réseau variées
         # Honnêteté : on dit pourquoi le MP3 manque, on ne livre pas d'audio factice.
         logger.warning("[voix off] synthèse impossible : %s", exc)
         livraison["voix_erreur"] = str(exc)
@@ -1430,7 +1483,7 @@ async def _donnees_tikwm(session: aiohttp.ClientSession, chemin: str, params: di
     url = f"https://www.tikwm.com/api{chemin}"
 
     async def _appel():
-        async with session.get(url, params=params) as resp:
+        async with session.get(url, params=params, headers=ENTETES_TIKWM) as resp:
             if resp.status != 200:
                 raise ErreurApp(f"TikWM inaccessible ({resp.status})")
             try:
@@ -1798,7 +1851,20 @@ async def _produire_rst(
         statut="delivering", progress=92,
         detail="Écriture du script et génération de la voix off",
     )
-    livraison = await livrer_script_et_voix(script, seed_infos, noms)
+    # Le rendu est déjà terminé : on garde du temps pour Drive et la finalisation au
+    # lieu de laisser edge-tts consommer toute la limite globale du job.
+    budget_livraison = contexte.restant() - LIVRAISON_RESERVE
+    try:
+        livraison = await livrer_script_et_voix(
+            script, seed_infos, noms, budget=budget_livraison
+        )
+    except Exception as exc:  # noqa: BLE001 - protection finale d'un rendu déjà prêt
+        logger.exception("[RsT] livraison complémentaire impossible")
+        livraison = {
+            "livraison_erreur": f"Livraison du script et de la voix off impossible : {exc}",
+            "script_url": "", "script_nom": "", "script_erreur": "",
+            "voix_url": "", "voix_nom": "", "voix_erreur": "",
+        }
 
     resultat.update(
         script=script, found_videos=trouves, search_queries=requetes_reelles,
