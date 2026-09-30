@@ -77,10 +77,26 @@ def _env(nom: str, defaut: str = "") -> str:
     return os.getenv(nom, defaut).strip()
 
 
+# Chaîne de modèles Gemini essayée dans l'ordre. Le premier modèle est le plus capable ;
+# les suivants servent de secours quand Google renvoie 503 « high demand » sur le premier.
+MODELES_GEMINI_DEFAUT = "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash"
+
+# Voix off importée par l'utilisateur (aucun service payant, aucune synthèse) :
+# fichier audio brut envoyé par le navigateur, conservé 6 h, lié à la session.
+VOIX_OFF_MAX_MO = 25
+VOIX_OFF_MAX_OCTETS = VOIX_OFF_MAX_MO * 1024 * 1024
+VOIX_OFF_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus"}
+DUREE_VIE_VOIX_OFF = 6 * 60 * 60
+
+# Mode RsT : nombre maximum de liens TikTok traités par lancement (un job indépendant chacun).
+RST_LIENS_PAR_LANCEMENT = 6
+
+
 @dataclass
 class Config:
     gemini_api_keys: list[str]
     gemini_model: str
+    gemini_modeles: list[str]
     pexels_api_key: str
     duree_cible: int
     gmail_adresse: str
@@ -116,6 +132,16 @@ class Config:
         cles = [c.strip() for c in _env("GEMINI_API_KEYS").split(",") if c.strip()]
         pexels = _env("PEXELS_API_KEY")
 
+        # Chaîne de modèles de secours : si le premier renvoie 503 (surcharge temporaire),
+        # l'appel bascule automatiquement sur le suivant avant de changer de clé.
+        modeles = [m.strip() for m in _env("GEMINI_MODELES", MODELES_GEMINI_DEFAUT).split(",") if m.strip()]
+        if not modeles:
+            modeles = [m.strip() for m in MODELES_GEMINI_DEFAUT.split(",") if m.strip()]
+        # GEMINI_MODEL explicitement défini garde la priorité en tête de chaîne.
+        modele_principal = _env("GEMINI_MODEL")
+        if modele_principal and modele_principal not in modeles:
+            modeles.insert(0, modele_principal)
+
         try:
             duree_cible = int(_env("DUREE_CIBLE_SECONDES", "30"))
             if duree_cible <= 0:
@@ -143,7 +169,8 @@ class Config:
 
         return cls(
             gemini_api_keys=cles,
-            gemini_model=_env("GEMINI_MODEL", "gemini-2.5-flash"),
+            gemini_model=modele_principal or modeles[0],
+            gemini_modeles=modeles,
             pexels_api_key=pexels,
             duree_cible=duree_cible,
             gmail_adresse=_env("GMAIL_ADRESSE"),
@@ -179,6 +206,47 @@ DOSSIER_VIDEOS = RACINE / "videos"
 DOSSIER_VIDEOS.mkdir(exist_ok=True)
 DOSSIER_TRAVAIL = RACINE / "travail"
 DOSSIER_TRAVAIL.mkdir(exist_ok=True)
+DOSSIER_VOIX_OFF = DOSSIER_TRAVAIL / "voixoff"
+DOSSIER_VOIX_OFF.mkdir(parents=True, exist_ok=True)
+
+
+def _dossier_voix_off(session_id: str) -> Path:
+    """Un sous-dossier par session : une voix off n'est jamais visible d'une autre session."""
+    empreinte = hashlib.sha256(str(session_id or "anonyme").encode("utf-8")).hexdigest()[:32]
+    return DOSSIER_VOIX_OFF / empreinte
+
+
+def _chemin_voix_off(session_id: str, identifiant: str) -> Optional[Path]:
+    """Retourne le fichier de voix off de cette session, ou None s'il n'existe plus."""
+    valeur = str(identifiant or "").strip()
+    if not valeur or not re.fullmatch(r"[a-f0-9]{32}(\.[a-z0-9]{1,5})?", valeur):
+        return None
+    dossier = _dossier_voix_off(session_id)
+    if not dossier.is_dir():
+        return None
+    base = valeur.split(".", 1)[0]
+    for fichier in dossier.glob(f"{base}.*"):
+        if fichier.is_file() and fichier.suffix.lower() in VOIX_OFF_EXTENSIONS:
+            return fichier
+    return None
+
+
+def _purger_voix_off() -> None:
+    """Supprime les voix off de plus de 6 h, comme les rendus et les travaux."""
+    seuil = time.time() - DUREE_VIE_VOIX_OFF
+    if not DOSSIER_VOIX_OFF.is_dir():
+        return
+    for dossier in DOSSIER_VOIX_OFF.iterdir():
+        try:
+            if not dossier.is_dir():
+                continue
+            for fichier in dossier.iterdir():
+                if fichier.is_file() and fichier.stat().st_mtime < seuil:
+                    fichier.unlink(missing_ok=True)
+            if not any(dossier.iterdir()):
+                dossier.rmdir()
+        except OSError:
+            logger.warning("Nettoyage voix off impossible pour %s", dossier)
 
 TAILLE_MAX_TELECHARGEMENT = 100 * 1024 * 1024  # évite de remplir le disque avec un lien distant
 TAILLE_MAX_PAGE_SOURCE = 2 * 1024 * 1024
@@ -227,6 +295,33 @@ def _verifier_ffmpeg() -> None:
             "ffmpeg est absent du serveur. Installe-le localement ou déploie l'application "
             "avec le Dockerfile fourni."
         )
+
+
+async def _sonder_audio(chemin: Path) -> float:
+    """Vérifie avec FFprobe que le fichier importé contient bien une piste audio lisible."""
+    commande = [
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=codec_type,codec_name,duration:format=duration",
+        "-of", "json", str(chemin),
+    ]
+    try:
+        stdout, _ = await executer_commande(
+            commande, etape="analyse de la voix off", timeout=30.0
+        )
+    except ErreurMontage as exc:
+        raise ErreurApp(f"Fichier audio illisible : {exc}") from exc
+    try:
+        donnees = json.loads(stdout.decode("utf-8", errors="ignore") or "{}")
+    except json.JSONDecodeError as exc:
+        raise ErreurApp("Fichier audio illisible : FFprobe n'a renvoyé aucune information.") from exc
+    flux = donnees.get("streams") or []
+    if not flux or str(flux[0].get("codec_type")) != "audio":
+        raise ErreurApp("Ce fichier ne contient aucune piste audio exploitable.")
+    duree = flux[0].get("duration") or (donnees.get("format") or {}).get("duration") or 0
+    try:
+        return max(0.0, float(duree))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # ======================================================================================
@@ -493,47 +588,118 @@ PROMPT_SCRIPT = (
 )
 
 
+# Statuts HTTP qui méritent une nouvelle tentative : surcharge, quota court terme, incident.
+GEMINI_STATUTS_REESSAYABLES = {429, 500, 502, 503, 504}
+# Statuts qui signalent explicitement une saturation temporaire du modèle.
+GEMINI_STATUTS_SATURATION = {429, 503}
+GEMINI_TENTATIVES_PAR_MODELE = 5
+GEMINI_BACKOFF = (2, 4, 8, 16)
+GEMINI_MESSAGE_SATURE = "Gemini est momentanément saturé (503). Réessaie dans quelques minutes."
+
+
+class ErreurGemini(ErreurApp):
+    """Erreur d'appel Gemini enrichie du statut HTTP et du caractère « saturation »."""
+
+    def __init__(self, message: str, statut: int = 0, saturation: bool = False) -> None:
+        super().__init__(message)
+        self.statut = statut
+        self.saturation = saturation
+
+
+def _est_saturation_gemini(statut: int, texte: str) -> bool:
+    """503/429 explicites, ou message UNAVAILABLE / OVERLOADED / RESOURCE_EXHAUSTED."""
+    if statut in GEMINI_STATUTS_SATURATION:
+        return True
+    haut = (texte or "").upper()
+    return any(
+        marqueur in haut
+        for marqueur in ("UNAVAILABLE", "OVERLOADED", "RESOURCE_EXHAUSTED", "HIGH DEMAND")
+    )
+
+
+def _modeles_gemini() -> list[str]:
+    return list(CONFIG.gemini_modeles) or [CONFIG.gemini_model]
+
+
 async def _appel_gemini_brut(
     parts: list[dict], *, temperature: float, system: Optional[str] = None, json_mode: bool = False
 ) -> str:
+    """Appelle Gemini avec repli automatique de modèle puis de clé.
+
+    Ordre d'essai : pour chaque clé (tirée au hasard), chaque modèle de la chaîne
+    `GEMINI_MODELES`, avec jusqu'à 5 tentatives par modèle et un backoff exponentiel
+    (2, 4, 8, 16 s) sur 503 / 429 / 500, toujours dans la limite du timeout Gemini.
+    """
     cles = CONFIG.gemini_api_keys
     if not cles:
         raise ErreurApp("GEMINI_API_KEYS n'est pas configuré sur le serveur.")
 
+    modeles = _modeles_gemini()
+    payload: dict[str, Any] = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": temperature},
+    }
+    if system:
+        payload["systemInstruction"] = {"parts": [{"text": system}]}
+    if json_mode:
+        payload["generationConfig"]["responseMimeType"] = "application/json"
+
+    debut = time.monotonic()
+
+    def restant() -> float:
+        return CONFIG.delai_gemini - (time.monotonic() - debut)
+
     derniere: Optional[Exception] = None
-    for cle in random.sample(cles, len(cles)):
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{CONFIG.gemini_model}:generateContent"
-        headers = {"x-goog-api-key": cle, "Content-Type": "application/json"}
-        payload: dict[str, Any] = {
-            "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {"temperature": temperature},
-        }
-        if system:
-            payload["systemInstruction"] = {"parts": [{"text": system}]}
-        if json_mode:
-            payload["generationConfig"]["responseMimeType"] = "application/json"
+    saturation_vue = False
 
-        try:
-            async with GEMINI_SEMAPHORE:
-                async with aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=CONFIG.delai_gemini, connect=15)
-                ) as session:
-                    async def _appel():
-                        async with session.post(url, headers=headers, json=payload) as resp:
-                            if resp.status != 200:
-                                texte = await resp.text()
-                                raise ErreurApp(f"Gemini a répondu {resp.status} : {texte[:200]}")
-                            return await resp.json()
-
-                    data = await asyncio.wait_for(
-                        _avec_retry(_appel, tentatives=2, etape="appel Gemini"),
-                        timeout=CONFIG.delai_gemini,
+    async with GEMINI_SEMAPHORE:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=CONFIG.delai_gemini, connect=15)
+        ) as session:
+            for cle in random.sample(cles, len(cles)):
+                headers = {"x-goog-api-key": cle, "Content-Type": "application/json"}
+                for modele in modeles:
+                    url = (
+                        "https://generativelanguage.googleapis.com/v1beta/models/"
+                        f"{modele}:generateContent"
                     )
-            return data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as exc:  # noqa: BLE001
-            derniere = exc
-            logger.warning("Clé Gemini indisponible (%s...), clé suivante.", cle[:6])
+                    for tentative in range(1, GEMINI_TENTATIVES_PAR_MODELE + 1):
+                        if restant() <= 1.0:
+                            break
+                        try:
+                            async with session.post(url, headers=headers, json=payload) as resp:
+                                texte = await resp.text()
+                                if resp.status == 200:
+                                    data = json.loads(texte)
+                                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                                raise ErreurGemini(
+                                    f"Gemini a répondu {resp.status} : {texte[:200]}",
+                                    statut=resp.status,
+                                    saturation=_est_saturation_gemini(resp.status, texte),
+                                )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001
+                            derniere = exc
+                            statut = int(getattr(exc, "statut", 0) or 0)
+                            sature = bool(getattr(exc, "saturation", False))
+                            saturation_vue = saturation_vue or sature
+                            logger.warning(
+                                "[Gemini] %s (clé %s…) tentative %s/%s : %s",
+                                modele, cle[:6], tentative, GEMINI_TENTATIVES_PAR_MODELE, exc,
+                            )
+                            reessayable = statut == 0 or statut in GEMINI_STATUTS_REESSAYABLES
+                            if not reessayable or tentative >= GEMINI_TENTATIVES_PAR_MODELE:
+                                break
+                            pause = GEMINI_BACKOFF[min(tentative - 1, len(GEMINI_BACKOFF) - 1)]
+                            if restant() <= pause + 1.0:
+                                break
+                            await asyncio.sleep(pause)
+                    logger.warning("[Gemini] modèle %s indisponible, modèle suivant.", modele)
+                logger.warning("[Gemini] clé %s… épuisée, clé suivante.", cle[:6])
 
+    if saturation_vue:
+        raise ErreurApp(GEMINI_MESSAGE_SATURE)
     raise ErreurApp(f"Toutes les clés Gemini ont échoué : {derniere}")
 
 
@@ -851,6 +1017,7 @@ async def _assembler_clips(normalises: list[Path], dossier: Path) -> Path:
 async def _incruster_sous_titres(
     assemble: Path, cues: list[dict], style: str, dossier: Path,
     largeur: int = 720, hauteur: int = 1280, crf: int = 23,
+    voix_off: Optional[Path] = None,
 ) -> Path:
     """Fichiers texte par cue (textfile= évite tout souci d'échappement des apostrophes/accents)."""
     if style not in STYLES_SOUS_TITRES:
@@ -872,12 +1039,22 @@ async def _incruster_sous_titres(
         )
 
     sortie = DOSSIER_VIDEOS / f"{uuid.uuid4().hex}.mp4"
+    commande = ["ffmpeg", "-y", "-i", str(assemble)]
+    if voix_off:
+        # Deuxième entrée : la voix off importée. `apad` la prolonge si elle est plus
+        # courte que l'image, `-shortest` coupe le rendu à la fin du plus court des deux.
+        commande += ["-i", str(voix_off)]
+    commande += ["-vf", ",".join(filtres)]
+    if voix_off:
+        commande += ["-af", "apad", "-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "160k"]
+    commande += [
+        "-c:v", "libx264", "-preset", CONFIG.preset_export, "-crf", str(max(14, min(30, int(crf)))),
+        "-pix_fmt", "yuv420p",
+        "-r", "24", "-threads", str(CONFIG.threads_ffmpeg), "-movflags", "+faststart",
+    ]
+    commande += (["-shortest"] if voix_off else ["-an"]) + [str(sortie)]
     await executer_commande(
-        ["ffmpeg", "-y", "-i", str(assemble), "-vf", ",".join(filtres),
-         "-c:v", "libx264", "-preset", CONFIG.preset_export, "-crf", str(max(14, min(30, int(crf)))),
-         "-pix_fmt", "yuv420p",
-         "-r", "24", "-threads", str(CONFIG.threads_ffmpeg), "-movflags", "+faststart",
-         "-an", str(sortie)],
+        commande,
         etape="incrustation des sous-titres", timeout=CONFIG.delai_ffmpeg,
         sortie_attendue=sortie,
     )
@@ -886,7 +1063,7 @@ async def _incruster_sous_titres(
 
 async def construire_video(
     liens_broll: list[str], cues: list[dict], duree_totale: float, style: str,
-    resolution: str = "720", crf: int = 23,
+    resolution: str = "720", crf: int = 23, voix_off: Optional[Path] = None,
 ) -> Path:
     """Mode « thème libre » : B-roll cherché sur Pexels."""
     _verifier_ffmpeg()
@@ -913,7 +1090,8 @@ async def construire_video(
 
         assemble = await _assembler_clips(normalises, dossier)
         return await _incruster_sous_titres(
-            assemble, cues, style, dossier, largeur=largeur, hauteur=hauteur, crf=crf
+            assemble, cues, style, dossier, largeur=largeur, hauteur=hauteur, crf=crf,
+            voix_off=voix_off,
         )
     finally:
         shutil.rmtree(dossier, ignore_errors=True)
@@ -1148,7 +1326,9 @@ def _rapporteur_decale(contexte: "ContexteJob", base: float, amplitude: float) -
     return Rapporteur(mise_a_jour, contexte.annule, contexte.restant)
 
 
-async def _produire_rst(requete: "RequeteRst", contexte: "ContexteJob") -> dict[str, Any]:
+async def _produire_rst(
+    requete: "RequeteRst", contexte: "ContexteJob", session_id: str = ""
+) -> dict[str, Any]:
     """Mode RsT : analyse un lien TikTok, trouve de vraies vidéos, monte automatiquement."""
     try:
         lien = normaliser_lien_tiktok(requete.lien.strip())
@@ -1257,6 +1437,7 @@ async def _produire_rst(requete: "RequeteRst", contexte: "ContexteJob") -> dict[
         telechargeur=_telecharger_fichier,
         appel_gemini=_appel_gemini_brut,
         intensite_transitions=requete.intensite_transitions,
+        voix_off=_resoudre_voix_off(session_id, requete.voix_off),
     )
     await envoyer_script_et_video(script["hook"], script["corps"], resultat["path"])
     resultat.update(script=script, found_videos=trouves, search_queries=requetes_reelles)
@@ -1392,6 +1573,7 @@ class RequeteVideo(BaseModel):
     mot_cle_broll: str = Field(min_length=1, max_length=200)
     style: str = Field(default="classique", max_length=32)
     mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
+    voix_off: str = Field(default="", max_length=64)
     idempotency_key: str = Field(default="", max_length=80)
 
 
@@ -1405,6 +1587,7 @@ class RequeteMontage(BaseModel):
     resolution: str = Field(default="720", pattern="^(720|1080)$")
     mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
     intensite_transitions: int = Field(default=2, ge=0, le=3)
+    voix_off: str = Field(default="", max_length=64)
     estimated_seconds: int = Field(default=0, ge=0, le=7200)
     accepter_risque: bool = False
     idempotency_key: str = Field(default="", max_length=80)
@@ -1416,6 +1599,7 @@ class RequeteRst(BaseModel):
     lien: str = Field(min_length=1, max_length=2048)
     mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
     intensite_transitions: int = Field(default=2, ge=0, le=3)
+    voix_off: str = Field(default="", max_length=64)
     idempotency_key: str = Field(default="", max_length=80)
 
 
@@ -1494,11 +1678,28 @@ def _purger_jobs() -> None:
     seuil = time.time() - max(DUREE_VIE_JOB, CONFIG.delai_job * 2)
     for dossier in DOSSIER_TRAVAIL.iterdir():
         try:
+            if dossier == DOSSIER_VOIX_OFF:
+                continue  # les voix off ont leur propre purge, par fichier
             if dossier.is_dir() and dossier.stat().st_mtime < seuil:
                 shutil.rmtree(dossier, ignore_errors=True)
         except OSError:
             logger.warning("Nettoyage impossible pour %s", dossier)
 
+    _purger_voix_off()
+
+
+
+def _resoudre_voix_off(session_id: str, identifiant: str) -> Optional[Path]:
+    """Traduit l'identifiant renvoyé par /api/voixoff en fichier réellement présent."""
+    valeur = str(identifiant or "").strip()
+    if not valeur:
+        return None
+    chemin = _chemin_voix_off(session_id, valeur)
+    if not chemin:
+        raise ErreurApp(
+            "La voix off importée n'est plus disponible (expirée après 6 h). Réimporte le fichier."
+        )
+    return chemin
 
 
 def _valider_requete_video(requete: RequeteVideo) -> None:
@@ -1528,8 +1729,11 @@ def _valider_requete_montage(requete: RequeteMontage) -> list[str]:
     return propres
 
 
-async def _produire_video(requete: RequeteVideo, contexte: Optional[ContexteJob] = None) -> dict[str, Any]:
+async def _produire_video(
+    requete: RequeteVideo, contexte: Optional[ContexteJob] = None, session_id: str = ""
+) -> dict[str, Any]:
     _valider_requete_video(requete)
+    voix_off = _resoudre_voix_off(session_id, requete.voix_off)
     if contexte:
         contexte.update(statut="selecting", progress=8, detail="Recherche du B-roll vertical")
     cues = _decouper_en_cues(requete.hook, requete.corps)
@@ -1541,6 +1745,7 @@ async def _produire_video(requete: RequeteVideo, contexte: Optional[ContexteJob]
     chemin = await construire_video(
         liens_broll, cues, duree_totale, requete.style,
         resolution=resolution, crf=21 if requete.mode == "qualite" else 23,
+        voix_off=voix_off,
     )
     await envoyer_script_et_video(requete.hook, requete.corps, chemin)
     return {"url": f"/videos/{chemin.name}", "path": chemin}
@@ -1550,6 +1755,7 @@ async def _produire_montage(
     requete: RequeteMontage, contexte: ContexteJob, session_id: str = ""
 ) -> dict[str, Any]:
     _valider_requete_montage(requete)
+    voix_off = _resoudre_voix_off(session_id, requete.voix_off)
     resultat = await construire_montage_professionnel(
         liens=requete.liens_videos,
         lien_reference=requete.lien_reference_style.strip(),
@@ -1563,6 +1769,7 @@ async def _produire_montage(
         telechargeur=_telecharger_fichier,
         appel_gemini=_appel_gemini_brut,
         intensite_transitions=requete.intensite_transitions,
+        voix_off=voix_off,
     )
     await envoyer_script_et_video(requete.hook, requete.corps, resultat["path"])
     return resultat
@@ -1760,8 +1967,69 @@ async def configuration_publique() -> dict[str, Any]:
         "rst": {
             "candidats_max": CONFIG.rst_candidats_max,
             "sources_max": CONFIG.rst_sources_max,
+            "liens_par_lancement": RST_LIENS_PAR_LANCEMENT,
         },
+        "voix_off_max_mo": VOIX_OFF_MAX_MO,
+        "voix_off_extensions": sorted(VOIX_OFF_EXTENSIONS),
+        "gemini_modeles": _modeles_gemini(),
     }
+
+
+@app.post("/api/voixoff")
+async def televerser_voix_off(request: Request, nom: str = ""):
+    """Importe un fichier audio (corps HTTP brut) qui servira de voix off au montage.
+
+    Aucun service payant : l'utilisateur fournit son propre enregistrement. Le fichier
+    reste lié à sa session, limité à 25 Mo, vérifié par FFprobe et purgé au bout de 6 h.
+    """
+    _purger_voix_off()
+    extension = Path(str(nom or "")).suffix.lower()
+    if extension not in VOIX_OFF_EXTENSIONS:
+        raise HTTPException(
+            400,
+            "Format audio non pris en charge. Extensions acceptées : "
+            + ", ".join(sorted(VOIX_OFF_EXTENSIONS))
+            + ".",
+        )
+
+    annonce = request.headers.get("content-length")
+    if annonce and annonce.isdigit() and int(annonce) > VOIX_OFF_MAX_OCTETS:
+        raise HTTPException(413, f"Voix off trop lourde : {VOIX_OFF_MAX_MO} Mo maximum.")
+
+    corps = await request.body()
+    if not corps:
+        raise HTTPException(400, "Fichier vide : aucun audio reçu.")
+    if len(corps) > VOIX_OFF_MAX_OCTETS:
+        raise HTTPException(413, f"Voix off trop lourde : {VOIX_OFF_MAX_MO} Mo maximum.")
+
+    session_id, nouveau = _session_id(request)
+    dossier = _dossier_voix_off(session_id)
+    dossier.mkdir(parents=True, exist_ok=True)
+    identifiant = uuid.uuid4().hex
+    chemin = dossier / f"{identifiant}{extension}"
+    chemin.write_bytes(corps)
+
+    try:
+        duree = await _sonder_audio(chemin)
+    except ErreurApp as exc:
+        chemin.unlink(missing_ok=True)
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        chemin.unlink(missing_ok=True)
+        logger.exception("Analyse de la voix off impossible")
+        raise HTTPException(400, f"Fichier audio refusé : {exc}") from exc
+
+    response = JSONResponse({
+        "voix_off": identifiant,
+        "nom": Path(str(nom)).name,
+        "extension": extension,
+        "taille_octets": len(corps),
+        "duree": round(duree, 2),
+        "expire_dans_heures": DUREE_VIE_VOIX_OFF // 3600,
+    })
+    if nouveau:
+        _poser_cookie(response, session_id, request)
+    return response
 
 
 @app.get("/api/integrations/status")
@@ -1943,7 +2211,8 @@ async def lancer_job_video(requete: RequeteVideo, request: Request):
         raise HTTPException(400, str(exc)) from exc
     session_id, nouveau = _session_id(request)
     job_id, reused = _demarrer_job(
-        "video", requete, session_id, lambda contexte: _produire_video(requete, contexte)
+        "video", requete, session_id,
+        lambda contexte: _produire_video(requete, contexte, session_id),
     )
     return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 
@@ -1979,7 +2248,8 @@ async def lancer_job_rst(requete: RequeteRst, request: Request):
         raise HTTPException(400, f"Lien TikTok de départ invalide : {exc}") from exc
     session_id, nouveau = _session_id(request)
     job_id, reused = _demarrer_job(
-        "rst", requete, session_id, lambda contexte: _produire_rst(requete, contexte)
+        "rst", requete, session_id,
+        lambda contexte: _produire_rst(requete, contexte, session_id),
     )
     return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 

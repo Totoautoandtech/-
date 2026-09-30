@@ -6,6 +6,9 @@
   'use strict';
   const ACTIVE_JOB_KEY = 'vesper.activeJob.v2';
   const BATCH_DRAFTS_KEY = 'vesper.batchDrafts.v1';
+  // Mode RsT multiple : un job indépendant par lien, suivis même après actualisation.
+  const RST_JOBS_KEY = 'vesper.rstJobs.v1';
+  const RST_LIENS_MAX = 6;
 
   function isTransientStatus(status) { return status === 502 || status === 503 || status === 504; }
   function backoffDelay(attempt) { return Math.min(12000, 750 * Math.pow(2, Math.max(0, attempt))); }
@@ -55,6 +58,30 @@
   }
   function clearBatchDrafts(storage) { storage.removeItem(BATCH_DRAFTS_KEY); }
 
+  function parseRstLinks(text, max) {
+    return parseLinks(text, Number.isFinite(max) && max > 0 ? max : RST_LIENS_MAX);
+  }
+
+  function saveRstJobs(storage, jobs) {
+    const propres = (Array.isArray(jobs) ? jobs : [])
+      .filter(job => job && typeof job.id === 'string' && job.id)
+      .slice(0, RST_LIENS_MAX)
+      .map(job => ({ id: job.id, lien: String(job.lien || ''), titre: String(job.titre || '') }));
+    storage.setItem(RST_JOBS_KEY, JSON.stringify(propres));
+  }
+
+  function loadRstJobs(storage) {
+    try {
+      const jobs = JSON.parse(storage.getItem(RST_JOBS_KEY) || '[]');
+      if (!Array.isArray(jobs)) return [];
+      return jobs
+        .filter(job => job && typeof job.id === 'string' && job.id)
+        .slice(0, RST_LIENS_MAX);
+    } catch (_) { return []; }
+  }
+
+  function clearRstJobs(storage) { storage.removeItem(RST_JOBS_KEY); }
+
   function submissionGuard() {
     let busy = false;
     return {
@@ -69,7 +96,9 @@
 
   return {
     ACTIVE_JOB_KEY, BATCH_DRAFTS_KEY, isTransientStatus, backoffDelay, sleep, normalizeTikTokLink,
-    parseLinks, saveActiveJob, loadActiveJob, clearActiveJob,
-    saveBatchDrafts, loadBatchDrafts, clearBatchDrafts, submissionGuard
+    RST_JOBS_KEY, RST_LIENS_MAX,
+    parseLinks, parseRstLinks, saveActiveJob, loadActiveJob, clearActiveJob,
+    saveBatchDrafts, loadBatchDrafts, clearBatchDrafts,
+    saveRstJobs, loadRstJobs, clearRstJobs, submissionGuard
   };
 });

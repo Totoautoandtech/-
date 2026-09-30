@@ -30,6 +30,12 @@
   let diagnosticTimer = 0;
   let historyTimer = 0;
   let batchDrafts = U.loadBatchDrafts(localStorage);
+  // RsT multiple : jusqu'à 6 travaux indépendants suivis en parallèle.
+  let rstJobs = U.loadRstJobs(localStorage);
+  const rstEtats = {};   // job_id -> dernier état réel renvoyé par l'API
+  const rstSuivis = new Set();
+  // Voix off importée par section : identifiant renvoyé par POST /api/voixoff.
+  const voixOff = { lien: '', rst: '', montage: '' };
 
   const guards = {
     analyser: U.submissionGuard(), video: U.submissionGuard(),
@@ -51,6 +57,7 @@
   };
 
   const ETATS_FINAL = ['completed', 'failed', 'cancelled'];
+  const RST_MAX = 6;
 
   /* ------------------------------------------------------------------
      PETITS OUTILS
@@ -271,14 +278,15 @@
   async function loadConfig() {
     try {
       serverConfig = await requestJSON('/api/config');
-      const rst = serverConfig.rst || { candidats_max: 40, sources_max: 20 };
+      const rst = serverConfig.rst || { candidats_max: 40, sources_max: 20, liens_par_lancement: 6 };
       $('source-limit').textContent =
         `Paramètres après « ? » retirés et doublons supprimés. Durée maximale : ${serverConfig.max_source_seconds} s par source. ` +
         `Limite globale : ${Math.floor(serverConfig.job_timeout_seconds / 60)} min ${String(serverConfig.job_timeout_seconds % 60).padStart(2, '0')}.`;
       const accroche = document.querySelector('.tool[data-tool="rst"] .lead');
       if (accroche) {
         accroche.innerHTML =
-          `Colle <strong>un seul lien TikTok de départ</strong>. RsT analyse la vidéo, prépare le script, recherche jusqu’à <strong>${rst.candidats_max} vidéos TikTok candidates</strong>, ` +
+          `Colle <strong>jusqu’à ${rst.liens_par_lancement || 6} liens TikTok de départ</strong>, un par ligne. Chaque lien lance <strong>son propre travail</strong>. ` +
+          `Pour chacun, RsT analyse la vidéo, prépare le script, recherche jusqu’à <strong>${rst.candidats_max} vidéos TikTok candidates</strong>, ` +
           `sélectionne jusqu’à <strong>${rst.sources_max} bonnes sources</strong>, puis crée automatiquement le montage final. ` +
           'Seules les vidéos réellement trouvées sont affichées.';
       }
@@ -326,7 +334,9 @@
     );
     if (serverConfig && serverConfig.rst) {
       complet.append(el('div', 'server-row',
-        `RsT : jusqu’à ${serverConfig.rst.candidats_max} candidates recherchées, ${serverConfig.rst.sources_max} sources retenues`));
+        `RsT : ${serverConfig.rst.liens_par_lancement || 6} liens par lancement, jusqu’à ${serverConfig.rst.candidats_max} candidates recherchées, ${serverConfig.rst.sources_max} sources retenues`));
+      complet.append(el('div', 'server-row',
+        `Voix off importée : ${voixOffMaxMo()} Mo maximum · ${voixOffExtensions().join(' ')}`));
     }
     const top = $('top-status');
     top.querySelector('span').textContent = sante.ok ? 'Studio opérationnel' : 'Service indisponible';
@@ -468,6 +478,97 @@
     });
   }
 
+
+  /* ------------------------------------------------------------------
+     VOIX OFF IMPORTÉE (fichier de l'utilisateur, aucun service payant)
+  ------------------------------------------------------------------ */
+
+  const VOIX_SECTIONS = {
+    lien: { input: 'voix-lien', etat: 'voix-lien-etat', clear: 'voix-lien-clear' },
+    rst: { input: 'voix-rst', etat: 'voix-rst-etat', clear: 'voix-rst-clear' },
+    montage: { input: 'voix-montage', etat: 'voix-montage-etat', clear: 'voix-montage-clear' }
+  };
+
+  function voixOffMaxMo() {
+    return Number(serverConfig && serverConfig.voix_off_max_mo) || 25;
+  }
+
+  function voixOffExtensions() {
+    return (serverConfig && serverConfig.voix_off_extensions)
+      || ['.aac', '.m4a', '.mp3', '.ogg', '.opus', '.wav'];
+  }
+
+  function reinitialiserVoixOff(section, message) {
+    const refs = VOIX_SECTIONS[section];
+    voixOff[section] = '';
+    $(refs.input).value = '';
+    const etat = $(refs.etat);
+    etat.textContent = message
+      || `Aucune voix off : la vidéo restera muette. Formats ${voixOffExtensions().join(', ')}, ${voixOffMaxMo()} Mo maximum.`;
+    etat.classList.remove('success', 'error');
+  }
+
+  async function televerserVoixOff(section) {
+    const refs = VOIX_SECTIONS[section];
+    const champ = $(refs.input);
+    const etat = $(refs.etat);
+    const fichier = champ.files && champ.files[0];
+    if (!fichier) { reinitialiserVoixOff(section); return; }
+
+    const extension = `.${(fichier.name.split('.').pop() || '').toLowerCase()}`;
+    if (!voixOffExtensions().includes(extension)) {
+      reinitialiserVoixOff(section, `Format ${extension} non accepté. Formats : ${voixOffExtensions().join(', ')}.`);
+      etat.classList.add('error');
+      toast('Format audio non pris en charge pour la voix off.', true);
+      return;
+    }
+    if (fichier.size > voixOffMaxMo() * 1024 * 1024) {
+      reinitialiserVoixOff(section, `Fichier trop lourd (${(fichier.size / 1048576).toFixed(1)} Mo). Limite : ${voixOffMaxMo()} Mo.`);
+      etat.classList.add('error');
+      toast('Voix off trop lourde.', true);
+      return;
+    }
+
+    etat.classList.remove('success', 'error');
+    etat.textContent = `Import de « ${fichier.name} » et vérification FFprobe…`;
+    champ.disabled = true;
+    try {
+      const reponse = await fetch(`/api/voixoff?nom=${encodeURIComponent(fichier.name)}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: fichier
+      });
+      let donnees = {};
+      try { donnees = await reponse.json(); } catch (_) { /* réponse vide */ }
+      if (!reponse.ok) throw new Error(donnees.detail || `Le serveur a répondu ${reponse.status}.`);
+      voixOff[section] = donnees.voix_off || '';
+      etat.textContent =
+        `Voix off « ${donnees.nom || fichier.name} » importée · ${fmtDuree(donnees.duree)} · ` +
+        `${(Number(donnees.taille_octets || fichier.size) / 1048576).toFixed(1)} Mo · ` +
+        `conservée ${donnees.expire_dans_heures || 6} h.`;
+      etat.classList.add('success');
+      toast('Voix off importée : elle sera montée sur la vidéo.');
+    } catch (error) {
+      reinitialiserVoixOff(section, `Voix off refusée : ${error.message}`);
+      etat.classList.add('error');
+      toast(error.message, true);
+    } finally {
+      champ.disabled = false;
+    }
+  }
+
+  function bindVoixOff() {
+    Object.keys(VOIX_SECTIONS).forEach((section) => {
+      const refs = VOIX_SECTIONS[section];
+      $(refs.input).addEventListener('change', () => televerserVoixOff(section));
+      $(refs.clear).addEventListener('click', () => {
+        reinitialiserVoixOff(section, 'Voix off retirée : cette vidéo sera muette.');
+      });
+      reinitialiserVoixOff(section);
+    });
+  }
+
   /* ------------------------------------------------------------------
      SUIVI RÉEL DE GÉNÉRATION (tracker commun aux trois sections)
   ------------------------------------------------------------------ */
@@ -538,50 +639,36 @@
       panneauScript.classList.add('hidden');
     }
 
-    if (data.type === 'rst' && Array.isArray(data.found_videos)) {
-      renderFoundVideos(data.found_videos, data.search_queries || []);
-    }
   }
 
   /* ------------------------------------------------------------------
      RsT : « Vidéos trouvées par RsT » (données réelles uniquement)
   ------------------------------------------------------------------ */
 
-  function renderFoundVideos(videos, requetes) {
-    $('rst-resultats').classList.remove('hidden');
-    const retenues = videos.filter((video) => video.selected).length;
-    $('rst-compteur').textContent = `${videos.length} trouvée(s) · ${retenues} retenue(s)`;
-    $('rst-resume').textContent = videos.length
-      ? `Recherches réellement effectuées : ${requetes.join(' · ')}. Aucune vidéo inventée : chaque ligne provient de TikTok.`
-      : 'Recherche en cours…';
+  function foundItem(video) {
+    const item = el('div', `found-item${video.selected ? ' selected' : ''}`);
 
-    const conteneur = $('rst-found');
-    conteneur.replaceChildren();
-    videos.forEach((video) => {
-      const item = el('div', `found-item${video.selected ? ' selected' : ''}`);
+    const icone = el('div', 'found-icon');
+    icone.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m10 8 6 4-6 4z"/></svg>';
+    item.append(icone);
 
-      const icone = el('div', 'found-icon');
-      icone.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m10 8 6 4-6 4z"/></svg>';
-      item.append(icone);
+    const info = el('div', 'found-info');
+    info.append(el('strong', '', `@${video.author || 'tiktok'}`));
+    info.append(el('span', 'found-title', video.title || '(vidéo sans légende)'));
+    info.append(el('span', 'found-meta', `${fmtDuree(video.duration)} · ${video.origin || 'recherche TikTok'}`));
+    if (!video.selected && video.rejet) info.append(el('span', 'found-rejet', `Écartée : ${video.rejet}`));
+    item.append(info);
 
-      const info = el('div', 'found-info');
-      info.append(el('strong', '', `@${video.author || 'tiktok'}`));
-      info.append(el('span', 'found-title', video.title || '(vidéo sans légende)'));
-      info.append(el('span', 'found-meta', `${fmtDuree(video.duration)} · ${video.origin || 'recherche TikTok'}`));
-      if (!video.selected && video.rejet) info.append(el('span', 'found-rejet', `Écartée : ${video.rejet}`));
-      item.append(info);
+    const cote = el('div', 'found-side');
+    cote.append(el('span', `badge ${video.selected ? 'ok' : 'ko'}`, video.selected ? 'retenue' : 'écartée'));
+    const ouvrir = el('a', 'found-open', 'Ouvrir ↗');
+    ouvrir.href = video.url;
+    ouvrir.target = '_blank';
+    ouvrir.rel = 'noopener';
+    cote.append(ouvrir);
+    item.append(cote);
 
-      const cote = el('div', 'found-side');
-      cote.append(el('span', `badge ${video.selected ? 'ok' : 'ko'}`, video.selected ? 'retenue' : 'écartée'));
-      const ouvrir = el('a', 'found-open', 'Ouvrir ↗');
-      ouvrir.href = video.url;
-      ouvrir.target = '_blank';
-      ouvrir.rel = 'noopener';
-      cote.append(ouvrir);
-      item.append(cote);
-
-      conteneur.append(item);
-    });
+    return item;
   }
 
   async function waitJob(id, type, statusElement) {
@@ -677,7 +764,7 @@
         await launchJob('video', {
           hook: $('hook').value, corps: $('corps').value,
           mot_cle_broll: $('mot-cle').value, style,
-          mode: settings.mode, idempotency_key: uuid()
+          mode: settings.mode, voix_off: voixOff.lien, idempotency_key: uuid()
         }, statut);
         setStatus(statut, 'Vidéo terminée.', 'success');
       } catch (error) {
@@ -690,38 +777,291 @@
      SECTION 2 : RsT
   ------------------------------------------------------------------ */
 
+  function rstLienCourt(lien) {
+    const texte = String(lien || '');
+    const morceaux = texte.split('/').filter(Boolean);
+    const identifiant = morceaux[morceaux.length - 1] || texte;
+    const auteur = (texte.match(/@[\w.\-]+/) || [''])[0];
+    return auteur ? `${auteur} · ${identifiant}` : identifiant;
+  }
+
+  function rstCompterLiens() {
+    const parsed = U.parseRstLinks($('rst-liens').value, RST_MAX);
+    const brut = $('rst-liens').value.split(/\r?\n/).filter((ligne) => ligne.trim()).length;
+    $('rst-liens-counter').textContent =
+      `${parsed.links.length}/${RST_MAX} liens${parsed.duplicates.length ? ` · ${parsed.duplicates.length} doublon(s)` : ''}`;
+    $('rst-liens-counter').classList.toggle('over', brut > RST_MAX || parsed.errors.length > 0);
+    if (parsed.errors.length) {
+      setStatus($('statut-rst'), parsed.errors.map((e) => `Ligne ${e.index + 1} : ${e.error}`).join(' · '), 'error');
+    } else if (parsed.links.length) {
+      setStatus($('statut-rst'), `${parsed.links.length} lien(s) TikTok prêt(s) : un travail sera lancé par lien.`);
+    } else {
+      setStatus($('statut-rst'), `Colle 1 à ${RST_MAX} liens TikTok de départ, un par ligne.`);
+    }
+    return parsed;
+  }
+
+  /* --- Une carte de suivi par travail RsT --- */
+
+  function renderRstJobs() {
+    const liste = $('job-list');
+    liste.replaceChildren();
+    $('rst-jobs').classList.toggle('hidden', rstJobs.length === 0);
+    if (!rstJobs.length) { $('rst-jobs-counter').textContent = ''; return; }
+
+    const actifs = rstJobs.filter((entree) => !ETATS_FINAL.includes((rstEtats[entree.id] || {}).status)).length;
+    $('rst-jobs-counter').textContent = `${actifs} en cours · ${rstJobs.length} travail(aux)`;
+
+    rstJobs.forEach((entree, index) => {
+      const data = rstEtats[entree.id] || { status: 'queued', progress: 0, detail: 'En attente sur Render' };
+      const fini = ETATS_FINAL.includes(data.status);
+      const carte = el('article', `job-card${data.status === 'completed' ? ' done' : data.status === 'failed' ? ' ko' : ''}`);
+      carte.dataset.job = entree.id;
+
+      const haut = el('div', 'job-top');
+      const titre = el('p', 'job-title');
+      titre.append(el('span', 'job-index', `RsT ${index + 1}/${rstJobs.length}`));
+      titre.append(document.createTextNode(entree.titre || rstLienCourt(entree.lien)));
+      haut.append(titre, el('span', 'job-pct', `${Number(data.progress || 0)}%`));
+      carte.append(haut);
+
+      carte.append(el('p', 'job-detail',
+        `${statusLabels[data.status] || data.status} · ${data.detail || ''}` +
+        (data.status === 'queued' && data.queue_position ? ` · position ${data.queue_position}` : '')));
+
+      const barre = el('div', 'job-progress');
+      barre.append(Object.assign(el('i'), { style: `width:${Number(data.progress || 0)}%` }));
+      carte.append(barre);
+
+      if (data.found_videos && data.found_videos.length) {
+        carte.append(el('p', 'job-found', `${data.found_videos.length} vidéo(s) réellement trouvée(s)`));
+      }
+      if (data.error) carte.append(el('p', 'job-error', data.error));
+
+      const actions = el('div', 'job-actions');
+      if (data.url) {
+        actions.append(boutonAction('Voir', () => showResult(data.url, data.drive, data.title || entree.titre)));
+        const telecharger = el('a', '', 'Télécharger');
+        telecharger.href = data.url; telecharger.download = '';
+        actions.append(telecharger);
+      }
+      if (!fini) {
+        actions.append(boutonAction('Annuler', async (evenement) => {
+          const bouton = evenement.currentTarget;
+          if (!confirm(`Annuler « ${entree.titre || rstLienCourt(entree.lien)} » ?`)) return;
+          bouton.disabled = true;
+          try {
+            await requestJSON(`/api/jobs/${encodeURIComponent(entree.id)}/cancel`, { body: {} });
+          } catch (error) { toast(error.message, true); bouton.disabled = false; }
+        }));
+      } else {
+        actions.append(boutonAction('Retirer', () => {
+          rstJobs = rstJobs.filter((autre) => autre.id !== entree.id);
+          delete rstEtats[entree.id];
+          U.saveRstJobs(localStorage, rstJobs);
+          const bloc = document.querySelector(`.found-bloc[data-job="${entree.id}"]`);
+          if (bloc) bloc.remove();
+          renderRstJobs();
+          renderRstFoundBlocs();
+        }));
+      }
+      const ouvrir = el('a', '', 'Lien de départ ↗');
+      ouvrir.href = entree.lien; ouvrir.target = '_blank'; ouvrir.rel = 'noopener';
+      actions.append(ouvrir);
+      carte.append(actions);
+
+      liste.append(carte);
+    });
+  }
+
+  /* --- « Vidéos trouvées par RsT » : un bloc par travail --- */
+
+  function renderRstFoundBlocs() {
+    const conteneur = $('rst-found');
+    const avecVideos = rstJobs.filter((entree) => (rstEtats[entree.id] || {}).found_videos);
+    $('rst-resultats').classList.toggle('hidden', avecVideos.length === 0);
+    if (!avecVideos.length) { conteneur.replaceChildren(); $('rst-compteur').textContent = ''; return; }
+
+    let total = 0, retenuesTotal = 0;
+    conteneur.replaceChildren();
+    avecVideos.forEach((entree, index) => {
+      const data = rstEtats[entree.id] || {};
+      const videos = data.found_videos || [];
+      const requetes = data.search_queries || [];
+      const retenues = videos.filter((video) => video.selected).length;
+      total += videos.length; retenuesTotal += retenues;
+
+      const bloc = el('section', 'found-bloc');
+      bloc.dataset.job = entree.id;
+      const tete = el('div', 'list-head');
+      tete.append(el('h4', '', `RsT ${index + 1} · ${entree.titre || rstLienCourt(entree.lien)}`));
+      tete.append(el('span', 'counter', `${videos.length} trouvée(s) · ${retenues} retenue(s)`));
+      bloc.append(tete);
+      bloc.append(el('p', 'hint', videos.length
+        ? `Recherches réellement effectuées : ${requetes.join(' · ')}. Aucune vidéo inventée : chaque ligne provient de TikTok.`
+        : 'Recherche en cours…'));
+
+      const liste = el('div', 'found-list');
+      videos.forEach((video) => liste.append(foundItem(video)));
+      bloc.append(liste);
+      conteneur.append(bloc);
+    });
+    $('rst-compteur').textContent = `${total} trouvée(s) · ${retenuesTotal} retenue(s) sur ${avecVideos.length} travail(aux)`;
+    $('rst-resume').textContent =
+      'Chaque bloc correspond à un lien de départ et à son propre travail RsT. Aucune donnée inventée.';
+  }
+
+  /* --- Suivi indépendant d'un travail RsT --- */
+
+  async function suivreRstJob(entree) {
+    if (rstSuivis.has(entree.id)) return;
+    rstSuivis.add(entree.id);
+    try {
+      for (;;) {
+        let data;
+        try {
+          data = await requestJSON(`/api/jobs/${encodeURIComponent(entree.id)}`, {
+            retryTransient: true, retryForMs: 90000
+          });
+        } catch (error) {
+          if (error.status === 404) {
+            rstEtats[entree.id] = {
+              status: 'failed', progress: 0, detail: 'Travail expiré',
+              error: 'Travail introuvable ou expiré (6 h).'
+            };
+            renderRstJobs();
+            return;
+          }
+          rstEtats[entree.id] = {
+            ...(rstEtats[entree.id] || {}), detail: error.message
+          };
+          renderRstJobs();
+          await U.sleep(4000);
+          continue;
+        }
+        rstEtats[entree.id] = data;
+        renderRstJobs();
+        if (Array.isArray(data.found_videos)) renderRstFoundBlocs();
+
+        if (ETATS_FINAL.includes(data.status)) {
+          if (data.status === 'completed') {
+            if (data.url) showResult(data.url, data.drive, data.title || entree.titre);
+            toast(`RsT terminé : ${entree.titre || rstLienCourt(entree.lien)}`);
+          } else if (data.status === 'failed') {
+            toast(`RsT échoué : ${data.error || 'travail interrompu'}`, true);
+          }
+          const restants = rstJobs.filter(
+            (autre) => !ETATS_FINAL.includes((rstEtats[autre.id] || {}).status)
+          );
+          U.saveRstJobs(localStorage, restants);
+          loadHistory();
+          majStatutRst();
+          return;
+        }
+        await U.sleep(2200);
+      }
+    } finally {
+      rstSuivis.delete(entree.id);
+    }
+  }
+
+  function majStatutRst() {
+    const actifs = rstJobs.filter((entree) => !ETATS_FINAL.includes((rstEtats[entree.id] || {}).status));
+    const termines = rstJobs.length - actifs.length;
+    if (actifs.length) {
+      setStatus($('statut-rst'), `${actifs.length} travail(aux) RsT en cours, ${termines} terminé(s). Le suivi reprend après une actualisation.`);
+    } else if (rstJobs.length) {
+      setStatus($('statut-rst'), `${rstJobs.length} travail(aux) RsT terminé(s).`, 'success');
+    }
+    $('nav-dot').classList.toggle('hidden', !actifs.length && !activeJobId);
+    $('btn-rst').disabled = Boolean(activeJobId);
+  }
+
   function bindRst() {
     $('rst-coller').addEventListener('click', () => {
-      collerPressePapier((texte) => { $('rst-lien').value = texte.split(/\r?\n/)[0].trim(); });
+      collerPressePapier((texte) => {
+        const existant = $('rst-liens').value.trim();
+        $('rst-liens').value = existant ? `${existant}\n${texte}` : texte;
+        rstCompterLiens();
+        toast('Liens collés dans RsT.');
+      });
     });
+
+    $('rst-clear').addEventListener('click', () => {
+      $('rst-liens').value = '';
+      rstCompterLiens();
+      setStatus($('statut-rst'), 'Liens RsT effacés.');
+    });
+
+    $('rst-liens').addEventListener('input', rstCompterLiens);
 
     $('btn-rst').addEventListener('click', () => guards.rst.run(async () => {
       const bouton = $('btn-rst'), statut = $('statut-rst');
-      const lien = $('rst-lien').value.trim();
-      if (!lien) { setStatus(statut, 'Colle un lien TikTok de départ.', 'error'); return; }
-      const verification = U.normalizeTikTokLink(lien);
-      if (!verification.ok) { setStatus(statut, 'Ce lien n’est pas une vidéo TikTok valide.', 'error'); return; }
+      const parsed = U.parseRstLinks($('rst-liens').value, RST_MAX);
+      if (parsed.errors.length) {
+        setStatus(statut, parsed.errors.map((e) => `Ligne ${e.index + 1} : ${e.error}`).join(' · '), 'error');
+        return;
+      }
+      if (!parsed.links.length) {
+        setStatus(statut, `Colle 1 à ${RST_MAX} liens TikTok de départ, un par ligne.`, 'error');
+        return;
+      }
+      const actifs = rstJobs.filter((entree) => !ETATS_FINAL.includes((rstEtats[entree.id] || {}).status));
+      if (actifs.length + parsed.links.length > RST_MAX) {
+        setStatus(statut, `${RST_MAX} travaux RsT maximum en parallèle (${actifs.length} déjà en cours).`, 'error');
+        return;
+      }
 
       bouton.disabled = true;
-      $('rst-resultats').classList.add('hidden');
-      $('rst-found').replaceChildren();
-      setStatus(statut, 'RsT analyse le lien, prépare le script puis cherche les vidéos…');
-      try {
-        await launchJob('rst', {
-          titre: `RsT · ${(verification.url || lien).slice(0, 80)}`,
-          lien,
-          mode: settings.mode,
-          intensite_transitions: settings.intensite,
-          idempotency_key: uuid()
-        }, statut);
-        setStatus(statut, 'Montage RsT terminé.', 'success');
-        toast('RsT a terminé le montage.');
-      } catch (error) {
-        setStatus(statut, error.message, 'error');
-      } finally {
-        bouton.disabled = Boolean(activeJobId);
+      setStatus(statut, `Lancement de ${parsed.links.length} travail(aux) RsT…`);
+      let lances = 0;
+      const echecs = [];
+      for (const lien of parsed.links) {
+        const titre = `RsT · ${rstLienCourt(lien)}`;
+        try {
+          const reponse = await requestJSON('/api/jobs/rst', {
+            body: {
+              titre, lien,
+              mode: settings.mode,
+              intensite_transitions: settings.intensite,
+              voix_off: voixOff.rst,
+              idempotency_key: uuid()
+            },
+            retryTransient: true, retryForMs: 45000,
+            onRetry: (message) => setStatus(statut, message)
+          });
+          const entree = { id: reponse.job_id, lien, titre };
+          if (!rstJobs.some((autre) => autre.id === entree.id)) rstJobs.push(entree);
+          U.saveRstJobs(localStorage, rstJobs);
+          renderRstJobs();
+          suivreRstJob(entree);
+          lances += 1;
+        } catch (error) {
+          echecs.push(`${rstLienCourt(lien)} : ${error.message}`);
+        }
       }
+      bouton.disabled = false;
+      if (lances) {
+        $('rst-liens').value = '';
+        rstCompterLiens();
+        toast(`${lances} travail(aux) RsT lancé(s).`);
+      }
+      setStatus(
+        statut,
+        echecs.length
+          ? `${lances} travail(aux) lancé(s). Échec : ${echecs.join(' · ')}`
+          : `${lances} travail(aux) RsT lancé(s). Render les traite l’un après l’autre ; le suivi survit à une actualisation.`,
+        echecs.length ? 'error' : 'success'
+      );
     }));
+  }
+
+  function resumeRstJobs() {
+    rstJobs = U.loadRstJobs(localStorage);
+    if (!rstJobs.length) return;
+    renderRstJobs();
+    setStatus($('statut-rst'), 'Reprise du suivi des travaux RsT après actualisation…');
+    rstJobs.forEach((entree) => suivreRstJob(entree));
   }
 
   /* ------------------------------------------------------------------
@@ -747,6 +1087,7 @@
       resolution: resolutionPourMode(),
       mode: settings.mode,
       intensite_transitions: settings.intensite,
+      voix_off: voixOff.montage,
       estimated_seconds: Number(diagnosticData?.estimated_seconds || 0),
       accepter_risque: risqueAccepte,
       idempotency_key: uuid()
@@ -1107,6 +1448,7 @@
   async function resumeJob() {
     const saved = U.loadActiveJob(localStorage);
     if (!saved) return;
+    if (saved.type === 'rst') { U.clearActiveJob(localStorage); return; }  // RsT a son propre suivi multiple
     const statut = saved.type === 'montage' ? $('statut-montage')
       : saved.type === 'rst' ? $('statut-rst')
         : saved.type === 'reference' ? $('statut-reference')
@@ -1147,8 +1489,10 @@
     bindAnnulation();
     bindIntegrations();
     bindPlayer();
+    bindVoixOff();
     renderBatchDrafts();
     validateLinksLocally(false);
+    rstCompterLiens();
 
     const params = new URLSearchParams(location.search);
     if (params.get('status')) {
@@ -1163,6 +1507,7 @@
     loadConfig().then(loadSante);
     loadIntegrations().then(loadHistory);
     resumeJob();
+    resumeRstJobs();
   }
 
   init();

@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#07070b">
+  <meta name="theme-color" content="#000000">
   <meta name="description" content="ς੮ ς८Րɿƿ┮ — dashboard vidéo : lien → vidéo, RsT et montage multi-source TikTok.">
   <title>ς੮ ς८Րɿƿ┮ — Studio vidéo</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700&family=Manrope:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
@@ -136,6 +136,14 @@
                     <div class="styles" id="styles-lien"></div>
                   </div>
                 </div>
+                <div class="field voix-field">
+                  <label for="voix-lien">Voix off · facultatif</label>
+                  <div class="input-group">
+                    <input id="voix-lien" class="file-input" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,audio/*">
+                    <button class="btn ghost danger" id="voix-lien-clear" type="button">Retirer</button>
+                  </div>
+                  <p class="hint voix-hint" id="voix-lien-etat">Aucune voix off : la vidéo restera muette. MP3, WAV, M4A, AAC, OGG ou OPUS, 25 Mo maximum.</p>
+                </div>
                 <div class="actions">
                   <button class="btn primary" id="btn-video"><span>Générer la vidéo</span><span aria-hidden="true">✦</span></button>
                 </div>
@@ -151,19 +159,42 @@
                 <h2>RsT</h2>
                 <span class="chip">02</span>
               </div>
-              <p class="lead">Colle <strong>un seul lien TikTok de départ</strong>. RsT analyse la vidéo, prépare le script, recherche jusqu’à 40 vidéos TikTok candidates, sélectionne jusqu’à 20 bonnes sources, puis crée automatiquement le montage final. Seules les vidéos réellement trouvées sont affichées.</p>
+              <p class="lead">Colle <strong>jusqu’à 6 liens TikTok de départ</strong>, un par ligne. Chaque lien lance son propre travail : RsT analyse la vidéo, prépare le script, recherche jusqu’à 40 vidéos TikTok candidates, sélectionne jusqu’à 20 bonnes sources, puis crée automatiquement le montage final. Seules les vidéos réellement trouvées sont affichées.</p>
 
-              <div class="field-row">
-                <div class="field grow">
-                  <label for="rst-lien">Lien TikTok de départ</label>
-                  <div class="input-group">
-                    <input id="rst-lien" type="text" inputmode="url" placeholder="https://www.tiktok.com/@…/video/…" autocomplete="off">
-                    <button class="btn ghost" id="rst-coller" type="button">Coller</button>
-                  </div>
+              <div class="field">
+                <div class="field-label-row">
+                  <label class="field-label" for="rst-liens">Liens TikTok de départ — un par ligne</label>
+                  <span class="counter" id="rst-liens-counter">0/6 liens</span>
                 </div>
+                <textarea id="rst-liens" rows="6" placeholder="https://www.tiktok.com/@…/video/…&#10;https://www.tiktok.com/@…/video/…"></textarea>
+                <p class="hint" id="rst-liens-hint">Un travail indépendant par lien, traités l’un après l’autre par Render.</p>
+                <div class="actions">
+                  <button class="btn ghost" id="rst-coller" type="button">Coller</button>
+                  <button class="btn ghost danger" id="rst-clear" type="button">Tout supprimer</button>
+                </div>
+              </div>
+
+              <div class="field voix-field">
+                <label for="voix-rst">Voix off · facultatif</label>
+                <div class="input-group">
+                  <input id="voix-rst" class="file-input" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,audio/*">
+                  <button class="btn ghost danger" id="voix-rst-clear" type="button">Retirer</button>
+                </div>
+                <p class="hint voix-hint" id="voix-rst-etat">Aucune voix off : les montages RsT resteront muets. La même voix off est appliquée à tous les liens lancés.</p>
+              </div>
+
+              <div class="actions">
                 <button class="btn primary" id="btn-rst"><span>Trouver les vidéos et créer</span><span aria-hidden="true">✦</span></button>
               </div>
               <p class="status" id="statut-rst"></p>
+
+              <div class="hidden" id="rst-jobs">
+                <div class="list-head">
+                  <h3>Travaux RsT en cours</h3>
+                  <span class="counter" id="rst-jobs-counter"></span>
+                </div>
+                <div class="job-list" id="job-list"></div>
+              </div>
 
               <div class="hidden" id="rst-resultats">
                 <div class="list-head">
@@ -171,7 +202,7 @@
                   <span class="counter" id="rst-compteur"></span>
                 </div>
                 <p class="hint" id="rst-resume"></p>
-                <div class="found-list" id="rst-found"></div>
+                <div class="found-blocs" id="rst-found"></div>
               </div>
             </div>
           </div>
@@ -284,6 +315,14 @@
                 <div class="field">
                   <label>Sous-titres (sans référence de style)</label>
                   <div class="styles" id="styles-montage"></div>
+                </div>
+                <div class="field voix-field">
+                  <label for="voix-montage">Voix off · facultatif</label>
+                  <div class="input-group">
+                    <input id="voix-montage" class="file-input" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,audio/*">
+                    <button class="btn ghost danger" id="voix-montage-clear" type="button">Retirer</button>
+                  </div>
+                  <p class="hint voix-hint" id="voix-montage-etat">Aucune voix off : le montage restera muet. MP3, WAV, M4A, AAC, OGG ou OPUS, 25 Mo maximum.</p>
                 </div>
                 <p class="hint" id="export-courant"></p>
               </div>
