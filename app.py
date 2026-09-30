@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -41,7 +42,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from urllib.parse import urlencode, urlparse
 
 import aiofiles
@@ -50,9 +51,10 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from studio_montage import (
+    DUREE_MAX_PLAN_DEFAUT,
     ConfigurationMontage,
     ErreurMontage,
     Rapporteur,
@@ -90,6 +92,25 @@ DUREE_VIE_VOIX_OFF = 6 * 60 * 60
 
 # Mode RsT : nombre maximum de liens TikTok traités par lancement (un job indépendant chacun).
 RST_LIENS_PAR_LANCEMENT = 6
+
+# Mode RsT « TOP N » : l'IA extrait de la vidéo de départ 3 ou 5 noms (personnes, lieux,
+# objets, marques…). Chaque nom devient une recherche TikTok distincte, et le montage
+# final enchaîne les meilleures sources trouvées pour chacun d'eux.
+RST_NOMS_CHOIX = (3, 5)
+RST_NOMS_DEFAUT = 3
+# Aucun plan du montage RsT ne dépasse 5 secondes.
+RST_DUREE_MAX_PLAN = 5.0
+
+# Livraison séparée : la vidéo finale reste MUETTE. Le script est livré en .txt et la
+# voix off est synthétisée en .mp3 par edge-tts — gratuit, sans clé d'API et sans compte.
+# Speechma a été écarté : payant. Les deux fichiers se téléchargent à côté de la vidéo.
+EDGE_TTS_VOIX = _env("EDGE_TTS_VOIX", "fr-FR-DeniseNeural")
+EDGE_TTS_DEBIT = _env("EDGE_TTS_DEBIT", "+0%")
+# edge-tts appelle speech.platform.bing.com : sur un réseau qui le bloque, la synthèse
+# échoue proprement et le travail se termine quand même avec la vidéo et le script.
+EDGE_TTS_DELAI = 45.0
+# Marge de sécurité : au-delà, la synthèse dépasserait le temps imparti sur Render Free.
+VOIX_OFF_TEXTE_MAX = 4000
 
 
 @dataclass
@@ -253,7 +274,9 @@ TAILLE_MAX_PAGE_SOURCE = 2 * 1024 * 1024
 DUREE_MAX_APERCU_IA = CONFIG.duree_max_source  # compatibilité des anciens helpers
 
 
-def _configuration_montage(mode: str = "rapide") -> ConfigurationMontage:
+def _configuration_montage(
+    mode: str = "rapide", duree_max_plan: float = DUREE_MAX_PLAN_DEFAUT
+) -> ConfigurationMontage:
     """Configuration du pipeline ; le mode « qualite » privilégie un encodage plus fin."""
     qualite = str(mode).lower() == "qualite"
     return ConfigurationMontage(
@@ -269,6 +292,7 @@ def _configuration_montage(mode: str = "rapide") -> ConfigurationMontage:
         crf=21 if qualite else 23,
         threads_ffmpeg=CONFIG.threads_ffmpeg,
         autoriser_1080=CONFIG.autoriser_export_1080,
+        duree_max_plan=float(duree_max_plan),
     )
 
 
@@ -732,6 +756,89 @@ async def generer_script(source_texte: str) -> dict[str, str]:
     return resultat
 
 
+PROMPT_NOMS_RST = (
+    "Tu analyses la légende d'une vidéo TikTok. Ton rôle est d'en extraire les NOMS "
+    "réellement évoqués : personnes, personnages, lieux, marques, équipes, œuvres, objets "
+    "ou concepts précis. Réponds UNIQUEMENT avec un JSON valide, sans texte avant/après, "
+    "sans balises markdown, avec exactement une clé :\n"
+    '- "noms" : un tableau de {nombre} chaînes maximum, classées de la plus importante à la '
+    "moins importante. Chaque nom fait 2 à 40 caractères et doit pouvoir servir tel quel de "
+    "requête de recherche sur TikTok.\n"
+    "N'invente jamais un nom qui ne serait pas soutenu par la légende : s'il y en a moins de "
+    "{nombre}, renvoie seulement ceux qui existent vraiment. Réponds strictement avec ce JSON."
+)
+
+
+def _nettoyer_nom_rst(valeur: Any) -> str:
+    """Normalise un nom proposé par l'IA en requête de recherche réellement utilisable."""
+    texte = str(valeur or "").strip().strip("\"'`").lstrip("#@").strip()
+    texte = re.sub(r"\s+", " ", texte)
+    if len(texte) < 2 or len(texte) > 40:
+        return ""
+    # Un « nom » entièrement composé de ponctuation ou de chiffres n'est pas cherchable.
+    if not re.search(r"[\wÀ-ÿ]", texte):
+        return ""
+    return texte
+
+
+def _deduplique_noms(noms: Iterable[str], limite: int) -> list[str]:
+    """Garde l'ordre d'importance, sans doublon insensible à la casse, jusqu'à `limite`."""
+    retenus: list[str] = []
+    vus: set[str] = set()
+    for brut in noms:
+        propre = _nettoyer_nom_rst(brut)
+        if not propre:
+            continue
+        cle = propre.casefold()
+        if cle in vus:
+            continue
+        vus.add(cle)
+        retenus.append(propre)
+        if len(retenus) >= limite:
+            break
+    return retenus
+
+
+def borner_nombre_noms_rst(valeur: Any) -> int:
+    """Le pipeline TOP N n'accepte que 3 ou 5 noms ; tout le reste retombe sur 3."""
+    try:
+        demande = int(valeur)
+    except (TypeError, ValueError):
+        return RST_NOMS_DEFAUT
+    return demande if demande in RST_NOMS_CHOIX else RST_NOMS_DEFAUT
+
+
+async def extraire_noms_rst(
+    legende: str, nombre: int = RST_NOMS_DEFAUT, mot_cle_broll: str = ""
+) -> list[str]:
+    """Extrait de la légende les `nombre` noms les plus importants (TOP N).
+
+    L'IA est interrogée en premier car elle reconnaît les noms propres ; si elle échoue
+    ou renvoie une liste vide, on retombe sur les mots-clés réellement présents dans la
+    légende. Aucun nom n'est inventé : la liste peut être plus courte que demandée.
+    """
+    limite = borner_nombre_noms_rst(nombre)
+    noms: list[str] = []
+    try:
+        brut = await _appel_gemini_brut(
+            [{"text": legende}],
+            temperature=0.2,
+            system=PROMPT_NOMS_RST.format(nombre=limite),
+            json_mode=True,
+        )
+        resultat = _parser_json(brut)
+        if isinstance(resultat, dict):
+            noms = _deduplique_noms(resultat.get("noms") or [], limite)
+    except (ErreurApp, ErreurMontage) as exc:
+        logger.warning("[RsT] extraction des noms par l'IA indisponible : %s", exc)
+
+    if len(noms) < limite:
+        # Repli honnête : hashtags, thème visuel puis mots fréquents de la vraie légende.
+        complement = _extraire_mots_cles_rst(legende, mot_cle_broll, limite=limite * 2)
+        noms = _deduplique_noms([*noms, *complement], limite)
+    return noms
+
+
 # ======================================================================================
 # MODE "VIDÉO DE RÉFÉRENCE" : reprendre le script d'une vidéo existante, hook préservé
 # ======================================================================================
@@ -1185,6 +1292,124 @@ async def construire_montage(liens_videos: list[str], hook: str, corps: str, sty
 
 
 # ======================================================================================
+# LIVRAISON SÉPARÉE : script .txt + voix off .mp3 générée (edge-tts), vidéo muette
+# ======================================================================================
+#
+# La vidéo finale ne contient AUCUNE piste audio générée : elle reste muette. Le script
+# et sa lecture à voix haute se téléchargent à côté, en deux fichiers indépendants.
+# L'utilisateur reste libre de les monter lui-même, ou d'importer sa propre voix off.
+
+
+def composer_script_txt(
+    script: dict[str, Any],
+    seed: Optional[dict[str, Any]] = None,
+    noms: Optional[list[str]] = None,
+) -> str:
+    """Met en forme le script livré en .txt — uniquement des données réelles du travail."""
+    hook = str(script.get("hook") or "").strip()
+    corps = str(script.get("corps") or "").strip()
+    lignes = ["SCRIPT", "=" * 6, "", "ACCROCHE", hook or "(vide)", "", "CORPS", corps or "(vide)"]
+
+    if noms:
+        lignes += ["", "NOMS RECHERCHÉS", ", ".join(noms)]
+    if seed:
+        titre = str(seed.get("title") or "").strip()
+        auteur = str(seed.get("author") or "").strip()
+        lignes += ["", "VIDÉO DE DÉPART"]
+        if auteur:
+            lignes.append(f"Auteur : @{auteur}")
+        if titre:
+            lignes.append(f"Légende : {titre}")
+        if seed.get("url"):
+            lignes.append(f"Lien : {seed['url']}")
+
+    mot_cle = str(script.get("mot_cle_broll") or "").strip()
+    if mot_cle:
+        lignes += ["", "UNIVERS VISUEL", mot_cle]
+    lignes += [
+        "", "-" * 60,
+        "La vidéo livrée est muette : ce script et le MP3 de voix off se téléchargent à part.",
+    ]
+    return "\n".join(lignes) + "\n"
+
+
+def texte_a_dire(script: dict[str, Any]) -> str:
+    """Texte réellement lu par la voix off : l'accroche puis le corps, rien d'autre."""
+    hook = str(script.get("hook") or "").strip()
+    corps = str(script.get("corps") or "").strip()
+    parle = " ".join(part for part in (hook, corps) if part).strip()
+    return parle[:VOIX_OFF_TEXTE_MAX]
+
+
+async def synthetiser_voix_off(texte: str, destination: Path) -> int:
+    """Génère un MP3 avec edge-tts (gratuit, sans clé). Retourne la taille écrite.
+
+    Lève ErreurApp si le service est injoignable ou renvoie un fichier vide : aucun
+    fichier factice n'est laissé derrière, et l'appelant reste libre de continuer.
+    """
+    propre = str(texte or "").strip()
+    if not propre:
+        raise ErreurApp("Script vide : il n'y a rien à lire pour la voix off.")
+    try:
+        import edge_tts  # import tardif : le module n'est requis qu'à la synthèse
+    except ImportError as exc:  # pragma: no cover - dépendance déclarée dans requirements
+        raise ErreurApp("edge-tts n'est pas installé sur le serveur.") from exc
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        communicate = edge_tts.Communicate(propre, EDGE_TTS_VOIX, rate=EDGE_TTS_DEBIT)
+        async with asyncio.timeout(EDGE_TTS_DELAI):
+            await communicate.save(str(destination))
+    except asyncio.TimeoutError as exc:
+        destination.unlink(missing_ok=True)
+        raise ErreurApp(
+            f"La synthèse vocale n'a pas répondu sous {EDGE_TTS_DELAI:.0f} s."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - edge-tts remonte des erreurs réseau variées
+        destination.unlink(missing_ok=True)
+        raise ErreurApp(f"Synthèse vocale indisponible : {exc}") from exc
+
+    taille = destination.stat().st_size if destination.is_file() else 0
+    if taille <= 0:
+        destination.unlink(missing_ok=True)
+        raise ErreurApp("La synthèse vocale a renvoyé un fichier audio vide.")
+    return taille
+
+
+async def livrer_script_et_voix(
+    script: dict[str, Any],
+    seed: Optional[dict[str, Any]] = None,
+    noms: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """Écrit le script .txt puis tente le MP3. Un échec de synthèse ne perd pas le script."""
+    base = uuid.uuid4().hex
+    chemin_txt = DOSSIER_VIDEOS / f"{base}.txt"
+    chemin_txt.write_text(composer_script_txt(script, seed, noms), encoding="utf-8")
+
+    livraison: dict[str, Any] = {
+        "script_url": f"/videos/{chemin_txt.name}",
+        "script_nom": "script.txt",
+        "voix_url": "",
+        "voix_nom": "",
+        "voix_erreur": "",
+        "voix_moteur": f"edge-tts · {EDGE_TTS_VOIX}",
+    }
+
+    chemin_mp3 = DOSSIER_VIDEOS / f"{base}.mp3"
+    try:
+        taille = await synthetiser_voix_off(texte_a_dire(script), chemin_mp3)
+    except ErreurApp as exc:
+        # Honnêteté : on dit pourquoi le MP3 manque, on ne livre pas d'audio factice.
+        logger.warning("[voix off] synthèse impossible : %s", exc)
+        livraison["voix_erreur"] = str(exc)
+    else:
+        livraison["voix_url"] = f"/videos/{chemin_mp3.name}"
+        livraison["voix_nom"] = "voix-off.mp3"
+        livraison["voix_octets"] = taille
+    return livraison
+
+
+# ======================================================================================
 # MODE « RsT » : un seul lien TikTok de départ → script + vraies vidéos trouvées → montage
 # ======================================================================================
 
@@ -1220,7 +1445,7 @@ async def _donnees_tikwm(session: aiohttp.ClientSession, chemin: str, params: di
     return donnees["data"]
 
 
-def _normaliser_candidat_rst(video: Any, origine: str) -> Optional[dict]:
+def _normaliser_candidat_rst(video: Any, origine: str, nom: str = "") -> Optional[dict]:
     """Convertit une vidéo réellement renvoyée par TikWM en candidate RsT, ou None."""
     if not isinstance(video, dict):
         return None
@@ -1241,6 +1466,8 @@ def _normaliser_candidat_rst(video: Any, origine: str) -> Optional[dict]:
         "title": str(video.get("title") or "").strip(),
         "duration": duree,
         "origin": origine,
+        # Nom (TOP N) qui a permis de trouver cette vidéo — vide pour le fil de l'auteur.
+        "nom": str(nom or "").strip(),
     }
 
 
@@ -1268,6 +1495,36 @@ def _extraire_mots_cles_rst(texte: str, mot_cle_broll: str = "", limite: int = 3
             break
         ajouter(mot)
     return retenus[:limite]
+
+
+def _repartir_par_nom(candidats: list[dict], noms: list[str]) -> list[dict]:
+    """Alterne les candidates nom par nom pour que chaque nom du TOP N soit représenté.
+
+    Sans cela, le premier nom — souvent le plus prolifique — remplirait tout le quota de
+    sources et les autres noms n'apparaîtraient jamais dans le montage final.
+    """
+    if not noms:
+        return list(candidats)
+    files: dict[str, list[dict]] = {nom.casefold(): [] for nom in noms}
+    sans_nom: list[dict] = []
+    for candidate in candidats:
+        cle = str(candidate.get("nom") or "").casefold()
+        files[cle].append(candidate) if cle in files else sans_nom.append(candidate)
+
+    ordonnes: list[dict] = []
+    rang = 0
+    while True:
+        ajoute = False
+        for nom in noms:
+            file = files[nom.casefold()]
+            if rang < len(file):
+                ordonnes.append(file[rang])
+                ajoute = True
+        if not ajoute:
+            break
+        rang += 1
+    # Les vidéos du fil de l'auteur ferment la marche : ce sont des sources de secours.
+    return ordonnes + sans_nom
 
 
 def _selectionner_sources_rst(
@@ -1329,11 +1586,20 @@ def _rapporteur_decale(contexte: "ContexteJob", base: float, amplitude: float) -
 async def _produire_rst(
     requete: "RequeteRst", contexte: "ContexteJob", session_id: str = ""
 ) -> dict[str, Any]:
-    """Mode RsT : analyse un lien TikTok, trouve de vraies vidéos, monte automatiquement."""
+    """Mode RsT : analyse un lien TikTok, trouve de vraies vidéos, monte automatiquement.
+
+    Pipeline TOP N : l'IA extrait 3 ou 5 noms de la légende de départ, chaque nom donne
+    lieu à sa propre recherche TikTok, les sources trouvées sont réparties nom par nom,
+    puis montées en plans de 5 secondes maximum.
+    """
     try:
         lien = normaliser_lien_tiktok(requete.lien.strip())
     except ErreurMontage as exc:
         raise ErreurApp(f"Lien TikTok de départ invalide : {exc}") from exc
+
+    nombre_noms = borner_nombre_noms_rst(requete.nombre_noms)
+    # Trace des recherches qui n'ont rien donné : sert à expliquer un échec sans rien inventer.
+    echecs_recherche: list[str] = []
 
     contexte.update(statut="analysing", progress=4, detail="Lecture de la vidéo TikTok de départ")
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=75, connect=15)) as session:
@@ -1344,31 +1610,49 @@ async def _produire_rst(
         auteur = str((donnees.get("author") or {}).get("unique_id") or "").strip().lstrip("@")
         identifiant_depart = str(donnees.get("id") or donnees.get("video_id") or "").strip()
 
+        seed_infos = {
+            "url": lien, "title": legende[:200], "author": auteur,
+            "duration": donnees.get("duration"),
+        }
+
         contexte.update(statut="analysing", progress=12, detail="Rédaction du script à partir de la légende")
         script = await generer_script(legende)
         contexte.update(
-            statut="analysing", progress=20, detail="Script prêt — recherche de vidéos candidates",
-            script=script,
-            seed={
-                "url": lien, "title": legende[:200], "author": auteur,
-                "duration": donnees.get("duration"),
-            },
+            statut="analysing", progress=18, detail="Script prêt — extraction des noms à chercher",
+            script=script, seed=seed_infos,
+        )
+
+        # TOP N : 3 ou 5 noms tirés de la vraie légende, chacun cherché séparément.
+        noms = await extraire_noms_rst(legende, nombre_noms, script.get("mot_cle_broll", ""))
+        contexte.update(
+            statut="analysing", progress=20,
+            detail=(
+                f"{len(noms)} nom(s) à chercher : {', '.join(noms)}" if noms
+                else "Aucun nom exploitable — recherche élargie à l'auteur"
+            ),
+            noms=noms, nombre_noms=nombre_noms,
         )
 
         requetes_reelles: list[str] = []
         candidats: dict[str, dict] = {}
 
-        async def accumuler(videos: Any, origine: str) -> None:
+        async def accumuler(videos: Any, origine: str, nom: str = "") -> int:
+            """Ajoute les vidéos réellement renvoyées et retourne le nombre de nouveautés."""
+            nouvelles = 0
             for video in videos or []:
-                candidate = _normaliser_candidat_rst(video, origine)
+                candidate = _normaliser_candidat_rst(video, origine, nom)
                 if not candidate or candidate["video_id"] == identifiant_depart:
                     continue
-                candidats.setdefault(candidate["video_id"], candidate)
+                if candidate["video_id"] not in candidats:
+                    candidats[candidate["video_id"]] = candidate
+                    nouvelles += 1
+            return nouvelles
 
         def publier(detail: str, progression: int) -> None:
             contexte.update(
                 statut="searching", progress=progression, detail=detail,
                 found_videos=list(candidats.values()), search_queries=list(requetes_reelles),
+                noms=noms,
             )
 
         # 1) Les autres publications réelles du créateur de la vidéo de départ.
@@ -1381,46 +1665,114 @@ async def _produire_rst(
                     session, "/user/posts",
                     {"unique_id": auteur, "count": str(min(CONFIG.rst_candidats_max, 40))},
                 )
-                await accumuler(publications.get("videos") or [], f"publications de @{auteur}")
+                nouvelles = await accumuler(
+                    publications.get("videos") or [], f"publications de @{auteur}"
+                )
+                if nouvelles == 0:
+                    echecs_recherche.append(f"@{auteur} : aucune autre publication")
             except ErreurApp as exc:
                 logger.warning("[RsT] publications de @%s indisponibles : %s", auteur, exc)
+                echecs_recherche.append(f"@{auteur} : {exc}")
             publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", 30)
 
-        # 2) Recherches TikTok par mots-clés tirés de la vraie légende.
-        for mot_cle in _extraire_mots_cles_rst(legende, script.get("mot_cle_broll", "")):
+        # 2) Une recherche TikTok par nom du TOP N, dans l'ordre d'importance.
+        # Chaque nom reçoit sa part du quota pour qu'aucun n'écrase les autres.
+        part_par_nom = max(5, CONFIG.rst_candidats_max // max(1, len(noms))) if noms else 0
+        for rang, nom in enumerate(noms, start=1):
             if len(candidats) >= CONFIG.rst_candidats_max:
-                break
-            requetes_reelles.append(mot_cle)
-            contexte.update(statut="searching", progress=34, detail=f"Recherche TikTok « {mot_cle} »")
+                echecs_recherche.append(f"« {nom} » : quota de candidates déjà atteint")
+                continue
+            requetes_reelles.append(nom)
+            progression = 30 + int(8 * rang / max(1, len(noms)))
+            contexte.update(
+                statut="searching", progress=progression,
+                detail=f"Recherche TikTok {rang}/{len(noms)} : « {nom} »",
+                noms=noms,
+            )
             try:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
                 resultats = await _donnees_tikwm(
-                    session, "/feed/search", {"keywords": mot_cle, "count": "20"}
+                    session, "/feed/search", {"keywords": nom, "count": str(part_par_nom)}
                 )
-                await accumuler(resultats.get("videos") or [], f"recherche « {mot_cle} »")
+                nouvelles = await accumuler(
+                    resultats.get("videos") or [], f"recherche « {nom} »", nom
+                )
+                if nouvelles == 0:
+                    echecs_recherche.append(f"« {nom} » : aucun résultat")
             except ErreurApp as exc:
-                logger.warning("[RsT] recherche « %s » indisponible : %s", mot_cle, exc)
-            publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", 38)
+                logger.warning("[RsT] recherche « %s » indisponible : %s", nom, exc)
+                echecs_recherche.append(f"« {nom} » : {exc}")
+            publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", progression)
 
-    trouves = list(candidats.values())[: CONFIG.rst_candidats_max]
+        # 3) Filet de sécurité : si le TOP N n'a rien ramené, on réessaie avec les mots-clés
+        # bruts de la légende. Sans cela, une légende sans nom propre condamnait le travail.
+        if not candidats:
+            deja_tentees = {requete.casefold() for requete in requetes_reelles}
+            replis = [
+                mot for mot in _extraire_mots_cles_rst(
+                    legende, script.get("mot_cle_broll", ""), limite=nombre_noms
+                )
+                if mot.casefold() not in deja_tentees
+            ]
+            for mot_cle in replis:
+                requetes_reelles.append(mot_cle)
+                contexte.update(
+                    statut="searching", progress=39,
+                    detail=f"Recherche élargie « {mot_cle} »", noms=noms,
+                )
+                try:
+                    await asyncio.sleep(1.0)
+                    resultats = await _donnees_tikwm(
+                        session, "/feed/search", {"keywords": mot_cle, "count": "20"}
+                    )
+                    nouvelles = await accumuler(
+                        resultats.get("videos") or [], f"recherche élargie « {mot_cle} »"
+                    )
+                    if nouvelles == 0:
+                        echecs_recherche.append(f"« {mot_cle} » : aucun résultat")
+                except ErreurApp as exc:
+                    logger.warning("[RsT] recherche élargie « %s » indisponible : %s", mot_cle, exc)
+                    echecs_recherche.append(f"« {mot_cle} » : {exc}")
+                publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", 40)
+                if candidats:
+                    break
+
+    # Chaque nom du TOP N est représenté à tour de rôle avant de plafonner les candidates.
+    trouves = _repartir_par_nom(list(candidats.values()), noms)[: CONFIG.rst_candidats_max]
     contexte.update(
         statut="searching", progress=42,
         detail=f"{len(trouves)} vidéo(s) trouvée(s) — sélection des meilleures sources",
-        found_videos=trouves, search_queries=requetes_reelles,
+        found_videos=trouves, search_queries=requetes_reelles, noms=noms,
     )
     if not trouves:
-        raise ErreurApp("RsT n'a trouvé aucune autre vidéo TikTok exploitable pour ce point de départ.")
+        # Recherche vide : on dit exactement ce qui a été tenté et ce que ça a donné.
+        if not requetes_reelles:
+            raise ErreurApp(
+                "RsT n'a pu construire aucune recherche : la légende de cette vidéo ne "
+                "contient ni nom ni mot-clé exploitable. Choisis une vidéo de départ dont "
+                "la description mentionne un sujet précis."
+            )
+        detail = " ; ".join(echecs_recherche[:6]) if echecs_recherche else "aucun résultat"
+        raise ErreurApp(
+            f"RsT n'a trouvé aucune autre vidéo TikTok exploitable. "
+            f"{len(requetes_reelles)} recherche(s) tentée(s) — {detail}."
+        )
 
+    configuration = _configuration_montage(requete.mode, RST_DUREE_MAX_PLAN)
     selectionnees, trouves = _selectionner_sources_rst(
         trouves, CONFIG.rst_sources_max, float(CONFIG.duree_max_source)
     )
-    selectionnees = _reduire_selon_estimation(selectionnees, _configuration_montage(requete.mode))
+    selectionnees = _reduire_selon_estimation(selectionnees, configuration)
     if not selectionnees:
         raise ErreurApp("Aucune vidéo trouvée n'entre dans les limites de durée utilisables.")
+    noms_couverts = sorted({s["nom"] for s in selectionnees if s.get("nom")})
     contexte.update(
         statut="selecting", progress=44,
-        detail=f"{len(selectionnees)} source(s) retenue(s) sur {len(trouves)} trouvée(s)",
-        found_videos=trouves, search_queries=requetes_reelles,
+        detail=(
+            f"{len(selectionnees)} source(s) retenue(s) sur {len(trouves)} trouvée(s)"
+            + (f" — {len(noms_couverts)}/{len(noms)} nom(s) couvert(s)" if noms else "")
+        ),
+        found_videos=trouves, search_queries=requetes_reelles, noms=noms,
     )
 
     resolution = "1080" if (requete.mode == "qualite" and CONFIG.autoriser_export_1080) else "720"
@@ -1431,8 +1783,8 @@ async def _produire_rst(
         corps=script["corps"].strip(),
         resolution=resolution,
         style_sous_titres="classique",
-        config=_configuration_montage(requete.mode),
-        rapporteur=_rapporteur_decale(contexte, 45.0, 0.55),
+        config=configuration,
+        rapporteur=_rapporteur_decale(contexte, 45.0, 0.45),
         resolveur=_resoudre_video_tiktok,
         telechargeur=_telecharger_fichier,
         appel_gemini=_appel_gemini_brut,
@@ -1440,7 +1792,19 @@ async def _produire_rst(
         voix_off=_resoudre_voix_off(session_id, requete.voix_off),
     )
     await envoyer_script_et_video(script["hook"], script["corps"], resultat["path"])
-    resultat.update(script=script, found_videos=trouves, search_queries=requetes_reelles)
+
+    # Livraison séparée : la vidéo reste muette, le script et la voix off partent à côté.
+    contexte.update(
+        statut="delivering", progress=92,
+        detail="Écriture du script et génération de la voix off",
+    )
+    livraison = await livrer_script_et_voix(script, seed_infos, noms)
+
+    resultat.update(
+        script=script, found_videos=trouves, search_queries=requetes_reelles,
+        noms=noms, nombre_noms=nombre_noms, noms_couverts=noms_couverts,
+        duree_max_plan=RST_DUREE_MAX_PLAN, **livraison,
+    )
     return resultat
 
 
@@ -1599,8 +1963,18 @@ class RequeteRst(BaseModel):
     lien: str = Field(min_length=1, max_length=2048)
     mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
     intensite_transitions: int = Field(default=2, ge=0, le=3)
+    # Pipeline TOP N : 3 ou 5 noms extraits de la vidéo de départ, rien d'autre.
+    nombre_noms: int = Field(default=RST_NOMS_DEFAUT)
     voix_off: str = Field(default="", max_length=64)
     idempotency_key: str = Field(default="", max_length=80)
+
+    @field_validator("nombre_noms")
+    @classmethod
+    def _valider_nombre_noms(cls, valeur: int) -> int:
+        if valeur not in RST_NOMS_CHOIX:
+            attendus = " ou ".join(str(choix) for choix in RST_NOMS_CHOIX)
+            raise ValueError(f"nombre_noms doit valoir {attendus}.")
+        return valeur
 
 
 class RequeteDiagnosticMontage(BaseModel):
@@ -1670,10 +2044,15 @@ def _purger_jobs() -> None:
         empreinte = job.get("fingerprint")
         if empreinte and JOB_INDEX.get(empreinte) == identifiant:
             JOB_INDEX.pop(empreinte, None)
-        url = str(job.get("url", ""))
-        nom = Path(urlparse(url).path).name
-        if urlparse(url).path == f"/videos/{nom}" and re.fullmatch(r"[a-f0-9]{32}\.mp4", nom):
-            (DOSSIER_VIDEOS / nom).unlink(missing_ok=True)
+        # Vidéo, script .txt et voix off .mp3 expirent ensemble avec leur travail.
+        for cle in ("url", "script_url", "voix_url"):
+            url = str(job.get(cle, ""))
+            nom = Path(urlparse(url).path).name
+            if (
+                urlparse(url).path == f"/videos/{nom}"
+                and re.fullmatch(r"[a-f0-9]{32}\.(mp4|txt|mp3)", nom)
+            ):
+                (DOSSIER_VIDEOS / nom).unlink(missing_ok=True)
 
     seuil = time.time() - max(DUREE_VIE_JOB, CONFIG.delai_job * 2)
     for dossier in DOSSIER_TRAVAIL.iterdir():
@@ -1951,6 +2330,8 @@ async def sante() -> dict[str, Any]:
         "google_drive_configure": bool(CONFIG.google_client_id and CONFIG.google_client_secret),
         "job_timeout_seconds": CONFIG.delai_job,
         "max_source_seconds": CONFIG.duree_max_source,
+        # Synthèse vocale gratuite et sans clé : on signale seulement si le module est là.
+        "voix_off_generee_disponible": importlib.util.find_spec("edge_tts") is not None,
     }
 
 
@@ -1968,9 +2349,18 @@ async def configuration_publique() -> dict[str, Any]:
             "candidats_max": CONFIG.rst_candidats_max,
             "sources_max": CONFIG.rst_sources_max,
             "liens_par_lancement": RST_LIENS_PAR_LANCEMENT,
+            "noms_choix": list(RST_NOMS_CHOIX),
+            "noms_defaut": RST_NOMS_DEFAUT,
+            "duree_max_plan": RST_DUREE_MAX_PLAN,
         },
         "voix_off_max_mo": VOIX_OFF_MAX_MO,
         "voix_off_extensions": sorted(VOIX_OFF_EXTENSIONS),
+        "voix_off_generee": {
+            "moteur": "edge-tts",
+            "voix": EDGE_TTS_VOIX,
+            "gratuit": True,
+            "livraison": "separee",
+        },
         "gemini_modeles": _modeles_gemini(),
     }
 

@@ -264,7 +264,7 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
                 "video_id": "111", "title": "seed", "duration": 21,
                 "author": {"unique_id": "chef"},
             }]
-            for i in range(20):
+            for i in range(12):
                 videos.append({
                     "video_id": f"1{i + 12}", "title": f"Recette numéro {i}",
                     "duration": 12 + i % 5, "author": {"unique_id": "chef"},
@@ -274,10 +274,12 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
             videos.append({"video_id": "902", "title": "durée inconnue", "duration": None, "author": {"unique_id": "chef"}})
             return {"videos": videos}
         if chemin == "/feed/search":
+            # Chaque nom du TOP N ramène ses propres vidéos, jamais les mêmes.
+            mot = params["keywords"]
             return {"videos": [
-                {"video_id": f"2{i:03d}", "title": f"vidéo de recherche {i}",
-                 "duration": 14 + i % 3, "author": {"unique_id": f"auteur{i}"}}
-                for i in range(20)
+                {"video_id": f"2{abs(hash(mot)) % 900:03d}{i}", "title": f"{mot} {i}",
+                 "duration": 14 + i % 3, "author": {"unique_id": f"auteur_{i}"}}
+                for i in range(4)
             ]}
         raise AssertionError(f"endpoint TikWM inattendu : {chemin}")
 
@@ -312,6 +314,11 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
     # Vidéos réellement trouvées : seed exclue, plafonnées au maximum configuré.
     trouves = job["found_videos"]
     assert 20 <= len(trouves) <= app.CONFIG.rst_candidats_max
+    # Pipeline TOP N : trois noms par défaut, une recherche TikTok par nom.
+    assert job["nombre_noms"] == 3
+    assert 1 <= len(job["noms"]) <= 3
+    recherches = [params["keywords"] for chemin, params in appels if chemin == "/feed/search"]
+    assert recherches == job["noms"]
     assert all(v["video_id"] != "111" for v in trouves)
     assert all(v["url"].startswith("https://www.tiktok.com/@") for v in trouves)
     retenues = [v for v in trouves if v["selected"]]
@@ -615,3 +622,420 @@ def test_interface_contient_rst_multiple_et_voix_off():
     assert '"Inter"' in css and '"DM Mono"' in css
     assert "#7c5cff" not in css and "#43d9ff" not in css
     assert "--accent: #ffffff;" in css
+
+
+# ======================================================================================
+# PIPELINE RsT « TOP N » : 3 ou 5 noms, une recherche par nom, plans de 5 s maximum
+# ======================================================================================
+
+
+@pytest.mark.parametrize("demande,attendu", [(3, 3), (5, 5), (4, 3), (0, 3), (None, 3), ("x", 3)])
+def test_borner_nombre_noms_n_accepte_que_trois_ou_cinq(demande, attendu):
+    assert app.borner_nombre_noms_rst(demande) == attendu
+
+
+def test_noms_rst_nettoyes_dedupliques_et_ordonnes():
+    noms = app._deduplique_noms(
+        ["  #Paris ", "@Paris", "PARIS", "", "  ", "x", "a" * 60, "Tour Eiffel", "Louvre"], 3
+    )
+    # Casse et préfixes ignorés pour la déduplication, ordre d'importance préservé.
+    assert noms == ["Paris", "Tour Eiffel", "Louvre"]
+
+
+def test_rst_refuse_un_nombre_de_noms_hors_trois_et_cinq(client):
+    response = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@chef/video/111", "nombre_noms": 4,
+    })
+    assert response.status_code == 422
+
+
+def test_extraire_noms_rst_prefere_l_ia_puis_retombe_sur_la_legende(monkeypatch):
+    async def ia_ok(_parts, **_kwargs):
+        return '{"noms": ["Kylian Mbappé", "Real Madrid", "Bernabéu"]}'
+
+    monkeypatch.setattr(app, "_appel_gemini_brut", ia_ok)
+    noms = asyncio.run(app.extraire_noms_rst("Mbappé au Real #football", 3))
+    assert noms == ["Kylian Mbappé", "Real Madrid", "Bernabéu"]
+
+    # Gemini indisponible : on retombe sur les mots réellement présents, sans rien inventer.
+    async def ia_ko(_parts, **_kwargs):
+        raise app.ErreurApp("Gemini saturé")
+
+    monkeypatch.setattr(app, "_appel_gemini_brut", ia_ko)
+    replis = asyncio.run(app.extraire_noms_rst("Recette de pancakes #cuisine #food", 3))
+    assert replis
+    assert all(isinstance(nom, str) and nom.strip() for nom in replis)
+    assert "cuisine" in [nom.lower() for nom in replis]
+
+
+def test_repartir_par_nom_alterne_les_noms_et_relegue_le_fil_auteur():
+    candidats = [
+        {"video_id": "a1", "nom": "Paris"}, {"video_id": "a2", "nom": "Paris"},
+        {"video_id": "b1", "nom": "Lyon"},
+        {"video_id": "z1", "nom": ""},
+        {"video_id": "c1", "nom": "Nice"}, {"video_id": "c2", "nom": "Nice"},
+    ]
+    ordonnes = app._repartir_par_nom(candidats, ["Paris", "Lyon", "Nice"])
+    # Un tour complet par rang : chaque nom est servi avant que le premier ne se resserve.
+    assert [c["video_id"] for c in ordonnes] == ["a1", "b1", "c1", "a2", "c2", "z1"]
+
+
+def test_rst_cinq_noms_lance_cinq_recherches_et_couvre_chaque_nom(client, monkeypatch):
+    noms_ia = ["Mbappé", "Real Madrid", "Bernabéu", "Vinicius", "Ancelotti"]
+
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            return {"id": "42", "title": "Mbappé au Real Madrid", "duration": 18,
+                    "author": {"unique_id": "foot"}}
+        if chemin == "/user/posts":
+            return {"videos": []}
+        if chemin == "/feed/search":
+            mot = params["keywords"]
+            rang = noms_ia.index(mot)
+            return {"videos": [
+                {"video_id": f"{rang}{i}", "title": f"{mot} {i}", "duration": 12,
+                 "author": {"unique_id": f"src{rang}{i}"}}
+                for i in range(3)
+            ]}
+        raise AssertionError(chemin)
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def script(_texte):
+        return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "football"}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    async def noms(_legende, _nombre, _broll=""):
+        return list(noms_ia)
+
+    monkeypatch.setattr(app, "extraire_noms_rst", noms)
+
+    recus = []
+
+    async def montage_fake(**kwargs):
+        recus.append(kwargs)
+        return {"url": "/videos/top5.mp4", "path": app.DOSSIER_VIDEOS / "top5.mp4",
+                "sources": [], "source_errors": []}
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    reponse = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@foot/video/42", "nombre_noms": 5,
+    })
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+
+    assert job["nombre_noms"] == 5
+    assert job["noms"] == noms_ia
+    # Le fil de l'auteur ouvre la marche, puis une recherche par nom, dans l'ordre.
+    assert job["search_queries"] == ["@foot", *noms_ia]
+    assert sorted(job["noms_couverts"]) == sorted(noms_ia)  # aucun nom laissé de côté
+    # Le montage RsT impose des plans de 5 s maximum.
+    assert recus[0]["config"].duree_max_plan == app.RST_DUREE_MAX_PLAN == 5.0
+
+
+def test_config_publique_expose_le_top_n(client):
+    rst = client.get("/api/config").json()["rst"]
+    assert rst["noms_choix"] == [3, 5]
+    assert rst["noms_defaut"] == 3
+    assert rst["duree_max_plan"] == 5.0
+
+
+def test_interface_propose_le_choix_du_top_n():
+    racine = Path(__file__).parents[1]
+    html = (racine / "static" / "index.html").read_text(encoding="utf-8")
+    js = (racine / "static" / "main.js").read_text(encoding="utf-8")
+    assert 'id="rst-noms-choices"' in html
+    assert 'data-noms="3"' in html and 'data-noms="5"' in html
+    assert "nombre_noms" in js and "rstNombreNoms" in js
+
+
+# ======================================================================================
+# LIVRAISON SÉPARÉE : vidéo muette + script .txt + voix off .mp3 générée par edge-tts
+# ======================================================================================
+
+
+def test_script_txt_ne_contient_que_des_donnees_reelles():
+    texte = app.composer_script_txt(
+        {"hook": "Le hook", "corps": "Le corps du script.", "mot_cle_broll": "cuisine"},
+        {"url": "https://www.tiktok.com/@chef/video/1", "title": "Pancakes", "author": "chef"},
+        ["Pancakes", "Chef"],
+    )
+    assert "Le hook" in texte and "Le corps du script." in texte
+    assert "Pancakes, Chef" in texte
+    assert "@chef" in texte and "https://www.tiktok.com/@chef/video/1" in texte
+    assert "cuisine" in texte
+    # La livraison séparée est rappelée dans le fichier lui-même.
+    assert "muette" in texte
+
+
+def test_texte_a_dire_enchaine_hook_et_corps_et_reste_borne():
+    assert app.texte_a_dire({"hook": "A", "corps": "B."}) == "A B."
+    long = app.texte_a_dire({"hook": "x" * 10_000, "corps": "y" * 10_000})
+    assert len(long) == app.VOIX_OFF_TEXTE_MAX
+
+
+def test_synthese_vocale_refuse_un_script_vide():
+    with pytest.raises(app.ErreurApp, match="rien à lire"):
+        asyncio.run(app.synthetiser_voix_off("   ", app.DOSSIER_VIDEOS / "vide.mp3"))
+
+
+def test_synthese_vocale_injoignable_ne_laisse_aucun_fichier(tmp_path, monkeypatch):
+    """edge-tts est bloqué sur certains réseaux : l'échec doit être propre et explicite."""
+    class CommunicateKo:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def save(self, chemin):
+            Path(chemin).write_bytes(b"")          # fichier partiel laissé par le module
+            raise OSError("speech.platform.bing.com injoignable")
+
+    monkeypatch.setitem(
+        __import__("sys").modules, "edge_tts", type("M", (), {"Communicate": CommunicateKo})
+    )
+    cible = tmp_path / "voix.mp3"
+    with pytest.raises(app.ErreurApp, match="Synthèse vocale indisponible"):
+        asyncio.run(app.synthetiser_voix_off("Bonjour", cible))
+    assert not cible.exists()
+
+
+def test_livraison_ecrit_le_script_meme_si_la_voix_echoue(monkeypatch):
+    async def synthese_ko(_texte, chemin):
+        raise app.ErreurApp("speech.platform.bing.com injoignable")
+
+    monkeypatch.setattr(app, "synthetiser_voix_off", synthese_ko)
+    livraison = asyncio.run(app.livrer_script_et_voix({"hook": "H", "corps": "C."}))
+
+    assert livraison["script_url"].startswith("/videos/") and livraison["script_url"].endswith(".txt")
+    fichier = app.DOSSIER_VIDEOS / Path(livraison["script_url"]).name
+    assert fichier.is_file() and "H" in fichier.read_text(encoding="utf-8")
+    # Aucun MP3 factice : l'échec est annoncé tel quel.
+    assert livraison["voix_url"] == ""
+    assert "injoignable" in livraison["voix_erreur"]
+    fichier.unlink(missing_ok=True)
+
+
+def test_livraison_complete_expose_script_et_mp3(monkeypatch):
+    async def synthese_ok(_texte, chemin):
+        Path(chemin).write_bytes(b"ID3fauxmp3")
+        return 10
+
+    monkeypatch.setattr(app, "synthetiser_voix_off", synthese_ok)
+    livraison = asyncio.run(app.livrer_script_et_voix({"hook": "H", "corps": "C."}))
+
+    assert livraison["voix_url"].endswith(".mp3")
+    assert livraison["voix_nom"] == "voix-off.mp3"
+    assert livraison["voix_erreur"] == ""
+    assert "edge-tts" in livraison["voix_moteur"]
+    # Script et audio sont deux fichiers distincts, livrés côte à côte.
+    assert Path(livraison["script_url"]).stem == Path(livraison["voix_url"]).stem
+    for url in (livraison["script_url"], livraison["voix_url"]):
+        (app.DOSSIER_VIDEOS / Path(url).name).unlink(missing_ok=True)
+
+
+def test_rst_livre_video_muette_script_et_voix_off(client, monkeypatch):
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            return {"id": "7", "title": "Match du PSG", "duration": 15,
+                    "author": {"unique_id": "sport"}}
+        if chemin == "/user/posts":
+            return {"videos": []}
+        return {"videos": [
+            {"video_id": f"s{i}", "title": "source", "duration": 11,
+             "author": {"unique_id": f"a{i}"}} for i in range(4)
+        ]}
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def script(_texte):
+        return {"hook": "Le PSG gagne", "corps": "Un but décisif.", "mot_cle_broll": "football"}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    async def noms(_legende, _nombre, _broll=""):
+        return ["PSG"]
+
+    monkeypatch.setattr(app, "extraire_noms_rst", noms)
+
+    async def montage_fake(**kwargs):
+        # La vidéo produite reste muette : aucune voix off n'est passée au montage.
+        assert kwargs["voix_off"] is None
+        return {"url": "/videos/muet.mp4", "path": app.DOSSIER_VIDEOS / "muet.mp4",
+                "sources": [], "source_errors": []}
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    async def synthese_ok(texte, chemin):
+        assert "Le PSG gagne" in texte
+        Path(chemin).write_bytes(b"ID3fauxmp3")
+        return 10
+
+    monkeypatch.setattr(app, "synthetiser_voix_off", synthese_ok)
+
+    reponse = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@sport/video/7",
+    })
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+
+    # Trois fichiers distincts, réellement servis par l'application.
+    assert job["url"] == "/videos/muet.mp4"
+    assert client.get(job["script_url"]).status_code == 200
+    assert "Le PSG gagne" in client.get(job["script_url"]).text
+    assert client.get(job["voix_url"]).status_code == 200
+    for url in (job["script_url"], job["voix_url"]):
+        (app.DOSSIER_VIDEOS / Path(url).name).unlink(missing_ok=True)
+
+
+def test_purge_supprime_aussi_le_script_et_la_voix_off():
+    base = "b" * 32
+    fichiers = {}
+    for extension in ("mp4", "txt", "mp3"):
+        chemin = app.DOSSIER_VIDEOS / f"{base}.{extension}"
+        chemin.write_bytes(b"x")
+        fichiers[extension] = chemin
+
+    app.JOBS["vieux"] = {
+        "status": "completed", "updated_at": time.monotonic() - app.DUREE_VIE_JOB - 10,
+        "url": f"/videos/{base}.mp4",
+        "script_url": f"/videos/{base}.txt",
+        "voix_url": f"/videos/{base}.mp3",
+    }
+    app._purger_jobs()
+    assert "vieux" not in app.JOBS
+    assert not any(chemin.exists() for chemin in fichiers.values())
+
+
+def test_config_et_sante_annoncent_la_voix_off_generee(client):
+    config = client.get("/api/config").json()
+    assert config["voix_off_generee"]["moteur"] == "edge-tts"
+    assert config["voix_off_generee"]["gratuit"] is True
+    assert config["voix_off_generee"]["livraison"] == "separee"
+    assert "voix_off_generee_disponible" in client.get("/api/sante").json()
+
+
+def test_interface_annonce_la_livraison_separee():
+    racine = Path(__file__).parents[1]
+    html = (racine / "static" / "index.html").read_text(encoding="utf-8")
+    js = (racine / "static" / "main.js").read_text(encoding="utf-8")
+    requirements = (racine / "requirements.txt").read_text(encoding="utf-8")
+    assert "edge-tts" in html and "edge-tts" in requirements
+    assert "script_url" in js and "voix_url" in js
+    assert "Script .txt" in js and "Voix off .mp3" in js
+    assert "Vidéo (muette)" in js
+
+
+# ======================================================================================
+# RECHERCHE VIDE : diagnostic honnête et repli sur les mots-clés réels de la légende
+# ======================================================================================
+
+
+def test_rst_recherche_vide_detaille_les_tentatives(client, monkeypatch):
+    """Un échec doit dire ce qui a été cherché et ce que ça a donné, sans rien inventer."""
+    async def donnees_tikwm(_session, chemin, _params):
+        if chemin == "/":
+            return {"id": "111", "title": "Sujet pointu sur Bordeaux", "duration": 12,
+                    "author": {"unique_id": "auteur"}}
+        return {"videos": []}
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def script(_texte):
+        return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "bordeaux"}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    async def noms(_legende, _nombre, _broll=""):
+        return ["Bordeaux", "Gironde"]
+
+    monkeypatch.setattr(app, "extraire_noms_rst", noms)
+
+    reponse = client.post("/api/jobs/rst", json={"lien": "https://www.tiktok.com/@auteur/video/111"})
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "failed"
+    erreur = job["error"]
+    assert "aucune autre vidéo TikTok" in erreur
+    assert "recherche(s) tentée(s)" in erreur
+    # Les noms réellement cherchés apparaissent dans le diagnostic.
+    assert "Bordeaux" in erreur and "aucun résultat" in erreur
+
+
+def test_rst_sans_aucun_nom_elargit_la_recherche_aux_mots_cles(client, monkeypatch):
+    """Légende sans nom propre : le repli mots-clés évite de condamner le travail."""
+    recherches = []
+
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            return {"id": "5", "title": "Astuce rangement #maison #diy", "duration": 14,
+                    "author": {"unique_id": "brico"}}
+        if chemin == "/user/posts":
+            return {"videos": []}
+        recherches.append(params["keywords"])
+        return {"videos": [
+            {"video_id": f"r{i}", "title": "trouvée", "duration": 10,
+             "author": {"unique_id": f"u{i}"}} for i in range(3)
+        ]}
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def script(_texte):
+        return {"hook": "H", "corps": "C.", "mot_cle_broll": "rangement"}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    async def aucun_nom(_legende, _nombre, _broll=""):
+        return []                                  # l'IA n'a trouvé aucun nom exploitable
+
+    monkeypatch.setattr(app, "extraire_noms_rst", aucun_nom)
+
+    async def montage_fake(**_kwargs):
+        return {"url": "/videos/repli.mp4", "path": app.DOSSIER_VIDEOS / "repli.mp4",
+                "sources": [], "source_errors": []}
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    async def synthese(_texte, chemin):
+        Path(chemin).write_bytes(b"ID3")
+        return 3
+
+    monkeypatch.setattr(app, "synthetiser_voix_off", synthese)
+
+    reponse = client.post("/api/jobs/rst", json={"lien": "https://www.tiktok.com/@brico/video/5"})
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+    assert job["noms"] == []
+    # La recherche élargie s'appuie sur les vrais hashtags / mots de la légende.
+    assert recherches
+    assert any(mot in {"maison", "diy", "rangement", "astuce"} for mot in recherches)
+    assert job["found_videos"]
+    for url in (job.get("script_url"), job.get("voix_url")):
+        if url:
+            (app.DOSSIER_VIDEOS / Path(url).name).unlink(missing_ok=True)
+
+
+def test_rst_sans_requete_possible_le_dit_clairement(client, monkeypatch):
+    """Ni auteur ni nom ni mot-clé : le message doit expliquer pourquoi, pas planter."""
+    async def donnees_tikwm(_session, chemin, _params):
+        if chemin == "/":
+            return {"id": "9", "title": "...", "duration": 10, "author": {"unique_id": ""}}
+        return {"videos": []}
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def script(_texte):
+        return {"hook": "H", "corps": "C.", "mot_cle_broll": ""}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    async def aucun_nom(_legende, _nombre, _broll=""):
+        return []
+
+    monkeypatch.setattr(app, "extraire_noms_rst", aucun_nom)
+
+    reponse = client.post("/api/jobs/rst", json={"lien": "https://www.tiktok.com/@x/video/9"})
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "failed"
+    assert "aucune recherche" in job["error"]
+    assert "ni nom ni mot-clé" in job["error"]

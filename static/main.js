@@ -59,6 +59,9 @@
 
   const ETATS_FINAL = ['completed', 'failed', 'cancelled'];
   const RST_MAX = 6;
+  // Pipeline TOP N : 3 ou 5 noms extraits de la vidéo de départ (valeurs confirmées par /api/config).
+  let rstNomsChoix = [3, 5];
+  let rstNombreNoms = 3;
 
   /* ------------------------------------------------------------------
      PETITS OUTILS
@@ -288,8 +291,15 @@
         accroche.innerHTML =
           `Colle <strong>jusqu’à ${rst.liens_par_lancement || 6} liens TikTok de départ</strong>, un par ligne. Chaque lien lance <strong>son propre travail</strong>. ` +
           `Pour chacun, RsT analyse la vidéo, prépare le script, recherche jusqu’à <strong>${rst.candidats_max} vidéos TikTok candidates</strong>, ` +
-          `sélectionne jusqu’à <strong>${rst.sources_max} bonnes sources</strong>, puis crée automatiquement le montage final. ` +
+          `en extrait <strong>${(rst.noms_choix || rstNomsChoix).join(' ou ')} noms</strong>, lance une recherche TikTok par nom, ` +
+          `sélectionne jusqu’à <strong>${rst.sources_max} bonnes sources</strong>, puis crée automatiquement le montage final ` +
+          `en <strong>plans de ${rst.duree_max_plan || 5} s maximum</strong>. ` +
           'Seules les vidéos réellement trouvées sont affichées.';
+      }
+      if (Array.isArray(rst.noms_choix) && rst.noms_choix.length) {
+        rstNomsChoix = rst.noms_choix;
+        if (!rstNomsChoix.includes(rstNombreNoms)) rstNombreNoms = rst.noms_defaut || rstNomsChoix[0];
+        syncRstNomsUI();
       }
     } catch (error) {
       $('source-limit').textContent = error.message;
@@ -335,9 +345,16 @@
     );
     if (serverConfig && serverConfig.rst) {
       complet.append(el('div', 'server-row',
-        `RsT : ${serverConfig.rst.liens_par_lancement || 6} liens par lancement, jusqu’à ${serverConfig.rst.candidats_max} candidates recherchées, ${serverConfig.rst.sources_max} sources retenues`));
+        `RsT : ${serverConfig.rst.liens_par_lancement || 6} liens par lancement, TOP ${(serverConfig.rst.noms_choix || rstNomsChoix).join('/')} noms recherchés, jusqu’à ${serverConfig.rst.candidats_max} candidates, ${serverConfig.rst.sources_max} sources retenues, plans de ${serverConfig.rst.duree_max_plan || 5} s max`));
       complet.append(el('div', 'server-row',
         `Voix off importée : ${voixOffMaxMo()} Mo maximum · ${voixOffExtensions().join(' ')}`));
+    }
+    if (serverConfig && serverConfig.voix_off_generee) {
+      const vog = serverConfig.voix_off_generee;
+      complet.append(ligneServeur('Voix off générée', Boolean(sante.voix_off_generee_disponible),
+        `${vog.moteur} · ${vog.voix} · gratuit, sans clé`));
+      complet.append(el('div', 'server-row',
+        'Livraison RsT : vidéo muette + script .txt + voix off .mp3, téléchargés séparément'));
     }
     const top = $('top-status');
     top.querySelector('span').textContent = sante.ok ? 'Studio opérationnel' : 'Service indisponible';
@@ -646,6 +663,13 @@
      RsT : « Vidéos trouvées par RsT » (données réelles uniquement)
   ------------------------------------------------------------------ */
 
+  function lienTelechargement(url, libelle, nomFichier) {
+    const lien = el('a', '', libelle);
+    lien.href = url;
+    lien.download = nomFichier || '';
+    return lien;
+  }
+
   function foundItem(video) {
     const item = el('div', `found-item${video.selected ? ' selected' : ''}`);
 
@@ -657,6 +681,7 @@
     info.append(el('strong', '', `@${video.author || 'tiktok'}`));
     info.append(el('span', 'found-title', video.title || '(vidéo sans légende)'));
     info.append(el('span', 'found-meta', `${fmtDuree(video.duration)} · ${video.origin || 'recherche TikTok'}`));
+    if (video.nom) info.append(el('span', 'found-nom', `Nom recherché : ${video.nom}`));
     if (!video.selected && video.rejet) info.append(el('span', 'found-rejet', `Écartée : ${video.rejet}`));
     item.append(info);
 
@@ -839,13 +864,18 @@
       }
       if (data.error) carte.append(el('p', 'job-error', data.error));
 
+      // Livraison séparée : la vidéo reste muette, le script et le MP3 se prennent à côté.
+      if (data.voix_erreur) {
+        carte.append(el('p', 'job-note', `Voix off non générée : ${data.voix_erreur} Le script reste téléchargeable.`));
+      }
+
       const actions = el('div', 'job-actions');
       if (data.url) {
         actions.append(boutonAction('Voir', () => showResult(data.url, data.drive, data.title || entree.titre)));
-        const telecharger = el('a', '', 'Télécharger');
-        telecharger.href = data.url; telecharger.download = '';
-        actions.append(telecharger);
+        actions.append(lienTelechargement(data.url, 'Vidéo (muette)', ''));
       }
+      if (data.script_url) actions.append(lienTelechargement(data.script_url, 'Script .txt', data.script_nom || 'script.txt'));
+      if (data.voix_url) actions.append(lienTelechargement(data.voix_url, 'Voix off .mp3', data.voix_nom || 'voix-off.mp3'));
       if (!fini) {
         actions.append(boutonAction('Annuler', async (evenement) => {
           const bouton = evenement.currentTarget;
@@ -898,6 +928,12 @@
       tete.append(el('h4', '', `RsT ${index + 1} · ${entree.titre || rstLienCourt(entree.lien)}`));
       tete.append(el('span', 'counter', `${videos.length} trouvée(s) · ${retenues} retenue(s)`));
       bloc.append(tete);
+      const noms = data.noms || [];
+      if (noms.length) {
+        const couverts = data.noms_couverts || [];
+        bloc.append(el('p', 'hint', `TOP ${noms.length} noms extraits de la vidéo de départ : ${noms.join(' · ')}.`
+          + (couverts.length ? ` ${couverts.length} nom(s) réellement présent(s) dans le montage.` : '')));
+      }
       bloc.append(el('p', 'hint', videos.length
         ? `Recherches réellement effectuées : ${requetes.join(' · ')}. Aucune vidéo inventée : chaque ligne provient de TikTok.`
         : 'Recherche en cours…'));
@@ -978,7 +1014,23 @@
     $('btn-rst').disabled = Boolean(activeJobId);
   }
 
+  function syncRstNomsUI() {
+    document.querySelectorAll('[data-noms]').forEach((bouton) => {
+      const valeur = Number(bouton.dataset.noms);
+      bouton.classList.toggle('active', valeur === rstNombreNoms);
+      bouton.hidden = !rstNomsChoix.includes(valeur);
+    });
+  }
+
   function bindRst() {
+    document.querySelectorAll('[data-noms]').forEach((bouton) => {
+      bouton.addEventListener('click', () => {
+        rstNombreNoms = Number(bouton.dataset.noms);
+        syncRstNomsUI();
+        setStatus($('statut-rst'), `RsT cherchera les ${rstNombreNoms} noms principaux de chaque vidéo de départ.`);
+      });
+    });
+
     $('rst-coller').addEventListener('click', () => {
       collerPressePapier((texte) => {
         const existant = $('rst-liens').value.trim();
@@ -1025,6 +1077,7 @@
               titre, lien,
               mode: settings.mode,
               intensite_transitions: settings.intensite,
+              nombre_noms: rstNombreNoms,
               voix_off: voixOff.rst,
               idempotency_key: uuid()
             },

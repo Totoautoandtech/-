@@ -17,10 +17,38 @@ La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **
    Tout supprimer). Chaque lien lance **son propre travail** `POST /api/jobs/rst` et dispose d'une
    carte de suivi indépendante (progression, annulation, bouton Voir) ainsi que de son propre bloc
    « Vidéos trouvées par RsT ». Le suivi de tous ces travaux reprend après actualisation de la page.
-   Pour chaque lien : RsT lit la légende réelle, rédige le script, interroge TikWM (publications du créateur + recherches par mots-clés tirés des hashtags et de la légende) pour trouver jusqu'à 40 vidéos candidates réelles, affiche la liste « Vidéos trouvées par RsT » (durée, auteur, origine, raison d'exclusion), retient jusqu'à 20 bonnes sources dans les limites de durée et de temps Render, puis lance automatiquement le montage. Aucune vidéo, résultat ou miniature inventé : si TikWM ne renvoie rien, le travail échoue avec un message honnête.
+   Pour chaque lien, le pipeline **TOP N** : RsT lit la légende réelle, rédige le script, puis demande
+   à l'IA les **3 ou 5 noms** réellement cités (personnes, lieux, marques, œuvres…) — choix fait dans
+   l'interface. **Chaque nom donne lieu à sa propre recherche TikTok**, les candidates sont réparties
+   nom par nom (tour de rôle) pour qu'aucun nom n'écrase les autres, puis RsT retient jusqu'à 20 bonnes
+   sources dans les limites de durée et de temps Render et lance le montage en **plans de 5 s maximum**.
+   La liste « Vidéos trouvées par RsT » affiche durée, auteur, origine, nom recherché et raison
+   d'exclusion. Si l'IA ne trouve aucun nom, RsT retombe sur les mots-clés réellement présents dans la
+   légende (hashtags, thème visuel, mots fréquents). Aucune vidéo, résultat ou miniature inventé : si
+   TikWM ne renvoie rien, le travail échoue avec un message qui détaille les recherches tentées.
+   **Livraison séparée** : la vidéo finale reste **muette**, tandis que le **script `.txt`** et une
+   **voix off `.mp3` générée** se téléchargent à côté, depuis la carte du travail.
 3. **Montage multi-source** — jusqu'à 20 liens collés manuellement, organisés en onglets Script / Sources / Référence / Réglages, avec les boutons Coller, Valider et Tout supprimer. La validation affiche l'état réel de chaque source (accessible, durée, dimensions, codec, erreur).
 
 Les **modes Rapide et Qualité** (720 × 1280 priorité vitesse, ou CRF 21 + 1080 × 1920 si `AUTORISER_EXPORT_1080`) et l'**intensité des transitions** (aucune, légère, modérée, forte) sont réglables dans Paramètres et dans l'onglet Réglages ; ils s'appliquent aux trois sections. Le suivi de génération est réel (états, progression, état par source), l'historique des 6 dernières heures permet lecture, téléchargement, Drive et annulation, et un travail en cours est repris après actualisation de la page. Aucun faux compte, aucune fausse donnée, aucun abonnement payant.
+
+## Voix off : importée ou générée
+
+Deux voies, aucune ne coûte quoi que ce soit :
+
+- **Importée** — l'utilisateur envoie son propre enregistrement (`.aac .m4a .mp3 .ogg .opus .wav`,
+  25 Mo maximum, conservé 6 h et lié à sa session). Cette piste-là est **incrustée dans la vidéo**.
+- **Générée (RsT)** — le script est lu par [`edge-tts`](https://pypi.org/project/edge-tts/), qui
+  utilise les voix Microsoft Edge : **gratuit, sans clé d'API et sans compte**. Voix par défaut
+  `fr-FR-DeniseNeural`, réglable via `EDGE_TTS_VOIX` et `EDGE_TTS_DEBIT`.
+  *Speechma a été écarté : payant.*
+
+La voix générée n'est **jamais** mixée dans la vidéo : RsT livre trois fichiers indépendants —
+la vidéo muette, `script.txt` et `voix-off.mp3` — pour laisser le montage final libre.
+
+`edge-tts` contacte `speech.platform.bing.com`. Si ce domaine est bloqué par le réseau, la synthèse
+échoue **proprement** : le travail se termine quand même, la vidéo et le script sont livrés, et
+l'interface affiche la raison exacte de l'absence de MP3. Aucun audio factice n'est produit.
 
 ## Montage multi-source
 
@@ -78,6 +106,12 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 | `AUTORISER_EXPORT_1080` | `false` | affiche l'option 1080 × 1920, nettement plus lente |
 | `RST_CANDIDATS_MAX` | `40` | vidéos TikTok candidates recherchées par RsT |
 | `RST_SOURCES_MAX` | `20` | sources retenues par RsT pour le montage final |
+| `EDGE_TTS_VOIX` | `fr-FR-DeniseNeural` | voix edge-tts de la voix off générée |
+| `EDGE_TTS_DEBIT` | `+0%` | débit de la voix off générée |
+
+Le TOP N (3 ou 5 noms) et le plafond de 5 s par plan ne sont pas configurables par variable
+d'environnement : ce sont des constantes du pipeline (`RST_NOMS_CHOIX`, `RST_DUREE_MAX_PLAN`),
+exposées en lecture via `/api/config`.
 
 ### OAuth
 

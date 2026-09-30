@@ -42,6 +42,8 @@ class ConfigurationMontage:
     dossier_travail: Path
     dossier_videos: Path
     duree_max_source: float = 180.0
+    # Aucun plan ne dépasse cette durée : le montage reste nerveux et lisible.
+    duree_max_plan: float = 5.0
     delai_ffmpeg: float = 240.0
     delai_gemini: float = 120.0
     delai_job: float = 570.0
@@ -515,6 +517,23 @@ async def analyser_style_reference(
 ECHELLES_INTENSITE_TRANSITIONS = {0: 0.15, 1: 0.6, 2: 1.0, 3: 1.35}
 
 
+# Durée maximale d'un plan, en secondes. Le montage RsT s'appuie dessus pour garder
+# un rythme court : aucun plan ne reste à l'écran plus longtemps que cette valeur.
+DUREE_MAX_PLAN_DEFAUT = 5.0
+DUREE_MIN_PLAN = 0.55
+
+
+def _borner_duree_plan(valeur: Any) -> float:
+    """Ramène une durée de plan demandée dans une plage réellement exploitable."""
+    try:
+        duree = float(valeur)
+    except (TypeError, ValueError):
+        return DUREE_MAX_PLAN_DEFAUT
+    if not math.isfinite(duree) or duree <= 0:
+        return DUREE_MAX_PLAN_DEFAUT
+    return max(DUREE_MIN_PLAN, min(30.0, duree))
+
+
 def borner_intensite_transitions(valeur: Any) -> int:
     try:
         return max(0, min(3, int(valeur)))
@@ -533,11 +552,15 @@ def _groupes_equilibres(mots: list[str], nombre: int) -> list[list[str]]:
     return groupes
 
 
-def creer_segments_script(hook: str, corps: str) -> list[dict[str, Any]]:
+def creer_segments_script(
+    hook: str, corps: str, duree_max_plan: float = DUREE_MAX_PLAN_DEFAUT
+) -> list[dict[str, Any]]:
+    """Découpe le script en segments dont aucun ne vise plus de `duree_max_plan` secondes."""
+    plafond = _borner_duree_plan(duree_max_plan)
     mots_hook = hook.strip().split()
     segments: list[dict[str, Any]] = []
     if mots_hook:
-        duree_hook = min(5.0, max(3.0, len(mots_hook) / 2.3))
+        duree_hook = min(plafond, max(min(3.0, plafond), len(mots_hook) / 2.3))
         nombre = max(2, min(len(mots_hook), math.ceil(duree_hook / 1.2))) if len(mots_hook) > 1 else 2
         groupes = _groupes_equilibres(mots_hook, min(nombre, len(mots_hook)))
         # Un hook d'un seul mot garde deux changements visuels sans dupliquer le sous-titre.
@@ -557,7 +580,7 @@ def creer_segments_script(hook: str, corps: str) -> list[dict[str, Any]]:
         for morceau in morceaux:
             segments.append({
                 "id": len(segments), "texte": " ".join(morceau), "hook": False,
-                "duree_cible": 5.0,
+                "duree_cible": plafond,
             })
     return segments
 
@@ -585,9 +608,13 @@ def selectionner_plan(
     metadonnees: dict[str, dict[str, Any]],
     style: StyleReference,
     intensite_transitions: int = 2,
+    duree_max_plan: float = DUREE_MAX_PLAN_DEFAUT,
 ) -> list[dict[str, Any]]:
     if not metadonnees:
         raise ErreurMontage("Aucune source valide n’est disponible pour le montage.")
+    plafond = _borner_duree_plan(duree_max_plan)
+    # En dessous du plafond, on vise des plans « pleins » sans jamais le dépasser.
+    plancher_plein = min(4.5, plafond)
     sources = list(metadonnees)
     plan: list[dict[str, Any]] = []
     precedente = ""
@@ -608,9 +635,9 @@ def selectionner_plan(
     echelle_intensite = ECHELLES_INTENSITE_TRANSITIONS[intensite]
 
     for index, segment in enumerate(segments):
-        cible = float(segment["duree_cible"])
+        cible = min(plafond, float(segment["duree_cible"]))
         if not segment["hook"]:
-            cible = min(5.5, max(4.5, style.duree_moyenne_plans))
+            cible = min(plafond, max(plancher_plein, style.duree_moyenne_plans))
         candidats: list[tuple[float, str, dict[str, Any]]] = []
         for source, scenes in analyses.items():
             for scene in scenes:
@@ -631,8 +658,8 @@ def selectionner_plan(
             fin_scene = min(float(metadonnees[source]["duration"]), float(scene["fin"]))
             disponible = max(0.55, fin_scene - debut_scene)
             duree = min(cible, disponible)
-            if not segment["hook"] and disponible >= 4.5:
-                duree = min(5.5, max(4.5, min(cible, disponible)))
+            if not segment["hook"] and disponible >= plancher_plein:
+                duree = min(plafond, max(plancher_plein, min(cible, disponible)))
             debut = debut_scene
             recommandation = str(scene.get("transition_recommandee", "cut")).lower()
         else:
@@ -640,8 +667,8 @@ def selectionner_plan(
             source = choix[index % len(choix)]
             duree_source = float(metadonnees[source]["duration"])
             duree = min(cible, duree_source)
-            if not segment["hook"] and duree_source >= 4.5:
-                duree = min(5.0, duree_source)
+            if not segment["hook"] and duree_source >= plancher_plein:
+                duree = min(plafond, duree_source)
             debut = min(curseurs_repli[source], max(0.0, duree_source - duree))
             curseurs_repli[source] = (debut + duree + 0.5) % max(duree_source, 0.6)
             recommandation = "cut"
@@ -665,7 +692,9 @@ def selectionner_plan(
 
         plan.append({
             **segment, "source": source, "debut": round(debut, 3),
-            "duree": round(max(0.55, duree), 3), "transition": transition,
+            # Garde-fou final : aucun plan ne franchit le plafond demandé.
+            "duree": round(min(plafond, max(DUREE_MIN_PLAN, duree)), 3),
+            "transition": transition,
             "transition_duree": round(transition_duree, 3),
         })
         precedente = source
@@ -919,7 +948,7 @@ async def construire_montage_professionnel(
         raise ErreurMontage(f"Aucune source TikTok valide : {detail}")
     if len(propres) > 20:
         raise ErreurMontage("20 liens TikTok uniques maximum.")
-    segments = creer_segments_script(hook, corps)
+    segments = creer_segments_script(hook, corps, config.duree_max_plan)
     if not segments:
         raise ErreurMontage("Le script est vide : aucun plan ne peut être préparé.")
 
@@ -1072,7 +1101,10 @@ async def construire_montage_professionnel(
             style_reference = style_reference.model_copy(update={"position_sous_titres": "centre"})
 
         rapporteur.update("selecting", 76, "Sélection et alternance des meilleurs plans")
-        plan = selectionner_plan(segments, analyses, metadonnees, style_reference, intensite_transitions)
+        plan = selectionner_plan(
+            segments, analyses, metadonnees, style_reference, intensite_transitions,
+            config.duree_max_plan,
+        )
         rapporteur.update(
             "editing", 82,
             f"Plan prêt : {len(plan)} plans, accroche rapide puis scènes principales de 5 s",
