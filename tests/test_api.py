@@ -1235,3 +1235,159 @@ def test_rst_sans_requete_possible_le_dit_clairement(client, monkeypatch):
     assert job["status"] == "failed"
     assert "aucune recherche" in job["error"]
     assert "ni nom ni mot-clé" in job["error"]
+
+
+def test_urlebird_extrait_vrais_liens_tiktok_sans_inventer_de_donnees():
+    """Urlebird : le parseur HTML découvre de vrais liens TikTok par auteur et par mot-clé."""
+    html_auteur = """
+    <div class="video-listing">
+        <div class="thumb">
+            <a href="/video/recette-crepes-faciles-7341000000000000001/">
+                <img src="thumb1.jpg" />
+            </a>
+            <div class="info">
+                <a href="/user/chef/">@chef</a>
+            </div>
+        </div>
+        <div class="thumb">
+            <a href="https://urlebird.com/video/crepes-sucrees-7341000000000000002/"></a>
+        </div>
+        <div class="thumb">
+            <a href="https://www.tiktok.com/@autre_chef/video/7341000000000000003"></a>
+        </div>
+    </div>
+    """
+    liens = app._extraire_liens_urlebird(html_auteur, auteur_defaut="chef")
+    assert "https://www.tiktok.com/@chef/video/7341000000000000001" in liens
+    assert "https://www.tiktok.com/@chef/video/7341000000000000002" in liens
+    assert "https://www.tiktok.com/@autre_chef/video/7341000000000000003" in liens
+    assert len(liens) == 3
+
+
+def test_tikwm_403_ne_declenche_pas_de_retry_inutile():
+    """Si TikWM répond 403, l'appel échoue immédiatement sans réessais inutiles."""
+    appels = []
+
+    class _Session403:
+        def get(self, url, **kwargs):
+            appels.append(url)
+            reponse = _ReponseTikwm({})
+            reponse.status = 403
+            return reponse
+
+    session = _Session403()
+    debut = time.monotonic()
+    with pytest.raises(app.ErreurTikwm403):
+        asyncio.run(app._donnees_tikwm(session, "/feed/search", {"keywords": "android"}))
+    duree = time.monotonic() - debut
+
+    # 403 = IP bloquée : un seul appel, pas de sleep/retry
+    assert len(appels) == 1
+    assert duree < 0.5
+
+
+def test_rst_bascule_sur_urlebird_si_tikwm_recherche_repond_403(client, monkeypatch):
+    """En cas de 403 sur /user/posts ou /feed/search, RsT bascule sur Urlebird et valide via /api/."""
+    appels_tikwm = []
+    appels_urlebird = []
+
+    async def donnees_tikwm(_session, chemin, params):
+        appels_tikwm.append((chemin, dict(params)))
+        if chemin == "/":
+            url = params.get("url", "")
+            if "111" in url:
+                # Vidéo de départ
+                return {
+                    "id": "111", "title": "Comparatif galaxya56 et honormagic7pro #tech",
+                    "duration": 20, "author": {"unique_id": "techreview", "nickname": "Tech Review"},
+                }
+            if "7341000000000000001" in url:
+                # Vidéo trouvée sur Urlebird (auteur)
+                return {
+                    "id": "7341000000000000001", "title": "Unboxing Samsung Galaxy A56",
+                    "duration": 18, "author": {"unique_id": "techreview", "nickname": "Tech Review"},
+                }
+            if "7341000000000000002" in url:
+                # Vidéo trouvée sur Urlebird (nom 1)
+                return {
+                    "id": "7341000000000000002", "title": "Galaxy A56 test complet",
+                    "duration": 16, "author": {"unique_id": "reviewer2", "nickname": "Reviewer 2"},
+                }
+            if "7341000000000000003" in url:
+                # Vidéo trouvée sur Urlebird (nom 2)
+                return {
+                    "id": "7341000000000000003", "title": "Honor Magic 7 Pro camera test",
+                    "duration": 22, "author": {"unique_id": "reviewer3", "nickname": "Reviewer 3"},
+                }
+            raise app.ErreurApp(f"Vidéo inconnue : {url}")
+
+        if chemin in {"/user/posts", "/feed/search"}:
+            # Simule le 403 réel de Render
+            raise app.ErreurTikwm403("TikWM inaccessible (403)")
+        raise AssertionError(f"Chemin TikWM inattendu : {chemin}")
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def decouvrir_urlebird(_session, *, auteur="", requete="", limite=20):
+        appels_urlebird.append({"auteur": auteur, "requete": requete})
+        if auteur == "techreview":
+            return ["https://www.tiktok.com/@techreview/video/7341000000000000001"]
+        if "Galaxy A56" in requete or "galaxya56" in requete:
+            return ["https://www.tiktok.com/@reviewer2/video/7341000000000000002"]
+        if "Honor Magic 7 Pro" in requete or "honormagic7pro" in requete:
+            return ["https://www.tiktok.com/@reviewer3/video/7341000000000000003"]
+        return []
+
+    monkeypatch.setattr(app, "_decouvrir_urlebird", decouvrir_urlebird)
+
+    async def script(_texte):
+        return {"hook": "Le duel des smartphones 2026", "corps": "Galaxy A56 face au Magic 7 Pro.", "mot_cle_broll": "smartphone"}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    async def noms(_legende, _nombre, _broll=""):
+        return ["Galaxy A56", "Honor Magic 7 Pro"]
+
+    monkeypatch.setattr(app, "extraire_noms_rst", noms)
+
+    async def montage_fake(**kwargs):
+        return {
+            "url": "/videos/rst-urlebird.mp4",
+            "path": app.DOSSIER_VIDEOS / "rst-urlebird.mp4",
+            "sources": [], "source_errors": [],
+        }
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    async def synthese(texte, chemin, budget=app.EDGE_TTS_DELAI):
+        Path(chemin).write_bytes(b"ID3mp3")
+        return 5
+
+    monkeypatch.setattr(app, "synthetiser_voix_off", synthese)
+
+    reponse = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@techreview/video/111",
+        "nombre_noms": 3,
+    })
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+    assert job["url"] == "/videos/rst-urlebird.mp4"
+
+    # Vérification que Urlebird a bien été utilisé en repli
+    assert len(appels_urlebird) >= 2
+    assert any(a.get("auteur") == "techreview" for a in appels_urlebird)
+
+    # Vérification que les candidates portent l'origine Urlebird
+    trouvees = job["found_videos"]
+    assert len(trouvees) >= 2
+    assert all("Urlebird" in v["origin"] for v in trouvees)
+
+    # Vérification qu'après le premier 403, TikWM /user/posts ou /feed/search n'a pas été réessayé
+    appels_search = [c for c, _ in appels_tikwm if c in {"/user/posts", "/feed/search"}]
+    assert len(appels_search) <= 1
+
+    for url in (job.get("script_url"), job.get("voix_url")):
+        if url:
+            (app.DOSSIER_VIDEOS / Path(url).name).unlink(missing_ok=True)
+

@@ -51,10 +51,11 @@ Pour **chaque** lien de départ :
 3. **TOP N** : Gemini extrait les **3 ou 5 noms** réellement cités (personnes,
    lieux, marques, œuvres…). Le nombre est choisi dans l'interface.
    → `extraire_noms_rst()` dans `app.py`.
-4. **Recherche par nom** : une requête TikWM `/feed/search` **par nom**, plus les
-   publications du créateur de départ. Tous les appels TikWM portent des en-têtes
-   de navigateur (`ENTETES_TIKWM`) : sans eux, `/feed/search` et `/user/posts`
-   peuvent répondre 403 depuis Render alors que la lecture initiale passe.
+4. **Recherche par nom & repli Urlebird** : une requête TikWM `/feed/search` **par nom**,
+   plus les publications du créateur de départ. Si `/feed/search` ou `/user/posts` répond
+   403 (blocage IP Render), le pipeline bascule automatiquement vers la découverte publique
+   Urlebird par auteur ou mot-clé, puis revalide chaque lien trouvé via TikWM `/api/`
+   sans rien inventer.
 5. **Répartition** : `_repartir_par_nom()` sert les candidates nom par nom, à tour
    de rôle, pour qu'un nom prolifique ne monopolise pas le quota de sources.
 6. **Sélection** : jusqu'à 20 sources dans les limites de durée et de temps Render.
@@ -127,7 +128,7 @@ outil de récupération de page HTTP du côté agent y accède.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q                    # 85 tests
+.venv/bin/python -m pytest -q                    # 88 tests
 node --test tests/js/job-utils.test.cjs          # 7 tests
 ```
 
