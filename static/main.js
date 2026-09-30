@@ -290,9 +290,10 @@
       if (accroche) {
         accroche.innerHTML =
           `Colle <strong>jusqu’à ${rst.liens_par_lancement || 6} liens TikTok de départ</strong>, un par ligne. Chaque lien lance <strong>son propre travail</strong>. ` +
-          `Pour chacun, RsT analyse la vidéo, prépare le script, recherche jusqu’à <strong>${rst.candidats_max} vidéos TikTok candidates</strong>, ` +
-          `en extrait <strong>${(rst.noms_choix || rstNomsChoix).join(' ou ')} noms</strong>, lance une recherche TikTok par nom, ` +
-          `sélectionne jusqu’à <strong>${rst.sources_max} bonnes sources</strong>, puis crée automatiquement le montage final ` +
+          `Pour chacun, RsT analyse la vidéo, prépare le script, puis en extrait ` +
+          `<strong>${(rst.noms_choix || rstNomsChoix).join(' ou ')} noms</strong>. ` +
+          `Chaque nom lance sa propre recherche TikTok — jusqu’à <strong>${rst.candidats_max} vidéos candidates</strong> au total — ` +
+          `puis RsT retient jusqu’à <strong>${rst.sources_max} bonnes sources</strong> et crée automatiquement le montage final ` +
           `en <strong>plans de ${rst.duree_max_plan || 5} s maximum</strong>. ` +
           'Seules les vidéos réellement trouvées sont affichées.';
       }
