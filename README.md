@@ -26,8 +26,8 @@ La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **
    **chaîne publique multi-sources** tolérante aux plages IP cloud : TikWM d'abord, puis — si ses
    endpoints de recherche répondent 403 depuis Render — les moteurs publics **SearXNG** (instances
    `opnxng.com` et `search.inetol.net`, qui agrègent Google/Bing/DuckDuckGo depuis leur propre
-   serveur), **DuckDuckGo** (dont le passage par le relais de traduction Google a été
-   vérifié en production : vraies URLs vidéo), **Ecosia et Bing** (chacun en direct,
+   serveur), **DuckDuckGo** (vérifié en production : vraies URLs vidéo, en direct
+   depuis Render), **Ecosia et Bing** (chacun en direct,
    puis via deux **relais publics sans
    clé** : le relais de lecture `r.jina.ai` et le relais de traduction Google `translate.goog`),
    l'**archive web Wayback** pour l'auteur, et le miroir **Urlebird** en dernier recours. Une
