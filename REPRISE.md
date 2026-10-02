@@ -168,8 +168,18 @@ vide honnêtement ; **Wayback OK** (5 liens `@parishilton` en 2,6 s) ; Urlebird 
 VRAIMENT vide pour `site:tiktok.com/@parishilton video` mais PLEINE de résultats
 pour `tiktok.com @parishilton video` (vidéo 7655569088227380511 confirmée, liens
 enveloppés `translate.google.com/website?…u=…uddg=<percent>` décodés par le
-parseur) — et ce relais répond 200 depuis Render. Le diagnostic affiche les
-destinations d'une page sans lien vidéo (« destinations : … »).
+parseur) — et ce relais répond 200 depuis Render.
+
+**Sondage 5 (déployé, format sans `site:`)** : `duckduckgo` **« ok » en direct
+depuis Render — 3 vrais liens en 0,7 s** (`@parishilton/video/7644249407940087070`
+en exemple) ; `wayback` « ok » (5 liens). **La découverte publique fonctionne
+depuis Render sans relais.** Sondage 6 (requête par nom « Galaxy A56 ») : DDG
+direct 202 puis traduction vide — throttling DDG sur le diagnostic en rafale
+(les sondes interrogent tous les moteurs en parallèle) ; le même requêtage via
+translate depuis une IP datacenter rend des URLs vidéo réelles
+(`@jallll9/video/7541748076139040056`…). Un travail RsT réel espace ses
+recherches (revalidation TikWM 1 req/s, génération du script…), et la chaîne
+retombe sur Wayback (auteurs) et les mots-clés si une recherche donne vide.
 Tous les tests automatisés reposent sur des doublures (`monkeypatch`) — aucun
 réseau n'est contacté dans les tests.
 
