@@ -1660,12 +1660,38 @@ def _extraire_liens_tiktok_texte(texte: str, auteur_attendu: str = "") -> list[s
     return liens
 
 
-def _requete_moteur(auteur: str, requete: str) -> str:
-    """Recherche qui cible uniquement les pages vidéo TikTok, par auteur ou par nom."""
+def _requete_moteur(auteur: str, requete: str, moteur: str = "") -> str:
+    """Recherche qui cible les pages vidéo TikTok, par auteur ou par nom.
+
+    SearXNG agrège des moteurs qui gèrent mal l'opérateur « site: » (Bing
+    l'ignore, d'autres le perdent et rendent des résultats génériques) : pour
+    lui, TikTok est ciblé par les mots-clés seuls. Le filtre final reste
+    l'extraction de vrais liens vidéo, puis la revalidation TikWM /api/.
+    """
+    avec_site = moteur != "searxng"
     if auteur:
-        return f"site:tiktok.com/@{auteur.strip().lstrip('@')} video"
+        pseudo = auteur.strip().lstrip("@")
+        if avec_site:
+            return f"site:tiktok.com/@{pseudo} video"
+        return f"tiktok.com @{pseudo} video"
     terme = " ".join(requete.strip().lstrip("#").split())
-    return f"site:tiktok.com {terme} video" if terme else ""
+    if not terme:
+        return ""
+    return f"site:tiktok.com {terme} video" if avec_site else f"tiktok.com {terme} video"
+
+
+def _apercu_resultats(texte: str, limite: int = 3) -> str:
+    """Hôtes des premières destinations d'une page, pour comprendre une page
+    sans lien vidéo : le diagnostic de production affiche ce qu'elle contient
+    vraiment au lieu d'un simple « vide »."""
+    hottes: list[str] = []
+    for url in re.findall(r"""href=["']?(https?://[^"'\s<>]+)""", texte or ""):
+        hote = urlparse(url).netloc.split("@")[-1]
+        if hote and hote not in hottes:
+            hottes.append(hote)
+        if len(hottes) >= limite:
+            break
+    return ", ".join(hottes)
 
 
 # Chaque moteur peut avoir plusieurs instances publiques, essayées en direct
@@ -1788,7 +1814,7 @@ async def _decouvrir_moteur(
     « relais traduction » ou vide ; le détail décrit chaque tentative, pour le
     diagnostic de production comme pour les journaux.
     """
-    q = _requete_moteur(auteur, requete)
+    q = _requete_moteur(auteur, requete, moteur)
     if not q:
         return [], "", "aucune requête constructible"
     modeles = _URLS_MOTEURS.get(moteur) or []
@@ -1808,7 +1834,10 @@ async def _decouvrir_moteur(
             liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
             if liens:
                 return liens[:limite], "direct", f"direct : {len(liens)} lien(s) en {duree:.1f} s"
-            etapes.append(f"direct vide ({len(texte)} octets, {duree:.1f} s)")
+            etapes.append(
+                f"direct vide ({len(texte)} octets, {duree:.1f} s, "
+                f"destinations : {_apercu_resultats(texte) or 'aucune'})"
+            )
             # Page qui dit honnêtement « aucun résultat » et répond vite : inutile de
             # consommer les relais pour la même recherche sur le même moteur. Une
             # autre instance du moteur peut pourtant agréger d'autres moteurs :
@@ -1834,7 +1863,7 @@ async def _decouvrir_moteur(
         if _serp_vraiment_vide(texte):
             # Le moteur a répondu via le relais : la recherche est réellement vide.
             return [], "", "relais de lecture : aucun résultat affiché par le moteur ; " + " ; ".join(etapes)
-        etapes.append("relais de lecture vide")
+        etapes.append(f"relais de lecture vide (destinations : {_apercu_resultats(texte) or 'aucune'})")
     except Exception as exc:  # noqa: BLE001
         etapes.append(f"relais de lecture injoignable ({exc})")
 
@@ -1847,7 +1876,7 @@ async def _decouvrir_moteur(
             return liens[:limite], "relais traduction", (
                 f"relais de traduction : {len(liens)} lien(s) ; " + " ; ".join(etapes)
             )
-        etapes.append("relais de traduction vide")
+        etapes.append(f"relais de traduction vide (destinations : {_apercu_resultats(texte) or 'aucune'})")
     except Exception as exc:  # noqa: BLE001
         etapes.append(f"relais de traduction injoignable ({exc})")
 

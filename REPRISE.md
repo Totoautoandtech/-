@@ -59,7 +59,9 @@ Pour **chaque** lien de départ :
    - moteurs publics, dans l'ordre : **SearXNG** (instances `opnxng.com` puis
      `search.inetol.net` — elles agrègent Google CSE/Bing/DuckDuckGo depuis
      leur propre serveur, donc c'est leur IP qui absorbe les blocages ;
-     résultats du miroir `sticktock.com` normalisés en `tiktok.com`), puis
+     requête **sans** `site:` car leurs moteurs le perdent : `tiktok.com
+     @auteur video` / `tiktok.com <nom> video` ; résultats du miroir
+     `sticktock.com` normalisés en `tiktok.com`), puis
      **DuckDuckGo lite**, **Ecosia**, **Bing** (requête `site:tiktok.com …
      video`), chacun **en direct puis via deux relais publics sans clé** — le
      relais de lecture `r.jina.ai`, puis le relais de traduction Google
@@ -150,13 +152,16 @@ DuckDuckGo **lite** renvoie de vraies URLs vidéo TikTok pour
 certaines IP mais bloque relais et datacenters ; Bing ignore `site:` ; le CDX
 Wayback liste les vidéos archivées d'un auteur (mais `r.jina.ai` est lui-même
 bloqué par archive.org) ; Urlebird passe avec un navigateur seulement.
-**Diagnostic réel du 2 octobre 2026 sur Render** (`GET /api/rst/sources`) :
-TikWM `/api/` ok, `/user/posts` et `/feed/search` 403 ; DDG direct timeout,
-`r.jina.ai` renvoie 403 à l'IP Render (OK depuis ailleurs), `translate.goog`
-renvoie 202 (géré par réessai) ; Ecosia 403 partout ; Bing répond vide honnêtement ;
-**Wayback OK** (5 liens pour `@parishilton` en 2,6 s) ; Urlebird 403. SearXNG
-(`opnxng.com`) vérifié fonctionnel depuis une IP datacenter : vraies URLs vidéo
-via Google CSE — à confirmer depuis Render par le prochain diagnostic.
+**Diagnostic réel du 2 octobre 2026 sur Render** (`GET /api/rst/sources`, 3 sondages) :
+TikWM `/api/` ok, `/user/posts` et `/feed/search` 403 ; DDG direct timeout puis
+202 ; `r.jina.ai` renvoie 403 à l'IP Render (OK depuis ailleurs) ; `translate.goog`
+renvoie 202 puis 400 selon l'hôte ; Ecosia 403 partout (disjoncteur) ; Bing répond
+vide honnêtement ; **Wayback OK** (5 liens `@parishilton` en 2,6 s) ; Urlebird 403.
+**SearXNG : les deux instances répondent depuis Render en ~1 s** (pages de 6,7 et
+9,1 Ko) mais 0 lien vidéo avec la requête `site:` — d'où le passage au format
+`tiktok.com @auteur video` (vérifié riche en URLs sticktock/tiktok depuis une IP
+datacenter, y compris pour les requêtes par nom). Le diagnostic affiche désormais
+les destinations d'une page sans lien vidéo (« destinations : … »).
 Tous les tests automatisés reposent sur des doublures (`monkeypatch`) — aucun
 réseau n'est contacté dans les tests.
 
@@ -166,7 +171,7 @@ réseau n'est contacté dans les tests.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt -r requirements.txt
-.venv/bin/python -m pytest -q                    # 106 tests
+.venv/bin/python -m pytest -q                    # 108 tests
 node --test tests/js/job-utils.test.cjs          # 7 tests
 ```
 
