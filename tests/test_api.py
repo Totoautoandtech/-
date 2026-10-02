@@ -1568,7 +1568,10 @@ def test_decouvrir_moteur_bascule_sur_le_relais_de_traduction():
     lecture reste vide aussi — le relais de traduction Google finit par passer."""
     vide_suspect = _PageWeb(200, "<html><body>DuckDuckGo</body></html>")  # ni lien ni « no results »
     jina_vide = _PageWeb(200, "Title: x\n\nMarkdown Content:\nrien ici")
-    traduction = _PageWeb(200, "tiktok.com/@chef/video/7341000000000000007")
+    traduction = _PageWeb(
+        200,
+        "<html>résultats traduits " * 8 + " tiktok.com/@chef/video/7341000000000000007",
+    )
     session = _SessionWeb([
         ("translate.goog", traduction),
         ("r.jina.ai/", jina_vide),
@@ -1579,6 +1582,93 @@ def test_decouvrir_moteur_bascule_sur_le_relais_de_traduction():
     assert liens == ["https://www.tiktok.com/@chef/video/7341000000000000007"]
     assert "direct vide" in detail and "relais de lecture vide" in detail
     assert len(session.appels) == 3  # direct, relais de lecture, relais de traduction
+
+
+def test_decouvrir_moteur_searxng_tente_chaque_instance_puis_normalise_le_miroir():
+    """SearXNG public : la première instance est bloquée, la deuxième répond ; le
+    miroir sticktock.com (mêmes auteurs et identifiants que TikTok) est normalisé
+    en vrai lien tiktok.com — revalidé ensuite par TikWM /api/."""
+    page_opnxng = _PageWeb(403, "")
+    page_inetol = _PageWeb(200, (
+        '<a href="https://sticktock.com/@chef/video/7505962928663809310">vidéo</a> '
+        '<a href="https://sticktock.com/@chef/video/7673952670075358495">vidéo</a>'
+    ))
+    session = _SessionWeb([
+        ("search.inetol.net", page_inetol),
+        ("opnxng.com", page_opnxng),
+    ])
+    liens, mode, detail = asyncio.run(app._decouvrir_moteur(session, "searxng", requete="chef", limite=5))
+    assert mode == "direct"
+    assert liens == [
+        "https://www.tiktok.com/@chef/video/7505962928663809310",
+        "https://www.tiktok.com/@chef/video/7673952670075358495",
+    ]
+    assert "direct" in detail
+    # Deux appels directs seulement : les relais ne sont pas consommés.
+    assert len(session.appels) == 2
+    assert "opnxng.com" in session.appels[0] and "inetol.net" in session.appels[1]
+
+
+def test_decouvrir_moteur_injoignable_partout_est_declare_bloque():
+    """Direct 403, relais de lecture 403, relais de traduction 403 : aucune page
+    obtenue — le moteur est injoignable, pas vide. L'ErreurApp déclenche le
+    disjoncteur de la chaîne (la source ne sera plus tentée pendant le travail)."""
+    session = _SessionWeb([_ for _ in []] or [
+        ("lite.duckduckgo.com", _PageWeb(403, "")),
+        ("r.jina.ai/", _PageWeb(403, "")),
+        ("translate.goog", _PageWeb(403, "")),
+    ])
+    with pytest.raises(app.ErreurApp, match="injoignable par tous les chemins"):
+        asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="chef", limite=5))
+
+
+class _SessionSequentielle:
+    """Session factuelle qui sert des pages différentes à chaque appel successif."""
+
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.appels = []
+
+    def get(self, url, **_kwargs):
+        page = self.pages[min(len(self.appels), len(self.pages) - 1)]
+        self.appels.append(url)
+        return page
+
+
+def test_relais_de_traduction_reessaie_apres_un_202():
+    """Google répond « 202 Accepted » pendant qu'il prépare la page : on réessaie
+    une fois, et la deuxième réponse est servie telle quelle."""
+    premiere = _PageWeb(202, "<html>" + "translation in progress " * 6 + "</html>")
+    deuxieme = _PageWeb(200, "<html>" + "vraie page de résultats de recherche " * 6 + "</html>")
+    session = _SessionSequentielle([premiere, deuxieme])
+    texte = asyncio.run(app._lire_page_translate(session, "https://lite.duckduckgo.com/lite/?q=test"))
+    assert texte == deuxieme._texte
+    assert len(session.appels) == 2
+
+
+def test_relais_de_traduction_accepte_un_202_deja_servi():
+    """Un 202 dont le corps contient déjà la page complète est accepté tel quel."""
+    page = _PageWeb(202, "x" * 2000 + " https://www.tiktok.com/@chef/video/7505962928663809310")
+    session = _SessionSequentielle([page])
+    texte = asyncio.run(app._lire_page_translate(session, "https://lite.duckduckgo.com/lite/?q=test"))
+    assert "tiktok.com/@chef" in texte
+    assert len(session.appels) == 1
+
+
+def test_relais_de_traduction_abandonne_apres_deux_202_vides():
+    session = _SessionSequentielle([_PageWeb(202, "<html>wait</html>")])
+    with pytest.raises(app.ErreurApp, match="relais de traduction inaccessible"):
+        asyncio.run(app._lire_page_translate(session, "https://lite.duckduckgo.com/lite/?q=test"))
+    assert len(session.appels) == 2
+
+
+def test_extraire_liens_reconnait_le_miroir_sticktock():
+    """Le miroir sticktock.com partage les identifiants vidéo de TikTok : les liens
+    y sont lus puis normalisés — jamais pris pour un lien sticktock à livrer."""
+    texte = "https://sticktock.com/@parishilton/video/7505962928663809310 fin"
+    assert app._extraire_liens_tiktok_texte(texte) == [
+        "https://www.tiktok.com/@parishilton/video/7505962928663809310"
+    ]
 
 
 def test_decouvrir_moteur_serp_vide_via_relais_arrete_la():
@@ -1641,7 +1731,7 @@ def test_chaine_publique_bloque_les_sources_en_echec_et_reessaie_la_gagnante(mon
 
     etat = app.EtatSourcesDecouverte()
     liens = asyncio.run(app._decouvrir_publique(None, requete="paris", limite=5, etat=etat))
-    assert ordre == ["duckduckgo", "ecosia", "bing", "urlebird"]
+    assert ordre == ["searxng", "duckduckgo", "ecosia", "bing", "urlebird"]
     assert etat.bloquees == {"duckduckgo", "urlebird"}
     assert etat.gagnante == "ecosia"
     assert [l["origin"] for l in liens] == ["Ecosia : recherche « paris »"]
@@ -1649,7 +1739,7 @@ def test_chaine_publique_bloque_les_sources_en_echec_et_reessaie_la_gagnante(mon
     ordre.clear()
     liens2 = asyncio.run(app._decouvrir_publique(None, requete="lyon", limite=5, etat=etat))
     # La gagnante passe en tête, les bloquées ne sont plus tentées.
-    assert ordre == ["ecosia", "bing"]
+    assert ordre == ["ecosia", "searxng", "bing"]
     assert [l["origin"] for l in liens2] == ["Ecosia : recherche « lyon »"]
 
 
@@ -1710,6 +1800,7 @@ def test_diagnostic_sources_rst_rapporte_l_etat_reel_depuis_le_serveur(client, m
     }
     assert "aucun résultat" in par_source["ecosia"]["detail"]
     assert par_source["ecosia"]["statut"] == "vide"
+    assert par_source["searxng"]["statut"] == "vide"
     assert par_source["bing"]["statut"] == "vide"
     assert par_source["wayback"]["statut"] == "vide"
     assert par_source["urlebird"]["statut"] == "bloque"

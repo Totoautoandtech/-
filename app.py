@@ -1585,7 +1585,7 @@ def _extraire_liens_urlebird(html: str, auteur_defaut: str = "") -> list[str]:
 # Relais de lecture public : gratuit, sans clé ni compte (limite publique ~20 req/min).
 RELAIS_LECTURE = _env("RELAIS_LECTURE_URL", "https://r.jina.ai/").rstrip("/") + "/"
 DECOUVERTE_DELAI_MOTEUR = 10.0    # moteur de recherche interrogé en direct
-DECOUVERTE_DELAI_RELAIS = 22.0    # même moteur interrogé via le relais de lecture
+DECOUVERTE_DELAI_RELAIS = 15.0    # même moteur interrogé via un relais public
 DECOUVERTE_DELAI_MIROIR = 14.0    # Urlebird et archive web
 DECOUVERTE_BUDGET = 150.0         # budget global de découverte pour un travail RsT
 DECOUVERTE_BUDGET_REQUETE = 45.0  # budget maximal de découverte pour une seule requête
@@ -1601,7 +1601,11 @@ ENTETES_MOTEURS = {
 
 # Identifiants vidéo TikTok réels : 18 à 20 chiffres. Les identifiants plus courts
 # ou les « versions » type 2.0.0.21 rencontrées dans les archives sont du bruit.
-_RE_LIEN_VIDEO_TIKTOK = re.compile(r"tiktok\.com/(@[\w.\-]+)/video/(\d{18,20})", re.IGNORECASE)
+# sticktock.com est un miroir public de TikTok : mêmes auteurs, mêmes identifiants
+# vidéo — les liens y sont normalisés en tiktok.com puis revalidés par TikWM /api/.
+_RE_LIEN_VIDEO_TIKTOK = re.compile(
+    r"(?:tiktok|sticktock)\.com/(@[\w.\-]+)/video/(\d{18,20})", re.IGNORECASE
+)
 
 # Pages « Just a moment… », captcha ou défi anti-bot : la page a répondu mais n'a
 # rien donné — le relais de lecture mérite alors un essai.
@@ -1664,10 +1668,23 @@ def _requete_moteur(auteur: str, requete: str) -> str:
     return f"site:tiktok.com {terme} video" if terme else ""
 
 
-_URLS_MOTEURS = {
-    "duckduckgo": lambda q: f"https://lite.duckduckgo.com/lite/?q={quote_plus(q)}",
-    "ecosia": lambda q: f"https://www.ecosia.org/search?q={quote_plus(q)}",
-    "bing": lambda q: f"https://www.bing.com/search?q={quote_plus(q)}&count=20",
+# Chaque moteur peut avoir plusieurs instances publiques, essayées en direct
+# l'une après l'autre. SearXNG agrège Google/Bing/DuckDuckGo depuis son propre
+# serveur : c'est lui qui subit les blocages d'IP, pas notre service.
+_URLS_MOTEURS: dict[str, list] = {
+    "searxng": [
+        lambda q: f"https://opnxng.com/search?q={quote_plus(q)}",
+        lambda q: f"https://search.inetol.net/search?q={quote_plus(q)}",
+    ],
+    "duckduckgo": [
+        lambda q: f"https://lite.duckduckgo.com/lite/?q={quote_plus(q)}",
+    ],
+    "ecosia": [
+        lambda q: f"https://www.ecosia.org/search?q={quote_plus(q)}",
+    ],
+    "bing": [
+        lambda q: f"https://www.bing.com/search?q={quote_plus(q)}&count=20",
+    ],
 }
 
 
@@ -1716,14 +1733,32 @@ async def _lire_page_translate(
 ) -> str:
     """Demande la page via le proxy de traduction public de Google : c'est Google
     qui contacte la source, ce qui contourne les blocages appliqués à la plage IP
-    du serveur (soft-block 200 vide, 403 Cloudflare…)."""
-    async with session.get(
-        _url_translate(url), headers=ENTETES_MOTEURS,
-        timeout=aiohttp.ClientTimeout(total=delai), allow_redirects=True,
-    ) as resp:
-        if resp.status != 200:
-            raise ErreurApp(f"relais de traduction inaccessible ({resp.status})")
-        return await resp.text(errors="replace")
+    du serveur (soft-block 200 vide, 403 Cloudflare…).
+
+    Google répond parfois « 202 Accepted » pendant qu'il prépare la page : on
+    réessaie une fois, et on accepte un 202 dont le corps contient déjà la page.
+    """
+    cible = _url_translate(url)
+    dernier_etat = "aucune réponse"
+    for tentative in range(2):
+        try:
+            async with session.get(
+                cible, headers=ENTETES_MOTEURS,
+                timeout=aiohttp.ClientTimeout(total=delai), allow_redirects=True,
+            ) as resp:
+                texte = await resp.text(errors="replace")
+                dernier_etat = f"statut {resp.status}, {len(texte)} octets"
+                if resp.status == 200 and len(texte) > 100:
+                    return texte
+                if resp.status == 202 and len(texte) > 1500:
+                    return texte  # la page est servie malgré le statut « accepté »
+        except asyncio.TimeoutError:
+            raise ErreurApp("relais de traduction sans réponse (délai dépassé)")
+        except Exception as exc:  # noqa: BLE001 — pas de réessai utile sur erreur réseau
+            raise ErreurApp(f"relais de traduction inaccessible ({exc})")
+        if tentative == 0:
+            await asyncio.sleep(1.5)  # page en préparation : un seul réessai
+    raise ErreurApp(f"relais de traduction inaccessible ({dernier_etat})")
 
 
 def _serp_vraiment_vide(texte: str) -> bool:
@@ -1756,30 +1791,43 @@ async def _decouvrir_moteur(
     q = _requete_moteur(auteur, requete)
     if not q:
         return [], "", "aucune requête constructible"
-    url = _URLS_MOTEURS[moteur](q)
+    modeles = _URLS_MOTEURS.get(moteur) or []
+    if not modeles:
+        return [], "", "moteur inconnu"
     etapes: list[str] = []
+    page_recue = False
 
-    # --- 1) Direct, depuis l'IP du serveur (Render) -----------------------------
-    try:
-        debut = time.monotonic()
-        texte = await _lire_page(session, url, entetes=ENTETES_MOTEURS, delai=DECOUVERTE_DELAI_MOTEUR)
-        duree = time.monotonic() - debut
-        liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
-        if liens:
-            return liens[:limite], "direct", f"direct : {len(liens)} lien(s) en {duree:.1f} s"
-        etapes.append(f"direct vide ({len(texte)} octets, {duree:.1f} s)")
-        # Page qui dit honnêtement « aucun résultat » et répond vite : inutile de
-        # consommer les relais pour la même recherche sur le même moteur.
-        if _serp_vraiment_vide(texte) and duree < 6.0:
-            return [], "", "direct : aucun résultat affiché par le moteur"
-        if _page_bloquee(texte):
-            etapes.append("page directe ressemble à un défi anti-bot")
-    except Exception as exc:  # noqa: BLE001 — IP probablement bloquée : on relaye
-        etapes.append(f"direct injoignable ({exc})")
+    # --- 1) Direct, depuis l'IP du serveur, sur chaque instance du moteur ------
+    urls = [modele(q) for modele in modeles]
+    for indice, url in enumerate(urls):
+        try:
+            debut = time.monotonic()
+            texte = await _lire_page(session, url, entetes=ENTETES_MOTEURS, delai=DECOUVERTE_DELAI_MOTEUR)
+            duree = time.monotonic() - debut
+            page_recue = True
+            liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
+            if liens:
+                return liens[:limite], "direct", f"direct : {len(liens)} lien(s) en {duree:.1f} s"
+            etapes.append(f"direct vide ({len(texte)} octets, {duree:.1f} s)")
+            # Page qui dit honnêtement « aucun résultat » et répond vite : inutile de
+            # consommer les relais pour la même recherche sur le même moteur. Une
+            # autre instance du moteur peut pourtant agréger d'autres moteurs :
+            # on la tente avant de conclure.
+            if _serp_vraiment_vide(texte) and duree < 6.0:
+                if indice == len(urls) - 1:
+                    return [], "", "direct : aucun résultat affiché par le moteur"
+                etapes.append("instance suivante : cette instance n'a aucun résultat")
+                continue
+            if _page_bloquee(texte):
+                etapes.append("page directe ressemble à un défi anti-bot")
+        except Exception as exc:  # noqa: BLE001 — IP probablement bloquée : on relaye
+            etapes.append(f"direct injoignable ({exc})")
 
-    # --- 2) Relais de lecture public (r.jina.ai) --------------------------------
+    # --- 2) Relais de lecture public (r.jina.ai) — première instance -----------
+    url = modeles[0](q)
     try:
         texte = await _lire_page_relais(session, url)
+        page_recue = True
         liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
         if liens:
             return liens[:limite], "relais jina", f"relais de lecture : {len(liens)} lien(s) ; " + " ; ".join(etapes)
@@ -1790,9 +1838,10 @@ async def _decouvrir_moteur(
     except Exception as exc:  # noqa: BLE001
         etapes.append(f"relais de lecture injoignable ({exc})")
 
-    # --- 3) Relais de traduction Google (translate.goog) ------------------------
+    # --- 3) Relais de traduction Google (translate.goog) — première instance ---
     try:
         texte = await _lire_page_translate(session, url)
+        page_recue = True
         liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
         if liens:
             return liens[:limite], "relais traduction", (
@@ -1802,6 +1851,12 @@ async def _decouvrir_moteur(
     except Exception as exc:  # noqa: BLE001
         etapes.append(f"relais de traduction injoignable ({exc})")
 
+    # Aucune page n'a jamais été obtenue, même par les relais : le moteur est
+    # injoignable depuis ce serveur. On le déclare bloqué (ErreurApp) pour que la
+    # chaîne cesse de le tenter pendant le reste du travail — contrairement à une
+    # vraie page vide, qui ne bloque rien.
+    if not page_recue:
+        raise ErreurApp("moteur injoignable par tous les chemins : " + " ; ".join(etapes))
     return [], "", " ; ".join(etapes)
 
 
@@ -1855,7 +1910,7 @@ async def _source_urlebird(
         terme = requete.strip().lstrip("#")
         url = f"https://urlebird.com/search/?q={quote_plus(terme)}"
     else:
-        return [], "", "aucune requête constructible", "aucune requête constructible"
+        return [], "", "aucune requête constructible"
 
     async def _appel():
         async with session.get(
@@ -1903,6 +1958,7 @@ class EtatSourcesDecouverte:
 def _libelle_origine(source: str, mode: str, auteur: str, requete: str) -> str:
     """Origine honnête affichée dans « Vidéos trouvées par RsT »."""
     noms = {
+        "searxng": "SearXNG",
         "duckduckgo": "DuckDuckGo",
         "ecosia": "Ecosia",
         "bing": "Bing",
@@ -1940,7 +1996,7 @@ async def _decouvrir_publique(
         return []
     etat = etat or EtatSourcesDecouverte()
 
-    sources = ["duckduckgo", "ecosia", "bing"]
+    sources = ["searxng", "duckduckgo", "ecosia", "bing"]
     if auteur:
         sources.append("wayback")
     sources.append("urlebird")
@@ -3089,7 +3145,7 @@ async def diagnostic_sources_rst(auteur: str = "", requete: str = "") -> dict[st
     ) as session:
         sondes_sources = [
             sonder_source(session, nom)
-            for nom in ("duckduckgo", "ecosia", "bing", "wayback", "urlebird")
+            for nom in ("searxng", "duckduckgo", "ecosia", "bing", "wayback", "urlebird")
         ]
         sondes_tikwm = [
             sonder_tikwm(session, "/", {"url": "https://www.tiktok.com/@tiktok/video/7106594312292453675", "hd": "1"}),

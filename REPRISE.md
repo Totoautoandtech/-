@@ -56,11 +56,19 @@ Pour **chaque** lien de départ :
    cherchés à travers une chaîne publique **sans clé ni compte** :
    - TikWM `/user/posts` et `/feed/search` d'abord — **403 depuis Render**
      (blocage de plage IP, constaté en production) ;
-   - moteurs **DuckDuckGo lite**, **Ecosia**, **Bing** (requête
-     `site:tiktok.com … video`), chacun **en direct puis via deux relais
-     publics sans clé** — le relais de lecture `r.jina.ai`, puis le relais de
-     traduction Google `translate.goog` — quand l'IP du serveur est bloquée
-     ou que la page reste vide ;
+   - moteurs publics, dans l'ordre : **SearXNG** (instances `opnxng.com` puis
+     `search.inetol.net` — elles agrègent Google CSE/Bing/DuckDuckGo depuis
+     leur propre serveur, donc c'est leur IP qui absorbe les blocages ;
+     résultats du miroir `sticktock.com` normalisés en `tiktok.com`), puis
+     **DuckDuckGo lite**, **Ecosia**, **Bing** (requête `site:tiktok.com …
+     video`), chacun **en direct puis via deux relais publics sans clé** — le
+     relais de lecture `r.jina.ai`, puis le relais de traduction Google
+     `translate.goog` (un « 202 Accepted » est réessayé une fois, un 202 déjà
+     servi est accepté) — quand l'IP du serveur est bloquée ou que la page
+     reste vide ;
+   - un moteur **injoignable par tous les chemins** lève `ErreurApp` et passe
+     au disjoncteur (`etat.bloquees`) : il n'est plus retenté pendant le
+     travail — une page honnêtement vide, elle, ne bloque rien ;
    - **archive web Wayback** (CDX) pour les publications d'un auteur ;
    - miroir **Urlebird** en dernier recours (Cloudflare le bloque sur Render).
    Disjoncteurs : une source en échec n'est plus tentée pendant le travail, la
@@ -143,8 +151,12 @@ certaines IP mais bloque relais et datacenters ; Bing ignore `site:` ; le CDX
 Wayback liste les vidéos archivées d'un auteur (mais `r.jina.ai` est lui-même
 bloqué par archive.org) ; Urlebird passe avec un navigateur seulement.
 **Diagnostic réel du 2 octobre 2026 sur Render** (`GET /api/rst/sources`) :
-TikWM `/api/` ok, `/user/posts` et `/feed/search` 403, Ecosia/Bing vides,
-Wayback timeout, Urlebird 403 — les relais DDG portent donc la découverte.
+TikWM `/api/` ok, `/user/posts` et `/feed/search` 403 ; DDG direct timeout,
+`r.jina.ai` renvoie 403 à l'IP Render (OK depuis ailleurs), `translate.goog`
+renvoie 202 (géré par réessai) ; Ecosia 403 partout ; Bing répond vide honnêtement ;
+**Wayback OK** (5 liens pour `@parishilton` en 2,6 s) ; Urlebird 403. SearXNG
+(`opnxng.com`) vérifié fonctionnel depuis une IP datacenter : vraies URLs vidéo
+via Google CSE — à confirmer depuis Render par le prochain diagnostic.
 Tous les tests automatisés reposent sur des doublures (`monkeypatch`) — aucun
 réseau n'est contacté dans les tests.
 
@@ -154,7 +166,7 @@ réseau n'est contacté dans les tests.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt -r requirements.txt
-.venv/bin/python -m pytest -q                    # 97 tests
+.venv/bin/python -m pytest -q                    # 106 tests
 node --test tests/js/job-utils.test.cjs          # 7 tests
 ```
 
