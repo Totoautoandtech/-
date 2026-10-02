@@ -187,6 +187,27 @@ réseau n'est contacté dans les tests.
 
 ## 6. Tests
 
+### Correctif RsT — plafond d'analyses sous Render Free (2 octobre 2026)
+
+Un travail réel a échoué pendant « Analyse 5/16 » : 16 sources avaient été
+retenues alors qu'une analyse Gemini peut coûter environ 60 s sur Render quand
+l'API sature (réessais 2/4/8/16 s sur 429/503). L'estimateur ne comptait que
+10 s par analyse et la sélection RsT utilisait un plafond fixe trop optimiste.
+
+Correctif à conserver :
+
+- `studio_montage.estimer_duree_traitement()` compte désormais, par source,
+  **30 s d'analyse Gemini + 8 s de transfert/latence** au lieu de 10 s ;
+- `_produire_rst()` calcule un `plafond_reel` à partir du budget restant du job
+  (`max(90, min(540, restant - LIVRAISON_RESERVE - 45))`) puis le transmet à
+  `_reduire_selon_estimation()` avant le montage ;
+- l'interface reçoit un détail explicite du type
+  `Budget restant : N s — X source(s) retenue(s)` ; sur Render Free, X doit
+  typiquement tomber autour de 9-10 sources plutôt que 16+ ;
+- le test RsT de bout en bout vérifie que la sélection reste entre 4 et 12
+  sources et que les candidates écartées portent la raison
+  `retirée pour rester sous la limite de temps Render`.
+
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt -r requirements.txt
 .venv/bin/python -m pytest -q                    # 108 tests

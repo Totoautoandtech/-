@@ -295,7 +295,17 @@ def estimer_duree_traitement(
     nb_analyses = len(durees) + (1 if duree_reference else 0)
     total_analyse = total + min(duree_reference, config.duree_max_source)
     # Aperçus 6 fps + uploads/latence Gemini + téléchargements + export vertical ~30 s.
-    secondes = 15 + total_analyse * 0.38 + nb_analyses * 10 + total * 0.08 + 30 * 3.0
+    # Sur Render Free, une analyse Gemini complète peut prendre ~60 s quand l'API
+    # sature (réessais 2/4/8/16 s). On réserve donc 30 s d'analyse + 8 s de
+    # transfert/latence par source au lieu de sous-estimer à 10 s par analyse.
+    secondes = (
+        15
+        + total_analyse * 0.38
+        + nb_analyses * 30
+        + nb_analyses * 8
+        + total * 0.08
+        + 30 * 3.0
+    )
     secondes = int(math.ceil(secondes / 5.0) * 5)
     plafond_prudent = min(540, max(60, int(config.delai_job - 20)))
     sous_dix = secondes <= plafond_prudent
