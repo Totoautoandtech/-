@@ -416,7 +416,13 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
     assert all(v["video_id"] != "111" for v in trouves)
     assert all(v["url"].startswith("https://www.tiktok.com/@") for v in trouves)
     retenues = [v for v in trouves if v["selected"]]
-    assert len(retenues) == min(20, app.CONFIG.rst_sources_max)
+    assert 4 <= len(retenues) <= 12
+    assert job["plafond_reel"] <= 540
+    ecartees_temps = [
+        v for v in trouves
+        if not v["selected"] and "limite de temps Render" in v.get("rejet", "")
+    ]
+    assert ecartees_temps
 
     # Les durées hors limites sont signalées honnêtement, jamais retenues.
     hors_limites = [v for v in trouves if v["video_id"] in {"900", "901", "902"}]

@@ -2485,17 +2485,23 @@ async def _produire_rst(
     selectionnees, trouves = _selectionner_sources_rst(
         trouves, CONFIG.rst_sources_max, float(CONFIG.duree_max_source)
     )
-    selectionnees = _reduire_selon_estimation(selectionnees, configuration)
+    plafond_reel = max(
+        90, min(540, int(contexte.restant()) - int(LIVRAISON_RESERVE) - 45)
+    )
+    selectionnees = _reduire_selon_estimation(selectionnees, configuration, plafond_reel)
     if not selectionnees:
         raise ErreurApp("Aucune vidéo trouvée n'entre dans les limites de durée utilisables.")
     noms_couverts = sorted({s["nom"] for s in selectionnees if s.get("nom")})
+    budget_restant = max(0, int(contexte.restant()))
     contexte.update(
         statut="selecting", progress=44,
         detail=(
+            f"Budget restant : {budget_restant} s — "
             f"{len(selectionnees)} source(s) retenue(s) sur {len(trouves)} trouvée(s)"
             + (f" — {len(noms_couverts)}/{len(noms)} nom(s) couvert(s)" if noms else "")
         ),
         found_videos=trouves, search_queries=requetes_reelles, noms=noms,
+        plafond_reel=plafond_reel,
     )
 
     resolution = "1080" if (requete.mode == "qualite" and CONFIG.autoriser_export_1080) else "720"
