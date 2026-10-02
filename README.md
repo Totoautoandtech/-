@@ -24,12 +24,15 @@ La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **
    sources dans les limites de durée et de temps Render et lance le montage en **plans de 5 s maximum**.
    La recherche explore les publications du créateur de départ et chaque nom du TOP N à travers une
    **chaîne publique multi-sources** tolérante aux plages IP cloud : TikWM d'abord, puis — si ses
-   endpoints de recherche répondent 403 depuis Render — les moteurs **DuckDuckGo, Ecosia et Bing**
-   (en direct, puis via deux **relais publics sans clé** : le relais de lecture `r.jina.ai` et le
-   relais de traduction Google `translate.goog`, dont l'infrastructure demande la page à sa place),
-   l'**archive web Wayback** pour l'auteur, et le miroir **Urlebird** en dernier recours. Une source
-   bloquée n'est plus retentée, celle qui a répondu passe en premier, et un budget de temps protège
-   le montage. **Chaque lien
+   endpoints de recherche répondent 403 depuis Render — les moteurs publics **SearXNG** (instances
+   `opnxng.com` et `search.inetol.net`, qui agrègent Google/Bing/DuckDuckGo depuis leur propre
+   serveur), **DuckDuckGo, Ecosia et Bing** (chacun en direct, puis via deux **relais publics sans
+   clé** : le relais de lecture `r.jina.ai` et le relais de traduction Google `translate.goog`),
+   l'**archive web Wayback** pour l'auteur, et le miroir **Urlebird** en dernier recours. Une
+   source injoignable est mise hors circuit pour le reste du travail, celle qui a répondu passe
+   en premier, et un budget de temps protège le montage. Les liens du miroir `sticktock.com`
+   (mêmes auteurs et identifiants vidéo que TikTok) sont normalisés en `tiktok.com` puis
+   revalidés par TikWM comme tous les autres. **Chaque lien
    découvert est revalidé par TikWM `/api/`** (identifiant, auteur, titre, durée réels) avant toute
    sélection — l'origine réelle de chaque vidéo est conservée dans « Vidéos trouvées par RsT », qui
    affiche durée, auteur, origine, nom recherché et raison d'exclusion. Si l'IA ne trouve aucun nom,
