@@ -40,10 +40,10 @@ import secrets
 import shutil
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
-from urllib.parse import quote, quote_plus, urlencode, urlparse
+from urllib.parse import quote, quote_plus, unquote, urlencode, urlparse
 
 import aiofiles
 import aiohttp
@@ -103,8 +103,9 @@ ENTETES_TIKWM = {
     "Referer": "https://www.tikwm.com/",
 }
 
-# Urlebird : miroir public utilisé en repli RsT quand TikWM bloque les recherches
-# (/feed/search et /user/posts répondant 403 depuis l'IP de l'hébergeur).
+# Urlebird : miroir public utilisé en repli RsT. En production (Render), Cloudflare
+# bloque souvent son IP de datacenter ; Urlebird n'est donc que la dernière source
+# de la chaîne de découverte publique multi-sources définie plus bas.
 ENTETES_URLEBIRD = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1566,6 +1567,232 @@ def _extraire_liens_urlebird(html: str, auteur_defaut: str = "") -> list[str]:
     return liens
 
 
+# ======================================================================================
+# DÉCOUVERTE PUBLIQUE MULTI-SOURCES — tolérante aux plages IP cloud de Render
+# ======================================================================================
+# Constaté en production : depuis l'IP de Render, TikWM /user/posts et /feed/search
+# répondent 403 (seul l'endpoint unitaire /api/ passe) et Urlebird est bloqué par
+# Cloudflare. La découverte enchaîne donc plusieurs sources publiques, toutes sans
+# clé, sans compte et sans abonnement :
+#   1. moteurs de recherche — DuckDuckGo lite, Ecosia, Bing — interrogés en direct
+#      puis, si l'IP du serveur est bloquée, via un relais de lecture public
+#      (r.jina.ai) dont l'infrastructure demande la page à sa place ;
+#   2. archive web publique (Wayback Machine) pour les publications d'un auteur ;
+#   3. miroir public Urlebird (dernier recours).
+# Chaque lien découvert est ensuite revalidé par TikWM /api/ : identifiant, auteur,
+# titre et durée restent réels, aucune donnée n'est jamais inventée.
+
+# Relais de lecture public : gratuit, sans clé ni compte (limite publique ~20 req/min).
+RELAIS_LECTURE = _env("RELAIS_LECTURE_URL", "https://r.jina.ai/").rstrip("/") + "/"
+DECOUVERTE_DELAI_MOTEUR = 10.0    # moteur de recherche interrogé en direct
+DECOUVERTE_DELAI_RELAIS = 22.0    # même moteur interrogé via le relais de lecture
+DECOUVERTE_DELAI_MIROIR = 14.0    # Urlebird et archive web
+DECOUVERTE_BUDGET = 150.0         # budget global de découverte pour un travail RsT
+DECOUVERTE_BUDGET_REQUETE = 45.0  # budget maximal de découverte pour une seule requête
+
+ENTETES_MOTEURS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+# Identifiants vidéo TikTok réels : 18 à 20 chiffres. Les identifiants plus courts
+# ou les « versions » type 2.0.0.21 rencontrées dans les archives sont du bruit.
+_RE_LIEN_VIDEO_TIKTOK = re.compile(r"tiktok\.com/(@[\w.\-]+)/video/(\d{18,20})", re.IGNORECASE)
+
+# Pages « Just a moment… », captcha ou défi anti-bot : la page a répondu mais n'a
+# rien donné — le relais de lecture mérite alors un essai.
+_MARQUEURS_BLOCAGE = (
+    "just a moment", "challenge", "captcha", "anomaly",
+    "unusual traffic", "are you a robot", "security verification",
+    "enable javascript and cookies",
+)
+
+
+def _page_bloquee(texte: str) -> bool:
+    """Vrai si la page ressemble à un défi anti-bot plutôt qu'à un vrai résultat."""
+    bas = (texte or "").lower()[:6000]
+    return any(marqueur in bas for marqueur in _MARQUEURS_BLOCAGE)
+
+
+def _extraire_liens_tiktok_texte(texte: str, auteur_attendu: str = "") -> list[str]:
+    """Extrait de vrais liens vidéo TikTok d'une page de moteur ou de miroir.
+
+    Les moteurs enveloppent souvent la destination : DuckDuckGo l'encode en
+    percent-encoding dans `uddg=`, Bing la chiffre en base64 dans `u=a1…`. On
+    décode tout, puis on ne retient que les identifiants vidéo plausibles, sans
+    jamais fabriquer un lien qui n'est pas dans la page.
+    """
+    if not texte:
+        return []
+    attendu = auteur_attendu.strip().lstrip("@").lower()
+    vus: set[str] = set()
+    liens: list[str] = []
+
+    morceaux: list[str] = [texte]
+    # Bing : destinations emballées en base64 (u=a1<base64url>)
+    for jeton in re.findall(r"u=a1[A-Za-z0-9\-_+/=%]{16,}", texte):
+        brut = unquote(jeton[4:])
+        try:
+            bourre = "=" * (-len(brut) % 4)
+            morceaux.append(base64.urlsafe_b64decode(brut + bourre).decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 — un jeton illisible est simplement ignoré
+            continue
+    # DuckDuckGo et autres : destination percent-encodée (uddg=…)
+    morceaux.append(unquote(texte))
+
+    for morceau in morceaux:
+        for match in _RE_LIEN_VIDEO_TIKTOK.finditer(morceau):
+            pseudo, vid_id = match.group(1).lstrip("@"), match.group(2)
+            if attendu and pseudo.lower() != attendu:
+                continue
+            if vid_id in vus:
+                continue
+            vus.add(vid_id)
+            liens.append(f"https://www.tiktok.com/@{pseudo}/video/{vid_id}")
+    return liens
+
+
+def _requete_moteur(auteur: str, requete: str) -> str:
+    """Recherche qui cible uniquement les pages vidéo TikTok, par auteur ou par nom."""
+    if auteur:
+        return f"site:tiktok.com/@{auteur.strip().lstrip('@')} video"
+    terme = " ".join(requete.strip().lstrip("#").split())
+    return f"site:tiktok.com {terme} video" if terme else ""
+
+
+_URLS_MOTEURS = {
+    "duckduckgo": lambda q: f"https://lite.duckduckgo.com/lite/?q={quote_plus(q)}",
+    "ecosia": lambda q: f"https://www.ecosia.org/search?q={quote_plus(q)}",
+    "bing": lambda q: f"https://www.bing.com/search?q={quote_plus(q)}&count=20",
+}
+
+
+async def _lire_page(session: aiohttp.ClientSession, url: str, *, entetes: dict, delai: float) -> str:
+    """GET direct ; lève ErreurApp si la source répond mal — aucune donnée n'est inventée."""
+    async with session.get(
+        url, headers=entetes, timeout=aiohttp.ClientTimeout(total=delai), allow_redirects=True
+    ) as resp:
+        if resp.status != 200:
+            raise ErreurApp(f"source inaccessible ({resp.status})")
+        return await resp.text(errors="replace")
+
+
+async def _lire_page_relais(
+    session: aiohttp.ClientSession, url: str, *, delai: float = DECOUVERTE_DELAI_RELAIS
+) -> str:
+    """Demande la page via le relais de lecture public : c'est le relais qui contacte
+    la source depuis sa propre infrastructure, ce qui contourne les blocages de
+    plage IP appliqués aux datacenters (Cloudflare, 403 sélectifs…)."""
+    if not RELAIS_LECTURE.startswith("http"):
+        raise ErreurApp("relais de lecture non configuré")
+    async with session.get(
+        RELAIS_LECTURE + url, headers=ENTETES_MOTEURS,
+        timeout=aiohttp.ClientTimeout(total=delai), allow_redirects=True,
+    ) as resp:
+        if resp.status != 200:
+            raise ErreurApp(f"relais inaccessible ({resp.status})")
+        return await resp.text(errors="replace")
+
+
+async def _decouvrir_moteur(
+    session: aiohttp.ClientSession, moteur: str, *,
+    auteur: str = "", requete: str = "", limite: int = 20,
+) -> tuple[list[str], str]:
+    """Interroge un moteur en direct puis, si l'IP du serveur est bloquée, via le relais.
+
+    Renvoie (liens réels, mode) où mode vaut « direct », « relais » ou vide si le
+    moteur a répondu sans aucune vidéo TikTok pour cette recherche.
+    """
+    q = _requete_moteur(auteur, requete)
+    if not q:
+        return [], ""
+    url = _URLS_MOTEURS[moteur](q)
+    try:
+        texte = await _lire_page(session, url, entetes=ENTETES_MOTEURS, delai=DECOUVERTE_DELAI_MOTEUR)
+        liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
+        if liens:
+            return liens[:limite], "direct"
+        if not _page_bloquee(texte):
+            return [], ""  # le moteur a répondu : cette recherche n'a simplement aucun résultat
+    except Exception as exc:  # noqa: BLE001 — IP peut-être bloquée : le relais réessaie
+        logger.info("[Découverte] moteur %s injoignable en direct (%s) : essai via relais", moteur, exc)
+    try:
+        texte = await _lire_page_relais(session, url)
+        liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
+        return (liens[:limite], "relais") if liens else ([], "")
+    except Exception as exc:  # noqa: BLE001
+        logger.info("[Découverte] moteur %s injoignable via relais : %s", moteur, exc)
+        return [], ""
+
+
+async def _decouvrir_wayback(
+    session: aiohttp.ClientSession, *, auteur: str, limite: int = 20
+) -> tuple[list[str], str]:
+    """Archive web publique (Wayback Machine) : vraies pages vidéo TikTok de cet
+    auteur déjà archivées, les snapshots les plus récents d'abord."""
+    pseudo = auteur.strip().lstrip("@")
+    if not pseudo:
+        return [], ""
+    annee_min = max(2018, time.gmtime().tm_year - 3)
+    parametres = {
+        "url": f"tiktok.com/@{pseudo}/video/*",
+        "output": "json",
+        "filter": "statuscode:200",
+        "collapse": "urlkey",
+        "fl": "original,timestamp",
+        "from": f"{annee_min}0101",
+        "limit": str(max(60, limite * 3)),
+    }
+    url = "https://web.archive.org/cdx/search/cdx?" + urlencode(parametres)
+    texte = await _lire_page(session, url, entetes=ENTETES_MOTEURS, delai=DECOUVERTE_DELAI_MIROIR)
+    try:
+        lignes = json.loads(texte)
+    except json.JSONDecodeError as exc:
+        raise ErreurApp("l'archive web a renvoyé une réponse invalide") from exc
+    archives: dict[str, str] = {}
+    for ligne in lignes[1:] if isinstance(lignes, list) else []:
+        if not isinstance(ligne, list) or len(ligne) < 2:
+            continue
+        match = re.search(r"/video/(\d{18,20})", str(ligne[0]))
+        if not match:
+            continue  # « video/0 », « video/2.0.0.21 »… : pas de vraies vidéos
+        vid, horodatage = match.group(1), str(ligne[1])
+        if vid not in archives or horodatage > archives[vid]:
+            archives[vid] = horodatage  # on garde le snapshot le plus récent
+    ordonnees = sorted(archives.items(), key=lambda c: c[1], reverse=True)[:limite]
+    return [f"https://www.tiktok.com/@{pseudo}/video/{vid}" for vid, _ in ordonnees], "archive"
+
+
+async def _source_urlebird(
+    session: aiohttp.ClientSession, *, auteur: str = "", requete: str = "", limite: int = 20
+) -> tuple[list[str], str]:
+    """Miroir public Urlebird ; lève ErreurApp si Cloudflare bloque l'IP du serveur."""
+    if auteur:
+        pseudo = auteur.strip().lstrip("@")
+        url = f"https://urlebird.com/user/{quote(pseudo)}/"
+    elif requete:
+        terme = requete.strip().lstrip("#")
+        url = f"https://urlebird.com/search/?q={quote_plus(terme)}"
+    else:
+        return [], ""
+
+    async def _appel():
+        async with session.get(
+            url, headers=ENTETES_URLEBIRD,
+            timeout=aiohttp.ClientTimeout(total=DECOUVERTE_DELAI_MIROIR),
+        ) as resp:
+            if resp.status != 200:
+                raise ErreurApp(f"Urlebird inaccessible ({resp.status})")
+            return await resp.text()
+
+    html = await _avec_retry(_appel, tentatives=2, etape=f"Urlebird {url}")
+    return _extraire_liens_urlebird(html, auteur_defaut=auteur)[:limite], "direct"
+
+
 async def _decouvrir_urlebird(
     session: aiohttp.ClientSession,
     *,
@@ -1574,30 +1801,119 @@ async def _decouvrir_urlebird(
     limite: int = 20,
 ) -> list[str]:
     """Découvre de vrais liens TikTok via les pages publiques Urlebird (aucun compte ni clé)."""
-    if auteur:
-        pseudo = auteur.strip().lstrip("@")
-        url = f"https://urlebird.com/user/{quote(pseudo)}/"
-    elif requete:
-        terme = requete.strip().lstrip("#")
-        url = f"https://urlebird.com/search/?q={quote_plus(terme)}"
-    else:
-        return []
-
-    async def _appel():
-        async with session.get(
-            url, headers=ENTETES_URLEBIRD, timeout=aiohttp.ClientTimeout(total=20)
-        ) as resp:
-            if resp.status != 200:
-                raise ErreurApp(f"Urlebird inaccessible ({resp.status})")
-            return await resp.text()
-
     try:
-        html = await _avec_retry(_appel, tentatives=2, etape=f"Urlebird {url}")
+        liens, _ = await _source_urlebird(session, auteur=auteur, requete=requete, limite=limite)
+        return liens
     except Exception as exc:  # noqa: BLE001
         logger.warning("[RsT] découverte Urlebird impossible pour %s : %s", auteur or requete, exc)
         return []
 
-    return _extraire_liens_urlebird(html, auteur_defaut=auteur)[:limite]
+
+@dataclass
+class EtatSourcesDecouverte:
+    """Mémoire des sources de découverte pour un travail RsT.
+
+    Une source en échec (403, timeout…) n'est plus tentée pendant le reste du
+    travail ; celle qui a fourni les derniers liens est interrogée en premier
+    pour les recherches suivantes. Le budget borne le temps total de découverte.
+    """
+    bloquees: set[str] = field(default_factory=set)
+    gagnante: str = ""
+    budget: float = DECOUVERTE_BUDGET
+
+
+def _libelle_origine(source: str, mode: str, auteur: str, requete: str) -> str:
+    """Origine honnête affichée dans « Vidéos trouvées par RsT »."""
+    noms = {
+        "duckduckgo": "DuckDuckGo",
+        "ecosia": "Ecosia",
+        "bing": "Bing",
+        "wayback": "Archive web",
+        "urlebird": "Urlebird",
+    }
+    libelle = noms.get(source, source or "source publique")
+    if source in {"duckduckgo", "ecosia", "bing"} and mode == "relais":
+        libelle += " via relais"
+    if auteur:
+        return f"{libelle} : publications de @{auteur.strip().lstrip('@')}"
+    return f"{libelle} : recherche « {requete.strip()} »"
+
+
+async def _decouvrir_publique(
+    session: aiohttp.ClientSession,
+    *,
+    auteur: str = "",
+    requete: str = "",
+    limite: int = 20,
+    etat: Optional[EtatSourcesDecouverte] = None,
+) -> list[dict]:
+    """Chaîne de découverte publique multi-sources, sans clé ni compte.
+
+    Essaie dans l'ordre plusieurs sources publiques jusqu'à obtenir de vrais liens
+    vidéo TikTok : moteurs de recherche (direct puis relais), archive Wayback pour
+    un auteur, miroir Urlebird en dernier recours. Renvoie [{'url': …, 'origin': …}] ;
+    chaque URL sera ensuite revalidée par TikWM /api/ avant toute sélection.
+    """
+    auteur = auteur.strip().lstrip("@")
+    requete = requete.strip()
+    if not auteur and not requete:
+        return []
+    etat = etat or EtatSourcesDecouverte()
+
+    sources = ["duckduckgo", "ecosia", "bing"]
+    if auteur:
+        sources.append("wayback")
+    sources.append("urlebird")
+    if etat.gagnante in sources:
+        sources.remove(etat.gagnante)
+        sources.insert(0, etat.gagnante)
+
+    decouverts: list[dict] = []
+    vus: set[str] = set()
+    debut_requete = time.monotonic()
+    for source in sources:
+        if source in etat.bloquees:
+            continue
+        if len(decouverts) >= limite:
+            break
+        # Deux garde-fous de temps : un budget par requête et un budget global,
+        # pour laisser à la sélection, au montage et à la livraison ce qu'il faut.
+        if time.monotonic() - debut_requete > DECOUVERTE_BUDGET_REQUETE:
+            logger.info("[Découverte] budget de requête épuisé : %s non tentée", source)
+            break
+        if etat.budget < 15.0:
+            logger.info("[Découverte] budget global épuisé : %s non tentée", source)
+            break
+        debut = time.monotonic()
+        try:
+            if source == "wayback":
+                liens, mode = await _decouvrir_wayback(session, auteur=auteur, limite=limite)
+            elif source == "urlebird":
+                liens, mode = await _source_urlebird(session, auteur=auteur, requete=requete, limite=limite)
+            else:
+                liens, mode = await _decouvrir_moteur(
+                    session, source, auteur=auteur, requete=requete, limite=limite
+                )
+        except Exception as exc:  # noqa: BLE001 — source bloquée : on passe à la suivante
+            etat.bloquees.add(source)
+            etat.budget -= time.monotonic() - debut
+            logger.warning("[Découverte] source %s bloquée : %s", source, exc)
+            continue
+        etat.budget -= time.monotonic() - debut
+        if not liens:
+            continue
+        etat.gagnante = source
+        origine = _libelle_origine(source, mode, auteur, requete)
+        for lien in liens:
+            vid = lien.rsplit("/", 1)[-1]
+            if vid in vus:
+                continue
+            vus.add(vid)
+            decouverts.append({"url": lien, "origin": origine})
+            if len(decouverts) >= limite:
+                break
+        logger.info("[Découverte] %s → %d lien(s) (%s)", source, len(liens), mode or "aucun résultat")
+    return decouverts
 
 
 def _normaliser_candidat_rst(video: Any, origine: str, nom: str = "") -> Optional[dict]:
@@ -1791,6 +2107,9 @@ async def _produire_rst(
         requetes_reelles: list[str] = []
         candidats: dict[str, dict] = {}
         tikwm_recherche_bloquee = False
+        # Mémoire des sources publiques : une source bloquée n'est plus tentée, la
+        # dernière qui a fourni des liens est interrogée en premier ensuite.
+        etat_sources = EtatSourcesDecouverte()
 
         async def accumuler(videos: Any, origine: str, nom: str = "") -> int:
             """Ajoute les vidéos réellement renvoyées et retourne le nombre de nouveautés."""
@@ -1804,24 +2123,26 @@ async def _produire_rst(
                     nouvelles += 1
             return nouvelles
 
-        async def valider_et_accumuler_urlebird(
-            liens_ub: list[str], origine: str, nom: str = "", limite_nouvelles: int = 20
+        async def valider_et_accumuler(
+            liens_publiques: list[dict], nom: str = "", limite_nouvelles: int = 20
         ) -> int:
-            """Revalide chaque lien Urlebird via TikWM /api/ pour récupérer métadonnées réelles."""
+            """Revalide chaque lien découvert via TikWM /api/ (identifiant, auteur,
+            titre et durée réels) — jamais de métadonnée inventée."""
             nouvelles = 0
-            for lien_ub in liens_ub:
+            for entree in liens_publiques:
                 if len(candidats) >= CONFIG.rst_candidats_max or nouvelles >= limite_nouvelles:
                     break
                 try:
-                    donnees_v = await _donnees_tikwm(session, "/", {"url": lien_ub, "hd": "1"})
-                    cand = _normaliser_candidat_rst(donnees_v, origine, nom)
+                    await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
+                    donnees_v = await _donnees_tikwm(session, "/", {"url": entree["url"], "hd": "1"})
+                    cand = _normaliser_candidat_rst(donnees_v, entree["origin"], nom)
                     if not cand or cand["video_id"] == identifiant_depart:
                         continue
                     if cand["video_id"] not in candidats:
                         candidats[cand["video_id"]] = cand
                         nouvelles += 1
                 except Exception as exc:  # noqa: BLE001
-                    logger.debug("[RsT] revalidation TikWM échouée pour %s : %s", lien_ub, exc)
+                    logger.debug("[RsT] revalidation TikWM échouée pour %s : %s", entree["url"], exc)
             return nouvelles
 
         def publier(detail: str, progression: int) -> None:
@@ -1847,23 +2168,25 @@ async def _produire_rst(
                         publications.get("videos") or [], f"publications de @{auteur}"
                     )
                 except ErreurTikwm403:
-                    logger.warning("[RsT] TikWM /user/posts bloqué (403) : repli Urlebird pour @%s", auteur)
+                    logger.warning("[RsT] TikWM /user/posts bloqué (403) : découverte publique pour @%s", auteur)
                     tikwm_recherche_bloquee = True
                 except ErreurApp as exc:
                     logger.warning("[RsT] publications de @%s indisponibles : %s", auteur, exc)
                     echecs_recherche.append(f"@{auteur} : {exc}")
 
-            if tikwm_recherche_bloquee:
+            # TikWM bloqué (403) ou fil de l'auteur vide : la chaîne publique prend
+            # le relais (moteurs de recherche, archive web, miroir Urlebird).
+            if tikwm_recherche_bloquee or nouvelles == 0:
                 contexte.update(
                     statut="searching", progress=26,
-                    detail=f"Recherche Urlebird : publications de @{auteur}",
+                    detail=f"Recherche publique : publications de @{auteur}",
                 )
-                liens_ub = await _decouvrir_urlebird(
-                    session, auteur=auteur, limite=min(CONFIG.rst_candidats_max, 40)
+                liens_publiques = await _decouvrir_publique(
+                    session, auteur=auteur, limite=min(CONFIG.rst_candidats_max, 40),
+                    etat=etat_sources,
                 )
-                nouvelles = await valider_et_accumuler_urlebird(
-                    liens_ub, f"Urlebird : publications de @{auteur}",
-                    limite_nouvelles=min(CONFIG.rst_candidats_max, 40),
+                nouvelles += await valider_et_accumuler(
+                    liens_publiques, limite_nouvelles=min(CONFIG.rst_candidats_max, 40)
                 )
 
             if nouvelles == 0 and not any(e.startswith(f"@{auteur}") for e in echecs_recherche):
@@ -1895,21 +2218,24 @@ async def _produire_rst(
                         resultats.get("videos") or [], f"recherche « {nom} »", nom
                     )
                 except ErreurTikwm403:
-                    logger.warning("[RsT] TikWM /feed/search bloqué (403) : repli Urlebird pour « %s »", nom)
+                    logger.warning("[RsT] TikWM /feed/search bloqué (403) : découverte publique pour « %s »", nom)
                     tikwm_recherche_bloquee = True
                 except ErreurApp as exc:
                     logger.warning("[RsT] recherche « %s » indisponible : %s", nom, exc)
                     echecs_recherche.append(f"« {nom} » : {exc}")
 
-            if tikwm_recherche_bloquee:
+            # TikWM bloqué (403) ou aucun résultat : la chaîne publique prend le relais.
+            if tikwm_recherche_bloquee or nouvelles == 0:
                 contexte.update(
                     statut="searching", progress=progression,
-                    detail=f"Recherche Urlebird {rang}/{len(noms)} : « {nom} »",
+                    detail=f"Recherche publique {rang}/{len(noms)} : « {nom} »",
                     noms=noms,
                 )
-                liens_ub = await _decouvrir_urlebird(session, requete=nom, limite=part_par_nom)
-                nouvelles = await valider_et_accumuler_urlebird(
-                    liens_ub, f"Urlebird : recherche « {nom} »", nom, limite_nouvelles=part_par_nom
+                liens_publiques = await _decouvrir_publique(
+                    session, requete=nom, limite=part_par_nom, etat=etat_sources
+                )
+                nouvelles += await valider_et_accumuler(
+                    liens_publiques, nom, limite_nouvelles=part_par_nom
                 )
 
             if nouvelles == 0 and not any(e.startswith(f"« {nom} »") for e in echecs_recherche):
@@ -1943,16 +2269,19 @@ async def _produire_rst(
                             resultats.get("videos") or [], f"recherche élargie « {mot_cle} »"
                         )
                     except ErreurTikwm403:
-                        logger.warning("[RsT] TikWM /feed/search bloqué (403) : repli Urlebird pour « %s »", mot_cle)
+                        logger.warning("[RsT] TikWM /feed/search bloqué (403) : découverte publique pour « %s »", mot_cle)
                         tikwm_recherche_bloquee = True
                     except ErreurApp as exc:
                         logger.warning("[RsT] recherche élargie « %s » indisponible : %s", mot_cle, exc)
                         echecs_recherche.append(f"« {mot_cle} » : {exc}")
 
-                if tikwm_recherche_bloquee:
-                    liens_ub = await _decouvrir_urlebird(session, requete=mot_cle, limite=20)
-                    nouvelles = await valider_et_accumuler_urlebird(
-                        liens_ub, f"Urlebird : recherche élargie « {mot_cle} »", limite_nouvelles=20
+                # TikWM bloqué (403) ou aucun résultat : la chaîne publique prend le relais.
+                if tikwm_recherche_bloquee or nouvelles == 0:
+                    liens_publiques = await _decouvrir_publique(
+                        session, requete=mot_cle, limite=20, etat=etat_sources
+                    )
+                    nouvelles += await valider_et_accumuler(
+                        liens_publiques, limite_nouvelles=20
                     )
 
                 if nouvelles == 0 and not any(e.startswith(f"« {mot_cle} »") for e in echecs_recherche):
@@ -2599,6 +2928,100 @@ async def configuration_publique() -> dict[str, Any]:
             "livraison": "separee",
         },
         "gemini_modeles": _modeles_gemini(),
+    }
+
+
+@app.get("/api/rst/sources")
+async def diagnostic_sources_rst(auteur: str = "", requete: str = "") -> dict[str, Any]:
+    """Vérifie en direct, depuis ce serveur, chaque source publique de découverte RsT.
+
+    Aucune donnée n'est inventée : pour chaque source, ce diagnostic dit si elle a
+    répondu depuis l'IP de ce serveur, combien de vrais liens vidéo TikTok elle a
+    donnés, et montre un exemple. C'est l'outil de vérification du déploiement :
+    en production, il révèle immédiatement quelles sources passent depuis Render.
+    """
+    auteur = auteur.strip().lstrip("@")[:40]
+    requete = requete.strip().lstrip("#")[:60]
+    if not auteur and not requete:
+        auteur = "tiktok"
+
+    async def sonder_source(session: aiohttp.ClientSession, nom: str) -> dict[str, Any]:
+        rapport: dict[str, Any] = {
+            "source": nom, "statut": "", "mode": "", "liens": 0,
+            "exemple": "", "detail": "", "duree_ms": 0,
+        }
+        debut = time.monotonic()
+        try:
+            if nom == "wayback":
+                liens, mode = await asyncio.wait_for(
+                    _decouvrir_wayback(session, auteur=auteur, limite=5), timeout=30.0
+                )
+            elif nom == "urlebird":
+                liens, mode = await asyncio.wait_for(
+                    _source_urlebird(session, auteur=auteur, requete=requete, limite=5), timeout=45.0
+                )
+            else:
+                liens, mode = await asyncio.wait_for(
+                    _decouvrir_moteur(session, nom, auteur=auteur, requete=requete, limite=5),
+                    timeout=60.0,
+                )
+        except Exception as exc:  # noqa: BLE001 — le diagnostic rapporte, il ne plante jamais
+            rapport["statut"] = "bloque"
+            rapport["detail"] = str(exc)[:200]
+        else:
+            rapport["mode"] = mode
+            rapport["liens"] = len(liens)
+            rapport["exemple"] = liens[0] if liens else ""
+            rapport["statut"] = "ok" if liens else "vide"
+        rapport["duree_ms"] = int((time.monotonic() - debut) * 1000)
+        return rapport
+
+    async def sonder_tikwm(session: aiohttp.ClientSession, chemin: str, parametres: dict) -> dict[str, Any]:
+        debut = time.monotonic()
+        rapport: dict[str, Any] = {
+            "endpoint": chemin, "statut": "", "videos": 0, "detail": "",
+            "duree_ms": 0,
+        }
+        try:
+            donnees = await asyncio.wait_for(
+                _donnees_tikwm(session, chemin, parametres), timeout=30.0
+            )
+            rapport["statut"] = "ok"
+            if chemin == "/":
+                rapport["videos"] = 1 if donnees.get("id") else 0
+            else:
+                rapport["videos"] = len((donnees or {}).get("videos") or [])
+        except ErreurTikwm403:
+            rapport["statut"] = "bloque (403)"
+        except Exception as exc:  # noqa: BLE001
+            rapport["statut"] = "erreur"
+            rapport["detail"] = str(exc)[:200]
+        rapport["duree_ms"] = int((time.monotonic() - debut) * 1000)
+        return rapport
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=75, connect=15)
+    ) as session:
+        sondes_sources = [
+            sonder_source(session, nom)
+            for nom in ("duckduckgo", "ecosia", "bing", "wayback", "urlebird")
+        ]
+        sondes_tikwm = [
+            sonder_tikwm(session, "/", {"url": "https://www.tiktok.com/@tiktok/video/7106594312292453675", "hd": "1"}),
+            sonder_tikwm(session, "/user/posts", {"unique_id": auteur or "tiktok", "count": "5"}),
+            sonder_tikwm(session, "/feed/search", {"keywords": requete or "paris", "count": "5"}),
+        ]
+        sources, tikwm = await asyncio.gather(
+            asyncio.gather(*sondes_sources), asyncio.gather(*sondes_tikwm)
+        )
+
+    return {
+        "ok": True,
+        "auteur": auteur,
+        "requete": requete,
+        "relais": RELAIS_LECTURE,
+        "tikwm": list(tikwm),
+        "sources": list(sources),
     }
 
 

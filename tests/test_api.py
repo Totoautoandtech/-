@@ -1,4 +1,6 @@
 import ast
+import base64
+import json
 import os
 import asyncio
 import time
@@ -28,6 +30,13 @@ def nettoyer_etat():
 def client():
     with TestClient(app.app) as test_client:
         yield test_client
+
+
+
+async def decouverte_publique_vide(_session, **_kwargs):
+    """Doublure : aucune source publique (moteurs, archive, miroirs) n'est contactée
+    dans les tests unitaires — la chaîne réelle a ses propres tests dédiés."""
+    return []
 
 
 def test_configuration_docker_et_render_contient_les_garde_fous():
@@ -367,6 +376,8 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
         raise AssertionError(f"endpoint TikWM inattendu : {chemin}")
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    # Aucune source publique n'est contactée dans les tests unitaires.
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
     async def script(_texte):
         return {"hook": "Hook RsT", "corps": "Corps du script RsT.", "mot_cle_broll": "cuisine maison"}
@@ -442,6 +453,8 @@ def test_rst_aucune_video_trouvee_echoue_honnetement(client, monkeypatch):
         return {"videos": []}
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    # Aucune source publique n'est contactée dans les tests unitaires.
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
     async def script(_texte):
         return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "rare"}
@@ -783,6 +796,8 @@ def test_rst_cinq_noms_lance_cinq_recherches_et_couvre_chaque_nom(client, monkey
         raise AssertionError(chemin)
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    # Aucune source publique n'est contactée dans les tests unitaires.
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
     async def script(_texte):
         return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "football"}
@@ -1017,6 +1032,8 @@ def test_rst_conserve_le_rendu_si_la_livraison_leve(client, monkeypatch):
         raise OSError("stockage complémentaire indisponible")
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    # Aucune source publique n'est contactée dans les tests unitaires.
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
     monkeypatch.setattr(app, "generer_script", script)
     monkeypatch.setattr(app, "extraire_noms_rst", noms)
     monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
@@ -1043,6 +1060,8 @@ def test_rst_livre_video_muette_script_et_voix_off(client, monkeypatch):
         ]}
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    # Aucune source publique n'est contactée dans les tests unitaires.
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
     async def script(_texte):
         return {"hook": "Le PSG gagne", "corps": "Un but décisif.", "mot_cle_broll": "football"}
@@ -1137,6 +1156,8 @@ def test_rst_recherche_vide_detaille_les_tentatives(client, monkeypatch):
         return {"videos": []}
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    # Aucune source publique n'est contactée dans les tests unitaires.
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
     async def script(_texte):
         return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "bordeaux"}
@@ -1175,6 +1196,8 @@ def test_rst_sans_aucun_nom_elargit_la_recherche_aux_mots_cles(client, monkeypat
         ]}
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    # Aucune source publique n'est contactée dans les tests unitaires.
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
     async def script(_texte):
         return {"hook": "H", "corps": "C.", "mot_cle_broll": "rangement"}
@@ -1219,6 +1242,8 @@ def test_rst_sans_requete_possible_le_dit_clairement(client, monkeypatch):
         return {"videos": []}
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    # Aucune source publique n'est contactée dans les tests unitaires.
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
     async def script(_texte):
         return {"hook": "H", "corps": "C.", "mot_cle_broll": ""}
@@ -1286,10 +1311,11 @@ def test_tikwm_403_ne_declenche_pas_de_retry_inutile():
     assert duree < 0.5
 
 
-def test_rst_bascule_sur_urlebird_si_tikwm_recherche_repond_403(client, monkeypatch):
-    """En cas de 403 sur /user/posts ou /feed/search, RsT bascule sur Urlebird et valide via /api/."""
+def test_rst_bascule_sur_les_sources_publiques_si_tikwm_recherche_repond_403(client, monkeypatch):
+    """En cas de 403 TikWM (blocage IP Render), RsT bascule sur la chaîne publique
+    et revalide chaque lien découvert via TikWM /api/ — origines réelles conservées."""
     appels_tikwm = []
-    appels_urlebird = []
+    appels_moteurs = []
 
     async def donnees_tikwm(_session, chemin, params):
         appels_tikwm.append((chemin, dict(params)))
@@ -1301,44 +1327,47 @@ def test_rst_bascule_sur_urlebird_si_tikwm_recherche_repond_403(client, monkeypa
                     "id": "111", "title": "Comparatif galaxya56 et honormagic7pro #tech",
                     "duration": 20, "author": {"unique_id": "techreview", "nickname": "Tech Review"},
                 }
-            if "7341000000000000001" in url:
-                # Vidéo trouvée sur Urlebird (auteur)
-                return {
-                    "id": "7341000000000000001", "title": "Unboxing Samsung Galaxy A56",
-                    "duration": 18, "author": {"unique_id": "techreview", "nickname": "Tech Review"},
-                }
-            if "7341000000000000002" in url:
-                # Vidéo trouvée sur Urlebird (nom 1)
-                return {
-                    "id": "7341000000000000002", "title": "Galaxy A56 test complet",
-                    "duration": 16, "author": {"unique_id": "reviewer2", "nickname": "Reviewer 2"},
-                }
-            if "7341000000000000003" in url:
-                # Vidéo trouvée sur Urlebird (nom 2)
-                return {
-                    "id": "7341000000000000003", "title": "Honor Magic 7 Pro camera test",
-                    "duration": 22, "author": {"unique_id": "reviewer3", "nickname": "Reviewer 3"},
-                }
+            catalogue = {
+                "7341000000000000001": ("techreview", "Unboxing Samsung Galaxy A56", 18),
+                "7341000000000000002": ("reviewer2", "Galaxy A56 test complet", 16),
+                "7341000000000000003": ("reviewer3", "Honor Magic 7 Pro camera test", 22),
+            }
+            for vid, (pseudo, titre, duree) in catalogue.items():
+                if vid in url:
+                    return {"id": vid, "title": titre, "duration": duree,
+                            "author": {"unique_id": pseudo, "nickname": pseudo}}
             raise app.ErreurApp(f"Vidéo inconnue : {url}")
 
         if chemin in {"/user/posts", "/feed/search"}:
-            # Simule le 403 réel de Render
+            # Simule le 403 réel observé sur Render
             raise app.ErreurTikwm403("TikWM inaccessible (403)")
         raise AssertionError(f"Chemin TikWM inattendu : {chemin}")
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
 
-    async def decouvrir_urlebird(_session, *, auteur="", requete="", limite=20):
-        appels_urlebird.append({"auteur": auteur, "requete": requete})
+    async def decouvrir_moteur(_session, moteur, *, auteur="", requete="", limite=20):
+        appels_moteurs.append({"moteur": moteur, "auteur": auteur, "requete": requete})
+        if moteur != "duckduckgo":
+            return [], ""
         if auteur == "techreview":
-            return ["https://www.tiktok.com/@techreview/video/7341000000000000001"]
-        if "Galaxy A56" in requete or "galaxya56" in requete:
-            return ["https://www.tiktok.com/@reviewer2/video/7341000000000000002"]
-        if "Honor Magic 7 Pro" in requete or "honormagic7pro" in requete:
-            return ["https://www.tiktok.com/@reviewer3/video/7341000000000000003"]
-        return []
+            return ["https://www.tiktok.com/@techreview/video/7341000000000000001"], "relais"
+        if requete == "Galaxy A56":
+            return ["https://www.tiktok.com/@reviewer2/video/7341000000000000002"], "direct"
+        if requete == "Honor Magic 7 Pro":
+            return ["https://www.tiktok.com/@reviewer3/video/7341000000000000003"], "relais"
+        return [], ""
 
-    monkeypatch.setattr(app, "_decouvrir_urlebird", decouvrir_urlebird)
+    monkeypatch.setattr(app, "_decouvrir_moteur", decouvrir_moteur)
+
+    async def wayback_bloque(_session, *, auteur="", limite=20):
+        raise app.ErreurApp("archive web indisponible")
+
+    monkeypatch.setattr(app, "_decouvrir_wayback", wayback_bloque)
+
+    async def urlebird_bloque(_session, *, auteur="", requete="", limite=20):
+        raise app.ErreurApp("Urlebird inaccessible (403)")
+
+    monkeypatch.setattr(app, "_source_urlebird", urlebird_bloque)
 
     async def script(_texte):
         return {"hook": "Le duel des smartphones 2026", "corps": "Galaxy A56 face au Magic 7 Pro.", "mot_cle_broll": "smartphone"}
@@ -1352,8 +1381,8 @@ def test_rst_bascule_sur_urlebird_si_tikwm_recherche_repond_403(client, monkeypa
 
     async def montage_fake(**kwargs):
         return {
-            "url": "/videos/rst-urlebird.mp4",
-            "path": app.DOSSIER_VIDEOS / "rst-urlebird.mp4",
+            "url": "/videos/rst-publique.mp4",
+            "path": app.DOSSIER_VIDEOS / "rst-publique.mp4",
             "sources": [], "source_errors": [],
         }
 
@@ -1372,22 +1401,271 @@ def test_rst_bascule_sur_urlebird_si_tikwm_recherche_repond_403(client, monkeypa
     assert reponse.status_code == 202, reponse.text
     job = _attendre_job(client, reponse.json()["job_id"])
     assert job["status"] == "completed", job.get("error")
-    assert job["url"] == "/videos/rst-urlebird.mp4"
+    assert job["url"] == "/videos/rst-publique.mp4"
 
-    # Vérification que Urlebird a bien été utilisé en repli
-    assert len(appels_urlebird) >= 2
-    assert any(a.get("auteur") == "techreview" for a in appels_urlebird)
+    # La chaîne publique a bien été utilisée : DuckDuckGo a répondu pour l'auteur
+    # et pour chaque nom du TOP N.
+    assert any(a.get("auteur") == "techreview" for a in appels_moteurs)
+    assert any(a.get("requete") == "Galaxy A56" for a in appels_moteurs)
+    assert any(a.get("requete") == "Honor Magic 7 Pro" for a in appels_moteurs)
 
-    # Vérification que les candidates portent l'origine Urlebird
+    # Chaque candidate porte son origine réelle (source + mode + recherche).
     trouvees = job["found_videos"]
-    assert len(trouvees) >= 2
-    assert all("Urlebird" in v["origin"] for v in trouvees)
+    assert len(trouvees) == 3
+    assert {v["origin"] for v in trouvees} == {
+        "DuckDuckGo via relais : publications de @techreview",
+        "DuckDuckGo : recherche « Galaxy A56 »",
+        "DuckDuckGo via relais : recherche « Honor Magic 7 Pro »",
+    }
+    # Les métadonnées viennent de TikWM /api/, jamais de la source de découverte.
+    assert {v["duration"] for v in trouvees} == {18.0, 16.0, 22.0}
 
-    # Vérification qu'après le premier 403, TikWM /user/posts ou /feed/search n'a pas été réessayé
+    # Chaque lien découvert a été revalidé par TikWM /api/ (la vidéo de départ incluse).
+    validations = [params for chemin, params in appels_tikwm if chemin == "/"]
+    assert len(validations) == 4
+
+    # Après le premier 403, les endpoints de recherche TikWM ne sont plus réessayés.
     appels_search = [c for c, _ in appels_tikwm if c in {"/user/posts", "/feed/search"}]
-    assert len(appels_search) <= 1
+    assert len(appels_search) == 1
 
     for url in (job.get("script_url"), job.get("voix_url")):
         if url:
             (app.DOSSIER_VIDEOS / Path(url).name).unlink(missing_ok=True)
 
+
+# ======================================================================================
+# DÉCOUVERTE PUBLIQUE MULTI-SOURCES : parseurs, relais, archive et chaîne complète
+# ======================================================================================
+
+
+class _PageWeb:
+    def __init__(self, statut=200, texte=""):
+        self.status = statut
+        self._texte = texte
+
+    async def text(self, **_kwargs):
+        return self._texte
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _SessionWeb:
+    """Session aiohttp factuelle : sert une page selon un motif d'URL, sans réseau."""
+
+    def __init__(self, pages):
+        self.pages = list(pages)  # liste de (motif d'URL, _PageWeb)
+        self.appels = []
+
+    def get(self, url, **_kwargs):
+        self.appels.append(url)
+        for motif, page in self.pages:
+            if motif in url:
+                return page
+        return _PageWeb(404, "")
+
+
+def test_page_bloquee_reconnait_les_defis_anti_bot():
+    assert app._page_bloquee("<html><title>Just a moment...</title></html>")
+    assert app._page_bloquee("Please complete the CAPTCHA to continue")
+    assert not app._page_bloquee("<html>10 résultats de recherche honnêtes</html>")
+
+
+def test_extraire_liens_tiktok_texte_decode_moteurs_sans_inventer():
+    # 1) Lien direct dans une page de résultats.
+    texte = '<a href="https://www.tiktok.com/@chef/video/7341000000000000001">vidéo</a>'
+    assert app._extraire_liens_tiktok_texte(texte) == [
+        "https://www.tiktok.com/@chef/video/7341000000000000001"
+    ]
+
+    # 2) DuckDuckGo emballe la destination en percent-encoding (uddg=…).
+    ddg = (
+        "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.tiktok.com%2F%40chef%2Fvideo%2F"
+        "7341000000000000002&rut=abc123"
+    )
+    assert app._extraire_liens_tiktok_texte(ddg) == [
+        "https://www.tiktok.com/@chef/video/7341000000000000002"
+    ]
+
+    # 3) Bing emballe la destination en base64 (u=a1…).
+    cible = "https://www.tiktok.com/@review/video/7341000000000000003"
+    jeton = "a1" + base64.urlsafe_b64encode(cible.encode()).decode().rstrip("=")
+    bing = f"https://www.bing.com/ck/a?!&&p=x&u={jeton}&ntb=1"
+    assert app._extraire_liens_tiktok_texte(bing) == [
+        "https://www.tiktok.com/@review/video/7341000000000000003"
+    ]
+
+    # 4) Filtre par auteur attendu : seules les vidéos de cet auteur sont retenues.
+    melange = (
+        "https://www.tiktok.com/@autre/video/7341000000000000004 "
+        "https://www.tiktok.com/@chef/video/7341000000000000005"
+    )
+    assert app._extraire_liens_tiktok_texte(melange, auteur_attendu="chef") == [
+        "https://www.tiktok.com/@chef/video/7341000000000000005"
+    ]
+
+    # 5) Aucun identifiant plausible : aucun lien, rien n'est fabriqué.
+    assert app._extraire_liens_tiktok_texte("tiktok.com/@x/video/123456 tiktok.com/@x/video/2.0.0.21") == []
+    assert app._extraire_liens_tiktok_texte("") == []
+
+
+def test_decouvrir_moteur_bascule_sur_le_relais_quand_l_ip_est_bloquee():
+    """IP datacenter bloquée (403) : la même recherche passe par le relais public."""
+    relais = _PageWeb(200, (
+        "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.tiktok.com%2F%40parisjet%2Fvideo%2F"
+        "7680000000000000001&rut=xyz"
+    ))
+    session = _SessionWeb([
+        ("r.jina.ai/", relais),
+        ("lite.duckduckgo.com", _PageWeb(403, "")),
+    ])
+    liens, mode = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="paris", limite=5))
+    assert mode == "relais"
+    assert liens == ["https://www.tiktok.com/@parisjet/video/7680000000000000001"]
+    assert len(session.appels) == 2  # direct bloqué puis relais
+
+
+def test_decouvrir_moteur_relais_apres_page_anti_bot():
+    """Une page 200 qui n'est qu'un défi anti-bot ne vaut pas un résultat : relais."""
+    antibot = _PageWeb(200, "<title>Just a moment...</title>challenge")
+    relais = _PageWeb(200, "tiktok.com/@chef/video/7341000000000000006")
+    session = _SessionWeb([
+        ("r.jina.ai/", relais),
+        ("lite.duckduckgo.com", antibot),
+    ])
+    liens, mode = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="chef", limite=5))
+    assert (liens, mode) == (["https://www.tiktok.com/@chef/video/7341000000000000006"], "relais")
+
+
+def test_decouvrir_moteur_sans_resultat_n_appelle_pas_le_relais():
+    """Le moteur a répondu « aucun résultat » : inutile de consommer le relais."""
+    session = _SessionWeb([("lite.duckduckgo.com", _PageWeb(200, "<html>No results found.</html>"))])
+    liens, mode = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="xyzrarissime", limite=5))
+    assert (liens, mode) == ([], "")
+    assert len(session.appels) == 1
+
+
+def test_decouvrir_wayback_ne_garde_que_les_vraies_videos_les_plus_recentes():
+    lignes = [
+        ["original", "timestamp"],
+        ["https://www.tiktok.com/@chef/video/2.0.0.21", "20250219135252"],           # bruit
+        ["https://www.tiktok.com/@chef/video/7341000000000000001", "20240101000000"],
+        ["https://www.tiktok.com/@chef/video/7341000000000000002?is_copy_url=1", "20260601120000"],
+        ["https://www.tiktok.com/@chef/video/7341000000000000001", "20250303000000"],  # doublon
+        ["https://www.tiktok.com/@chef/video/7341000000000000003", "20260202000000"],
+    ]
+    session = _SessionWeb([("web.archive.org", _PageWeb(200, json.dumps(lignes)))])
+    liens, mode = asyncio.run(app._decouvrir_wayback(session, auteur="chef", limite=2))
+    assert mode == "archive"
+    # Snapshots les plus récents d'abord, doublons fusionnés, bruit écarté.
+    assert liens == [
+        "https://www.tiktok.com/@chef/video/7341000000000000002",
+        "https://www.tiktok.com/@chef/video/7341000000000000003",
+    ]
+
+
+def test_chaine_publique_bloque_les_sources_en_echec_et_reessaie_la_gagnante(monkeypatch):
+    """Une source bloquée n'est plus tentée ; la source gagnante passe en premier."""
+    ordre = []
+
+    async def moteur(_session, nom, *, auteur="", requete="", limite=20):
+        ordre.append(nom)
+        if nom == "duckduckgo":
+            raise app.ErreurApp("403")
+        if nom == "ecosia":
+            return ["https://www.tiktok.com/@ecoloi/video/7341000000000000001"], "direct"
+        return [], ""
+
+    async def wayback(_session, *, auteur="", limite=20):
+        ordre.append("wayback")
+        raise app.ErreurApp("archive indisponible")
+
+    async def urlebird(_session, *, auteur="", requete="", limite=20):
+        ordre.append("urlebird")
+        raise app.ErreurApp("Urlebird inaccessible (403)")
+
+    monkeypatch.setattr(app, "_decouvrir_moteur", moteur)
+    monkeypatch.setattr(app, "_decouvrir_wayback", wayback)
+    monkeypatch.setattr(app, "_source_urlebird", urlebird)
+
+    etat = app.EtatSourcesDecouverte()
+    liens = asyncio.run(app._decouvrir_publique(None, requete="paris", limite=5, etat=etat))
+    assert ordre == ["duckduckgo", "ecosia", "bing", "urlebird"]
+    assert etat.bloquees == {"duckduckgo", "urlebird"}
+    assert etat.gagnante == "ecosia"
+    assert [l["origin"] for l in liens] == ["Ecosia : recherche « paris »"]
+
+    ordre.clear()
+    liens2 = asyncio.run(app._decouvrir_publique(None, requete="lyon", limite=5, etat=etat))
+    # La gagnante passe en tête, les bloquées ne sont plus tentées.
+    assert ordre == ["ecosia", "bing"]
+    assert [l["origin"] for l in liens2] == ["Ecosia : recherche « lyon »"]
+
+
+def test_chaine_publique_respecte_son_budget_de_temps():
+    """Budget épuisé : plus aucune source n'est contactée, la chaîne rend la main."""
+
+    async def moteur(_session, _nom, **_kwargs):
+        raise AssertionError("aucune source ne doit être contactée")
+
+    app_moteur, app_wayback, app_urlebird = app._decouvrir_moteur, app._decouvrir_wayback, app._source_urlebird
+    app._decouvrir_moteur = moteur
+    try:
+        etat = app.EtatSourcesDecouverte(budget=5.0)
+        liens = asyncio.run(app._decouvrir_publique(None, requete="paris", etat=etat))
+        assert liens == []
+    finally:
+        app._decouvrir_moteur, app._decouvrir_wayback, app._source_urlebird = app_moteur, app_wayback, app_urlebird
+
+
+def test_diagnostic_sources_rst_rapporte_l_etat_reel_depuis_le_serveur(client, monkeypatch):
+    """Le diagnostic /api/rst/sources dit, source par source, ce qui passe depuis
+    l'IP du serveur — sans jamais inventer de résultat."""
+    async def moteur(_session, nom, *, auteur="", requete="", limite=20):
+        if nom == "duckduckgo":
+            return ["https://www.tiktok.com/@tiktok/video/7341000000000000001"], "relais"
+        return [], ""
+
+    async def wayback(_session, *, auteur="", limite=20):
+        return [], "archive"
+
+    async def urlebird(_session, *, auteur="", requete="", limite=20):
+        raise app.ErreurApp("Urlebird inaccessible (403)")
+
+    async def donnees_tikwm(_session, chemin, _params):
+        if chemin == "/":
+            return {"id": "7106594312292453675", "title": "vraie vidéo", "duration": 24,
+                    "author": {"unique_id": "tiktok"}}
+        if chemin == "/user/posts":
+            raise app.ErreurTikwm403("TikWM inaccessible (403)")
+        return {"videos": []}
+
+    monkeypatch.setattr(app, "_decouvrir_moteur", moteur)
+    monkeypatch.setattr(app, "_decouvrir_wayback", wayback)
+    monkeypatch.setattr(app, "_source_urlebird", urlebird)
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    reponse = client.get("/api/rst/sources", params={"auteur": "tiktok"})
+    assert reponse.status_code == 200
+    rapport = reponse.json()
+    assert rapport["relais"].startswith("https://")
+
+    par_source = {s["source"]: s for s in rapport["sources"]}
+    assert par_source["duckduckgo"] == {
+        "source": "duckduckgo", "statut": "ok", "mode": "relais", "liens": 1,
+        "exemple": "https://www.tiktok.com/@tiktok/video/7341000000000000001",
+        "detail": "", "duree_ms": par_source["duckduckgo"]["duree_ms"],
+    }
+    assert par_source["ecosia"]["statut"] == "vide"
+    assert par_source["bing"]["statut"] == "vide"
+    assert par_source["wayback"]["statut"] == "vide"
+    assert par_source["urlebird"]["statut"] == "bloque"
+    assert "Urlebird" in par_source["urlebird"]["detail"]
+
+    tikwm = {t["endpoint"]: t for t in rapport["tikwm"]}
+    assert tikwm["/"]["statut"] == "ok" and tikwm["/"]["videos"] == 1
+    assert tikwm["/user/posts"]["statut"] == "bloque (403)"
+    assert tikwm["/feed/search"]["statut"] == "ok" and tikwm["/feed/search"]["videos"] == 0
