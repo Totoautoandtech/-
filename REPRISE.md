@@ -56,18 +56,23 @@ Pour **chaque** lien de départ :
    cherchés à travers une chaîne publique **sans clé ni compte** :
    - TikWM `/user/posts` et `/feed/search` d'abord — **403 depuis Render**
      (blocage de plage IP, constaté en production) ;
-   - moteurs publics, dans l'ordre : **SearXNG** (instances `opnxng.com` puis
-     `search.inetol.net` — elles agrègent Google CSE/Bing/DuckDuckGo depuis
-     leur propre serveur, donc c'est leur IP qui absorbe les blocages ;
-     requête **sans** `site:` car leurs moteurs le perdent : `tiktok.com
-     @auteur video` / `tiktok.com <nom> video` ; résultats du miroir
-     `sticktock.com` normalisés en `tiktok.com`), puis
-     **DuckDuckGo lite**, **Ecosia**, **Bing** (requête `site:tiktok.com …
-     video`), chacun **en direct puis via deux relais publics sans clé** — le
-     relais de lecture `r.jina.ai`, puis le relais de traduction Google
+   - moteurs publics, dans l'ordre : **DuckDuckGo lite** (premier : son passage
+     par le relais de traduction Google a été vérifié en production — vraies
+     URLs vidéo, dont `@parishilton/video/7655569088227380511`), puis
+     **SearXNG** (instances `opnxng.com` puis `search.inetol.net` — elles
+     agrègent Google CSE/Bing/DuckDuckGo depuis leur propre serveur, donc
+     c'est leur IP qui absorbe les blocages ; résultats du miroir
+     `sticktock.com` normalisés en `tiktok.com`), puis **Ecosia**, **Bing** ;
+     chacun **en direct puis via deux relais publics sans clé** — le relais
+     de lecture `r.jina.ai`, puis le relais de traduction Google
      `translate.goog` (un « 202 Accepted » est réessayé une fois, un 202 déjà
      servi est accepté) — quand l'IP du serveur est bloquée ou que la page
      reste vide ;
+   - requête **sans `site:`** pour DuckDuckGo et SearXNG (`tiktok.com @auteur
+     video` / `tiktok.com <nom> video`) : « site:tiktok.com/@… » rend une page
+     DDG vide quand elle est servie via le proxy de traduction Google, et les
+     moteurs agrégés par SearXNG perdent l'opérateur ; Ecosia et Bing gardent
+     « site:tiktok.com … » ;
    - un moteur **injoignable par tous les chemins** lève `ErreurApp` et passe
      au disjoncteur (`etat.bloquees`) : il n'est plus retenté pendant le
      travail — une page honnêtement vide, elle, ne bloque rien ;
@@ -158,10 +163,13 @@ TikWM `/api/` ok, `/user/posts` et `/feed/search` 403 ; DDG direct timeout puis
 renvoie 202 puis 400 selon l'hôte ; Ecosia 403 partout (disjoncteur) ; Bing répond
 vide honnêtement ; **Wayback OK** (5 liens `@parishilton` en 2,6 s) ; Urlebird 403.
 **SearXNG : les deux instances répondent depuis Render en ~1 s** (pages de 6,7 et
-9,1 Ko) mais 0 lien vidéo avec la requête `site:` — d'où le passage au format
-`tiktok.com @auteur video` (vérifié riche en URLs sticktock/tiktok depuis une IP
-datacenter, y compris pour les requêtes par nom). Le diagnostic affiche désormais
-les destinations d'une page sans lien vidéo (« destinations : … »).
+9,1 Ko) mais 0 lien vidéo avec la requête `site:` — d'où le format sans `site:`.
+**Découverte clé du 2 octobre** : DDG servi via `translate.goog` rend une page
+VRAIMENT vide pour `site:tiktok.com/@parishilton video` mais PLEINE de résultats
+pour `tiktok.com @parishilton video` (vidéo 7655569088227380511 confirmée, liens
+enveloppés `translate.google.com/website?…u=…uddg=<percent>` décodés par le
+parseur) — et ce relais répond 200 depuis Render. Le diagnostic affiche les
+destinations d'une page sans lien vidéo (« destinations : … »).
 Tous les tests automatisés reposent sur des doublures (`monkeypatch`) — aucun
 réseau n'est contacté dans les tests.
 
