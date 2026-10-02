@@ -1348,14 +1348,17 @@ def test_rst_bascule_sur_les_sources_publiques_si_tikwm_recherche_repond_403(cli
     async def decouvrir_moteur(_session, moteur, *, auteur="", requete="", limite=20):
         appels_moteurs.append({"moteur": moteur, "auteur": auteur, "requete": requete})
         if moteur != "duckduckgo":
-            return [], ""
+            return [], "", "aucun résultat"
         if auteur == "techreview":
-            return ["https://www.tiktok.com/@techreview/video/7341000000000000001"], "relais"
+            return (["https://www.tiktok.com/@techreview/video/7341000000000000001"],
+                    "relais jina", "relais de lecture : 1 lien")
         if requete == "Galaxy A56":
-            return ["https://www.tiktok.com/@reviewer2/video/7341000000000000002"], "direct"
+            return (["https://www.tiktok.com/@reviewer2/video/7341000000000000002"],
+                    "direct", "direct : 1 lien")
         if requete == "Honor Magic 7 Pro":
-            return ["https://www.tiktok.com/@reviewer3/video/7341000000000000003"], "relais"
-        return [], ""
+            return (["https://www.tiktok.com/@reviewer3/video/7341000000000000003"],
+                    "relais traduction", "relais de traduction : 1 lien")
+        return [], "", "aucun résultat"
 
     monkeypatch.setattr(app, "_decouvrir_moteur", decouvrir_moteur)
 
@@ -1415,7 +1418,7 @@ def test_rst_bascule_sur_les_sources_publiques_si_tikwm_recherche_repond_403(cli
     assert {v["origin"] for v in trouvees} == {
         "DuckDuckGo via relais : publications de @techreview",
         "DuckDuckGo : recherche « Galaxy A56 »",
-        "DuckDuckGo via relais : recherche « Honor Magic 7 Pro »",
+        "DuckDuckGo via relais de traduction : recherche « Honor Magic 7 Pro »",
     }
     # Les métadonnées viennent de TikWM /api/, jamais de la source de découverte.
     assert {v["duration"] for v in trouvees} == {18.0, 16.0, 22.0}
@@ -1522,9 +1525,10 @@ def test_decouvrir_moteur_bascule_sur_le_relais_quand_l_ip_est_bloquee():
         ("r.jina.ai/", relais),
         ("lite.duckduckgo.com", _PageWeb(403, "")),
     ])
-    liens, mode = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="paris", limite=5))
-    assert mode == "relais"
+    liens, mode, detail = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="paris", limite=5))
+    assert mode == "relais jina"
     assert liens == ["https://www.tiktok.com/@parisjet/video/7680000000000000001"]
+    assert "relais de lecture" in detail
     assert len(session.appels) == 2  # direct bloqué puis relais
 
 
@@ -1536,16 +1540,59 @@ def test_decouvrir_moteur_relais_apres_page_anti_bot():
         ("r.jina.ai/", relais),
         ("lite.duckduckgo.com", antibot),
     ])
-    liens, mode = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="chef", limite=5))
-    assert (liens, mode) == (["https://www.tiktok.com/@chef/video/7341000000000000006"], "relais")
+    liens, mode, _detail = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="chef", limite=5))
+    assert (liens, mode) == (["https://www.tiktok.com/@chef/video/7341000000000000006"], "relais jina")
 
 
 def test_decouvrir_moteur_sans_resultat_n_appelle_pas_le_relais():
     """Le moteur a répondu « aucun résultat » : inutile de consommer le relais."""
     session = _SessionWeb([("lite.duckduckgo.com", _PageWeb(200, "<html>No results found.</html>"))])
-    liens, mode = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="xyzrarissime", limite=5))
+    liens, mode, detail = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="xyzrarissime", limite=5))
     assert (liens, mode) == ([], "")
+    assert "aucun résultat" in detail
     assert len(session.appels) == 1
+
+
+def test_url_translate_construit_le_relais_google():
+    url = app._url_translate("https://lite.duckduckgo.com/lite/?q=site%3Atiktok.com+paris+video")
+    assert url == (
+        "https://lite-duckduckgo-com.translate.goog/lite/"
+        "?q=site%3Atiktok.com+paris+video&_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
+    )
+    sans_requete = app._url_translate("https://www.exemple.fr/page/")
+    assert sans_requete == "https://www-exemple-fr.translate.goog/page/?_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
+
+
+def test_decouvrir_moteur_bascule_sur_le_relais_de_traduction():
+    """Blocage doux : direct renvoie une page vide sans explication, le relais de
+    lecture reste vide aussi — le relais de traduction Google finit par passer."""
+    vide_suspect = _PageWeb(200, "<html><body>DuckDuckGo</body></html>")  # ni lien ni « no results »
+    jina_vide = _PageWeb(200, "Title: x\n\nMarkdown Content:\nrien ici")
+    traduction = _PageWeb(200, "tiktok.com/@chef/video/7341000000000000007")
+    session = _SessionWeb([
+        ("translate.goog", traduction),
+        ("r.jina.ai/", jina_vide),
+        ("lite.duckduckgo.com", vide_suspect),
+    ])
+    liens, mode, detail = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="chef", limite=5))
+    assert mode == "relais traduction"
+    assert liens == ["https://www.tiktok.com/@chef/video/7341000000000000007"]
+    assert "direct vide" in detail and "relais de lecture vide" in detail
+    assert len(session.appels) == 3  # direct, relais de lecture, relais de traduction
+
+
+def test_decouvrir_moteur_serp_vide_via_relais_arrete_la():
+    """Le relais de lecture obtient une vraie page « aucun résultat » : le moteur a
+    répondu, inutile de consommer le second relais pour la même recherche."""
+    vide_suspect = _PageWeb(200, "<html>en-tête seul</html>")
+    jina_vide_honnete = _PageWeb(200, "No results found for your search")
+    session = _SessionWeb([
+        ("r.jina.ai/", jina_vide_honnete),
+        ("lite.duckduckgo.com", vide_suspect),
+    ])
+    liens, mode, _detail = asyncio.run(app._decouvrir_moteur(session, "duckduckgo", requete="zzz", limite=5))
+    assert (liens, mode) == ([], "")
+    assert len(session.appels) == 2  # direct puis relais de lecture, pas de traduction
 
 
 def test_decouvrir_wayback_ne_garde_que_les_vraies_videos_les_plus_recentes():
@@ -1558,7 +1605,7 @@ def test_decouvrir_wayback_ne_garde_que_les_vraies_videos_les_plus_recentes():
         ["https://www.tiktok.com/@chef/video/7341000000000000003", "20260202000000"],
     ]
     session = _SessionWeb([("web.archive.org", _PageWeb(200, json.dumps(lignes)))])
-    liens, mode = asyncio.run(app._decouvrir_wayback(session, auteur="chef", limite=2))
+    liens, mode, _detail = asyncio.run(app._decouvrir_wayback(session, auteur="chef", limite=2))
     assert mode == "archive"
     # Snapshots les plus récents d'abord, doublons fusionnés, bruit écarté.
     assert liens == [
@@ -1576,8 +1623,9 @@ def test_chaine_publique_bloque_les_sources_en_echec_et_reessaie_la_gagnante(mon
         if nom == "duckduckgo":
             raise app.ErreurApp("403")
         if nom == "ecosia":
-            return ["https://www.tiktok.com/@ecoloi/video/7341000000000000001"], "direct"
-        return [], ""
+            return (["https://www.tiktok.com/@ecoloi/video/7341000000000000001"],
+                    "direct", "direct : 1 lien")
+        return [], "", "aucun résultat"
 
     async def wayback(_session, *, auteur="", limite=20):
         ordre.append("wayback")
@@ -1626,11 +1674,12 @@ def test_diagnostic_sources_rst_rapporte_l_etat_reel_depuis_le_serveur(client, m
     l'IP du serveur — sans jamais inventer de résultat."""
     async def moteur(_session, nom, *, auteur="", requete="", limite=20):
         if nom == "duckduckgo":
-            return ["https://www.tiktok.com/@tiktok/video/7341000000000000001"], "relais"
-        return [], ""
+            return (["https://www.tiktok.com/@tiktok/video/7341000000000000001"],
+                    "relais traduction", "relais de traduction : 1 lien")
+        return [], "", "direct : aucun résultat affiché par le moteur"
 
     async def wayback(_session, *, auteur="", limite=20):
-        return [], "archive"
+        return [], "archive", "0 vidéo archivée"
 
     async def urlebird(_session, *, auteur="", requete="", limite=20):
         raise app.ErreurApp("Urlebird inaccessible (403)")
@@ -1655,10 +1704,11 @@ def test_diagnostic_sources_rst_rapporte_l_etat_reel_depuis_le_serveur(client, m
 
     par_source = {s["source"]: s for s in rapport["sources"]}
     assert par_source["duckduckgo"] == {
-        "source": "duckduckgo", "statut": "ok", "mode": "relais", "liens": 1,
+        "source": "duckduckgo", "statut": "ok", "mode": "relais traduction", "liens": 1,
         "exemple": "https://www.tiktok.com/@tiktok/video/7341000000000000001",
-        "detail": "", "duree_ms": par_source["duckduckgo"]["duree_ms"],
+        "detail": "relais de traduction : 1 lien", "duree_ms": par_source["duckduckgo"]["duree_ms"],
     }
+    assert "aucun résultat" in par_source["ecosia"]["detail"]
     assert par_source["ecosia"]["statut"] == "vide"
     assert par_source["bing"]["statut"] == "vide"
     assert par_source["wayback"]["statut"] == "vide"

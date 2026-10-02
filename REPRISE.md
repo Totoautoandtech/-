@@ -57,8 +57,10 @@ Pour **chaque** lien de départ :
    - TikWM `/user/posts` et `/feed/search` d'abord — **403 depuis Render**
      (blocage de plage IP, constaté en production) ;
    - moteurs **DuckDuckGo lite**, **Ecosia**, **Bing** (requête
-     `site:tiktok.com … video`), chacun **en direct puis via le relais de
-     lecture public `r.jina.ai`** quand l'IP du serveur est bloquée ;
+     `site:tiktok.com … video`), chacun **en direct puis via deux relais
+     publics sans clé** — le relais de lecture `r.jina.ai`, puis le relais de
+     traduction Google `translate.goog` — quand l'IP du serveur est bloquée
+     ou que la page reste vide ;
    - **archive web Wayback** (CDX) pour les publications d'un auteur ;
    - miroir **Urlebird** en dernier recours (Cloudflare le bloque sur Render).
    Disjoncteurs : une source en échec n'est plus tentée pendant le travail, la
@@ -134,11 +136,15 @@ de développement, **pas** à un bug du code :
 En revanche, l'**outil de récupération de page HTTP du côté agent** sort sur une
 IP datacenter et a permis de vérifier en direct (2 octobre 2026) : TikWM `/api/`,
 `/user/posts` et `/feed/search` répondent depuis une IP datacenter générique,
-DuckDuckGo **lite** et Ecosia renvoient de vraies URLs vidéo TikTok pour
-`site:tiktok.com … video` (en direct **et** via `r.jina.ai`), le CDX Wayback
-liste les vidéos archivées d'un auteur, Urlebird passe avec un navigateur mais
-Bing ignore `site:`. **Seule la production peut confirmer le comportement exact
-depuis l'IP Render** : utiliser `GET /api/rst/sources` après chaque déploiement.
+DuckDuckGo **lite** renvoie de vraies URLs vidéo TikTok pour
+`site:tiktok.com … video` en direct, via `r.jina.ai` **et** via
+`translate.goog` (vérifié les deux le 2 octobre 2026) ; Ecosia marche depuis
+certaines IP mais bloque relais et datacenters ; Bing ignore `site:` ; le CDX
+Wayback liste les vidéos archivées d'un auteur (mais `r.jina.ai` est lui-même
+bloqué par archive.org) ; Urlebird passe avec un navigateur seulement.
+**Diagnostic réel du 2 octobre 2026 sur Render** (`GET /api/rst/sources`) :
+TikWM `/api/` ok, `/user/posts` et `/feed/search` 403, Ecosia/Bing vides,
+Wayback timeout, Urlebird 403 — les relais DDG portent donc la découverte.
 Tous les tests automatisés reposent sur des doublures (`monkeypatch`) — aucun
 réseau n'est contacté dans les tests.
 
