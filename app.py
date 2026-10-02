@@ -1698,45 +1698,121 @@ async def _lire_page_relais(
         return await resp.text(errors="replace")
 
 
+def _url_translate(url: str) -> str:
+    """Construit l'URL « traduite » servie par l'infrastructure Google : la page est
+    demandée par Google, pas par notre IP — un second relais public sans clé."""
+    parsee = urlparse(url)
+    hote = parsee.netloc.replace(":", "-").replace(".", "-")
+    chemin = parsee.path or "/"
+    base = f"https://{hote}.translate.goog{chemin}"
+    parametres = "_x_tr_sl=auto&_x_tr_tl=en&_x_tr_hl=en"
+    if parsee.query:
+        return f"{base}?{parsee.query}&{parametres}"
+    return f"{base}?{parametres}"
+
+
+async def _lire_page_translate(
+    session: aiohttp.ClientSession, url: str, *, delai: float = DECOUVERTE_DELAI_RELAIS
+) -> str:
+    """Demande la page via le proxy de traduction public de Google : c'est Google
+    qui contacte la source, ce qui contourne les blocages appliqués à la plage IP
+    du serveur (soft-block 200 vide, 403 Cloudflare…)."""
+    async with session.get(
+        _url_translate(url), headers=ENTETES_MOTEURS,
+        timeout=aiohttp.ClientTimeout(total=delai), allow_redirects=True,
+    ) as resp:
+        if resp.status != 200:
+            raise ErreurApp(f"relais de traduction inaccessible ({resp.status})")
+        return await resp.text(errors="replace")
+
+
+def _serp_vraiment_vide(texte: str) -> bool:
+    """Vrai si le moteur a clairement répondu « aucun résultat » (marqueur explicite).
+
+    Sans ce marqueur, une page vide est suspecte : certains blocages doux servent
+    une page 200 sans aucun résultat, et il faut alors passer par un relais.
+    """
+    if not texte:
+        return False
+    bas = texte.lower()
+    return any(
+        marqueur in bas
+        for marqueur in ("no results", "aucun résultat", "didn't match any documents", "keine ergebnisse")
+    )
+
+
 async def _decouvrir_moteur(
     session: aiohttp.ClientSession, moteur: str, *,
     auteur: str = "", requete: str = "", limite: int = 20,
-) -> tuple[list[str], str]:
-    """Interroge un moteur en direct puis, si l'IP du serveur est bloquée, via le relais.
+) -> tuple[list[str], str, str]:
+    """Interroge un moteur en direct puis, si l'IP du serveur est bloquée ou que la
+    page reste vide, via deux relais publics : le relais de lecture (r.jina.ai) et
+    le relais de traduction Google (translate.goog).
 
-    Renvoie (liens réels, mode) où mode vaut « direct », « relais » ou vide si le
-    moteur a répondu sans aucune vidéo TikTok pour cette recherche.
+    Renvoie (liens réels, mode, détail) : mode vaut « direct », « relais jina »,
+    « relais traduction » ou vide ; le détail décrit chaque tentative, pour le
+    diagnostic de production comme pour les journaux.
     """
     q = _requete_moteur(auteur, requete)
     if not q:
-        return [], ""
+        return [], "", "aucune requête constructible"
     url = _URLS_MOTEURS[moteur](q)
+    etapes: list[str] = []
+
+    # --- 1) Direct, depuis l'IP du serveur (Render) -----------------------------
     try:
+        debut = time.monotonic()
         texte = await _lire_page(session, url, entetes=ENTETES_MOTEURS, delai=DECOUVERTE_DELAI_MOTEUR)
+        duree = time.monotonic() - debut
         liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
         if liens:
-            return liens[:limite], "direct"
-        if not _page_bloquee(texte):
-            return [], ""  # le moteur a répondu : cette recherche n'a simplement aucun résultat
-    except Exception as exc:  # noqa: BLE001 — IP peut-être bloquée : le relais réessaie
-        logger.info("[Découverte] moteur %s injoignable en direct (%s) : essai via relais", moteur, exc)
+            return liens[:limite], "direct", f"direct : {len(liens)} lien(s) en {duree:.1f} s"
+        etapes.append(f"direct vide ({len(texte)} octets, {duree:.1f} s)")
+        # Page qui dit honnêtement « aucun résultat » et répond vite : inutile de
+        # consommer les relais pour la même recherche sur le même moteur.
+        if _serp_vraiment_vide(texte) and duree < 6.0:
+            return [], "", "direct : aucun résultat affiché par le moteur"
+        if _page_bloquee(texte):
+            etapes.append("page directe ressemble à un défi anti-bot")
+    except Exception as exc:  # noqa: BLE001 — IP probablement bloquée : on relaye
+        etapes.append(f"direct injoignable ({exc})")
+
+    # --- 2) Relais de lecture public (r.jina.ai) --------------------------------
     try:
         texte = await _lire_page_relais(session, url)
         liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
-        return (liens[:limite], "relais") if liens else ([], "")
+        if liens:
+            return liens[:limite], "relais jina", f"relais de lecture : {len(liens)} lien(s) ; " + " ; ".join(etapes)
+        if _serp_vraiment_vide(texte):
+            # Le moteur a répondu via le relais : la recherche est réellement vide.
+            return [], "", "relais de lecture : aucun résultat affiché par le moteur ; " + " ; ".join(etapes)
+        etapes.append("relais de lecture vide")
     except Exception as exc:  # noqa: BLE001
-        logger.info("[Découverte] moteur %s injoignable via relais : %s", moteur, exc)
-        return [], ""
+        etapes.append(f"relais de lecture injoignable ({exc})")
+
+    # --- 3) Relais de traduction Google (translate.goog) ------------------------
+    try:
+        texte = await _lire_page_translate(session, url)
+        liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
+        if liens:
+            return liens[:limite], "relais traduction", (
+                f"relais de traduction : {len(liens)} lien(s) ; " + " ; ".join(etapes)
+            )
+        etapes.append("relais de traduction vide")
+    except Exception as exc:  # noqa: BLE001
+        etapes.append(f"relais de traduction injoignable ({exc})")
+
+    return [], "", " ; ".join(etapes)
 
 
 async def _decouvrir_wayback(
     session: aiohttp.ClientSession, *, auteur: str, limite: int = 20
-) -> tuple[list[str], str]:
+) -> tuple[list[str], str, str]:
     """Archive web publique (Wayback Machine) : vraies pages vidéo TikTok de cet
     auteur déjà archivées, les snapshots les plus récents d'abord."""
     pseudo = auteur.strip().lstrip("@")
     if not pseudo:
-        return [], ""
+        return [], "", "aucun auteur"
     annee_min = max(2018, time.gmtime().tm_year - 3)
     parametres = {
         "url": f"tiktok.com/@{pseudo}/video/*",
@@ -1764,12 +1840,13 @@ async def _decouvrir_wayback(
         if vid not in archives or horodatage > archives[vid]:
             archives[vid] = horodatage  # on garde le snapshot le plus récent
     ordonnees = sorted(archives.items(), key=lambda c: c[1], reverse=True)[:limite]
-    return [f"https://www.tiktok.com/@{pseudo}/video/{vid}" for vid, _ in ordonnees], "archive"
+    liens = [f"https://www.tiktok.com/@{pseudo}/video/{vid}" for vid, _ in ordonnees]
+    return liens, "archive", f"{len(archives)} vidéo(s) archivée(s) depuis {annee_min}"
 
 
 async def _source_urlebird(
     session: aiohttp.ClientSession, *, auteur: str = "", requete: str = "", limite: int = 20
-) -> tuple[list[str], str]:
+) -> tuple[list[str], str, str]:
     """Miroir public Urlebird ; lève ErreurApp si Cloudflare bloque l'IP du serveur."""
     if auteur:
         pseudo = auteur.strip().lstrip("@")
@@ -1778,7 +1855,7 @@ async def _source_urlebird(
         terme = requete.strip().lstrip("#")
         url = f"https://urlebird.com/search/?q={quote_plus(terme)}"
     else:
-        return [], ""
+        return [], "", "aucune requête constructible", "aucune requête constructible"
 
     async def _appel():
         async with session.get(
@@ -1790,7 +1867,8 @@ async def _source_urlebird(
             return await resp.text()
 
     html = await _avec_retry(_appel, tentatives=2, etape=f"Urlebird {url}")
-    return _extraire_liens_urlebird(html, auteur_defaut=auteur)[:limite], "direct"
+    liens = _extraire_liens_urlebird(html, auteur_defaut=auteur)[:limite]
+    return liens, "direct", f"page Urlebird de {len(html)} octets"
 
 
 async def _decouvrir_urlebird(
@@ -1802,7 +1880,7 @@ async def _decouvrir_urlebird(
 ) -> list[str]:
     """Découvre de vrais liens TikTok via les pages publiques Urlebird (aucun compte ni clé)."""
     try:
-        liens, _ = await _source_urlebird(session, auteur=auteur, requete=requete, limite=limite)
+        liens, _, _ = await _source_urlebird(session, auteur=auteur, requete=requete, limite=limite)
         return liens
     except Exception as exc:  # noqa: BLE001
         logger.warning("[RsT] découverte Urlebird impossible pour %s : %s", auteur or requete, exc)
@@ -1832,8 +1910,10 @@ def _libelle_origine(source: str, mode: str, auteur: str, requete: str) -> str:
         "urlebird": "Urlebird",
     }
     libelle = noms.get(source, source or "source publique")
-    if source in {"duckduckgo", "ecosia", "bing"} and mode == "relais":
+    if mode == "relais jina":
         libelle += " via relais"
+    elif mode == "relais traduction":
+        libelle += " via relais de traduction"
     if auteur:
         return f"{libelle} : publications de @{auteur.strip().lstrip('@')}"
     return f"{libelle} : recherche « {requete.strip()} »"
@@ -1887,11 +1967,13 @@ async def _decouvrir_publique(
         debut = time.monotonic()
         try:
             if source == "wayback":
-                liens, mode = await _decouvrir_wayback(session, auteur=auteur, limite=limite)
+                liens, mode, detail = await _decouvrir_wayback(session, auteur=auteur, limite=limite)
             elif source == "urlebird":
-                liens, mode = await _source_urlebird(session, auteur=auteur, requete=requete, limite=limite)
+                liens, mode, detail = await _source_urlebird(
+                    session, auteur=auteur, requete=requete, limite=limite
+                )
             else:
-                liens, mode = await _decouvrir_moteur(
+                liens, mode, detail = await _decouvrir_moteur(
                     session, source, auteur=auteur, requete=requete, limite=limite
                 )
         except Exception as exc:  # noqa: BLE001 — source bloquée : on passe à la suivante
@@ -1901,6 +1983,8 @@ async def _decouvrir_publique(
             continue
         etat.budget -= time.monotonic() - debut
         if not liens:
+            if detail:
+                logger.info("[Découverte] %s : %s", source, detail)
             continue
         etat.gagnante = source
         origine = _libelle_origine(source, mode, auteur, requete)
@@ -2953,26 +3037,27 @@ async def diagnostic_sources_rst(auteur: str = "", requete: str = "") -> dict[st
         debut = time.monotonic()
         try:
             if nom == "wayback":
-                liens, mode = await asyncio.wait_for(
-                    _decouvrir_wayback(session, auteur=auteur, limite=5), timeout=30.0
+                liens, mode, detail = await asyncio.wait_for(
+                    _decouvrir_wayback(session, auteur=auteur, limite=5), timeout=35.0
                 )
             elif nom == "urlebird":
-                liens, mode = await asyncio.wait_for(
-                    _source_urlebird(session, auteur=auteur, requete=requete, limite=5), timeout=45.0
+                liens, mode, detail = await asyncio.wait_for(
+                    _source_urlebird(session, auteur=auteur, requete=requete, limite=5), timeout=50.0
                 )
             else:
-                liens, mode = await asyncio.wait_for(
+                liens, mode, detail = await asyncio.wait_for(
                     _decouvrir_moteur(session, nom, auteur=auteur, requete=requete, limite=5),
-                    timeout=60.0,
+                    timeout=70.0,
                 )
         except Exception as exc:  # noqa: BLE001 — le diagnostic rapporte, il ne plante jamais
             rapport["statut"] = "bloque"
-            rapport["detail"] = str(exc)[:200]
+            rapport["detail"] = str(exc)[:300]
         else:
             rapport["mode"] = mode
             rapport["liens"] = len(liens)
             rapport["exemple"] = liens[0] if liens else ""
             rapport["statut"] = "ok" if liens else "vide"
+            rapport["detail"] = detail[:300]
         rapport["duree_ms"] = int((time.monotonic() - debut) * 1000)
         return rapport
 
