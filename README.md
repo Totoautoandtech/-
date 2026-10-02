@@ -22,10 +22,19 @@ La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **
    l'interface. **Chaque nom donne lieu à sa propre recherche TikTok**, les candidates sont réparties
    nom par nom (tour de rôle) pour qu'aucun nom n'écrase les autres, puis RsT retient jusqu'à 20 bonnes
    sources dans les limites de durée et de temps Render et lance le montage en **plans de 5 s maximum**.
-   La liste « Vidéos trouvées par RsT » affiche durée, auteur, origine, nom recherché et raison
-   d'exclusion. Si l'IA ne trouve aucun nom, RsT retombe sur les mots-clés réellement présents dans la
-   légende (hashtags, thème visuel, mots fréquents). Aucune vidéo, résultat ou miniature inventé : si
-   TikWM ne renvoie rien, le travail échoue avec un message qui détaille les recherches tentées.
+   La recherche explore les publications du créateur de départ et chaque nom du TOP N à travers une
+   **chaîne publique multi-sources** tolérante aux plages IP cloud : TikWM d'abord, puis — si ses
+   endpoints de recherche répondent 403 depuis Render — les moteurs **DuckDuckGo, Ecosia et Bing**
+   (en direct, puis via un **relais de lecture public** sans clé), l'**archive web Wayback** pour
+   l'auteur, et le miroir **Urlebird** en dernier recours. Une source bloquée n'est plus retentée,
+   celle qui a répondu passe en premier, et un budget de temps protège le montage. **Chaque lien
+   découvert est revalidé par TikWM `/api/`** (identifiant, auteur, titre, durée réels) avant toute
+   sélection — l'origine réelle de chaque vidéo est conservée dans « Vidéos trouvées par RsT », qui
+   affiche durée, auteur, origine, nom recherché et raison d'exclusion. Si l'IA ne trouve aucun nom,
+   RsT retombe sur les mots-clés réellement présents dans la légende (hashtags, thème visuel, mots
+   fréquents). Aucune vidéo, résultat ou miniature inventé : si aucune source ne donne rien, le
+   travail échoue avec un message qui détaille les recherches tentées. Le diagnostic
+   `GET /api/rst/sources` vérifie en direct, depuis le serveur, quelle source passe.
    **Livraison séparée** : la vidéo finale reste **muette**, tandis que le **script `.txt`** et une
    **voix off `.mp3` générée** se téléchargent à côté, depuis la carte du travail.
 3. **Montage multi-source** — jusqu'à 20 liens collés manuellement, organisés en onglets Script / Sources / Référence / Réglages, avec les boutons Coller, Valider et Tout supprimer. La validation affiche l'état réel de chaque source (accessible, durée, dimensions, codec, erreur).
@@ -98,6 +107,7 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 | `FFMPEG_TIMEOUT_SECONDES` | `240` | timeout d'une commande FFmpeg |
 | `GEMINI_TIMEOUT_SECONDES` | `120` | timeout d'un appel Gemini |
 | `TIKWM_TIMEOUT_SECONDES` | `30` | timeout TikWM |
+| `RELAIS_LECTURE_URL` | `https://r.jina.ai/` | relais de lecture public utilisé par la découverte RsT quand l'IP du serveur est bloquée (gratuit, sans clé) |
 | `DOWNLOAD_TIMEOUT_SECONDES` | `120` | timeout par téléchargement |
 | `GEMINI_ANALYSES_CONCURRENTES` | `1` | `1` conseillé avec 512 Mo, maximum `2` |
 | `BUDGET_DISQUE_SOURCES_MO` | `700` | budget temporaire cumulé |

@@ -51,16 +51,35 @@ Pour **chaque** lien de départ :
 3. **TOP N** : Gemini extrait les **3 ou 5 noms** réellement cités (personnes,
    lieux, marques, œuvres…). Le nombre est choisi dans l'interface.
    → `extraire_noms_rst()` dans `app.py`.
-4. **Recherche par nom & repli Urlebird** : une requête TikWM `/feed/search` **par nom**,
-   plus les publications du créateur de départ. Si `/feed/search` ou `/user/posts` répond
-   403 (blocage IP Render), le pipeline bascule automatiquement vers la découverte publique
-   Urlebird par auteur ou mot-clé, puis revalide chaque lien trouvé via TikWM `/api/`
-   sans rien inventer.
-5. **Répartition** : `_repartir_par_nom()` sert les candidates nom par nom, à tour
+4. **Découverte multi-sources résiliente** : les publications du créateur de
+   départ (`@auteur`) et chaque nom du TOP N (puis les mots-clés de repli) sont
+   cherchés à travers une chaîne publique **sans clé ni compte** :
+   - TikWM `/user/posts` et `/feed/search` d'abord — **403 depuis Render**
+     (blocage de plage IP, constaté en production) ;
+   - moteurs **DuckDuckGo lite**, **Ecosia**, **Bing** (requête
+     `site:tiktok.com … video`), chacun **en direct puis via le relais de
+     lecture public `r.jina.ai`** quand l'IP du serveur est bloquée ;
+   - **archive web Wayback** (CDX) pour les publications d'un auteur ;
+   - miroir **Urlebird** en dernier recours (Cloudflare le bloque sur Render).
+   Disjoncteurs : une source en échec n'est plus tentée pendant le travail, la
+   dernière source gagnante passe en tête, budget de temps global (150 s) et
+   par requête (45 s). → `_decouvrir_publique()` dans `app.py`.
+5. **Revalidation stricte** : chaque URL découverte est revalidée par TikWM
+   `/api/` (identifiant, auteur, titre et durée **réels**), à la cadence de
+   1 req/s. L'origine réelle (source + mode + recherche) est conservée dans
+   `found_videos`. Rien n'est jamais inventé.
+6. **Répartition** : `_repartir_par_nom()` sert les candidates nom par nom, à tour
    de rôle, pour qu'un nom prolifique ne monopolise pas le quota de sources.
-6. **Sélection** : jusqu'à 20 sources dans les limites de durée et de temps Render.
-7. **Montage** en **plans de 5 s maximum** (`ConfigurationMontage.duree_max_plan`).
-8. **Livraison séparée** : voir §4.
+7. **Sélection** : jusqu'à 20 sources dans les limites de durée et de temps Render.
+8. **Montage** en **plans de 5 s maximum** (`RST_DUREE_MAX_PLAN = 5.0`).
+9. **Livraison séparée** : voir §4.
+
+### Diagnostic en production
+
+`GET /api/rst/sources?auteur=…&requete=…` sonde en direct, **depuis l'IP du
+serveur**, chaque source (TikWM, moteurs direct/relais, Wayback, Urlebird) et
+retourne pour chacune : statut (`ok` / `vide` / `bloque`), mode, nombre de liens
+et un exemple. C'est l'outil pour vérifier un déploiement en une requête.
 
 ### Si la recherche ne donne rien
 
@@ -102,39 +121,42 @@ faire expirer un rendu déjà terminé. Ces chemins d'échec sont testés.
 
 ## 5. Limites du sandbox — NE PAS REFAIRE CES ESSAIS
 
-Ces trois points ont été vérifiés et re-vérifiés. Ils sont dus à l'environnement
+Ces points ont été vérifiés et re-vérifiés. Ils sont dus à l'environnement
 de développement, **pas** à un bug du code :
 
 | Élément | État dans le sandbox | Conséquence |
 |---|---|---|
-| **TikWM** | injoignable | aucun appel RsT réel possible |
+| **Réseau sortant** (`curl`, aiohttp) | **totalement bloqué** | aucun appel réel possible, même vers Google |
 | **`speech.platform.bing.com`** (edge-tts) | injoignable | aucun MP3 réel généré |
 | **`ffmpeg` / `ffprobe`** | **absents** | aucun rendu vidéo réel |
-| **`*.onrender.com`** | bloqué par l'allowlist réseau | `curl` vers la prod échoue |
+| **`*.onrender.com`** | bloqué pour `curl` | utiliser l'outil de récupération HTTP côté agent |
 
-Conséquence directe : **le pipeline RsT n'a jamais tourné en conditions réelles.**
-Les en-têtes TikWM corrigent le diagnostic le plus probable des 403, mais ne
-peuvent pas exclure un blocage de plage d'IP Render : seul un vrai lancement RsT
-le confirmera. Tous les tests réseau reposent sur des doublures (`monkeypatch`).
-Le premier vrai test se fait **sur Render**, où ffmpeg est installé (voir le
-`Dockerfile`) et le réseau est ouvert.
-
-Pour lire la production depuis une session d'agent, `curl` ne marche pas, mais un
-outil de récupération de page HTTP du côté agent y accède.
+En revanche, l'**outil de récupération de page HTTP du côté agent** sort sur une
+IP datacenter et a permis de vérifier en direct (2 octobre 2026) : TikWM `/api/`,
+`/user/posts` et `/feed/search` répondent depuis une IP datacenter générique,
+DuckDuckGo **lite** et Ecosia renvoient de vraies URLs vidéo TikTok pour
+`site:tiktok.com … video` (en direct **et** via `r.jina.ai`), le CDX Wayback
+liste les vidéos archivées d'un auteur, Urlebird passe avec un navigateur mais
+Bing ignore `site:`. **Seule la production peut confirmer le comportement exact
+depuis l'IP Render** : utiliser `GET /api/rst/sources` après chaque déploiement.
+Tous les tests automatisés reposent sur des doublures (`monkeypatch`) — aucun
+réseau n'est contacté dans les tests.
 
 ---
 
 ## 6. Tests
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q                    # 88 tests
+python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt -r requirements.txt
+.venv/bin/python -m pytest -q                    # 97 tests
 node --test tests/js/job-utils.test.cjs          # 7 tests
 ```
 
 Les deux doivent être verts avant toute publication.
 
-- `tests/test_api.py` — API, RsT TOP N, recherche vide, livraison, voix off, Gemini 503, thème.
+- `tests/test_api.py` — API, RsT TOP N, chaîne de découverte publique (parseurs
+  moteurs/relais/archive, disjoncteurs, replis 403, diagnostic `/api/rst/sources`),
+  recherche vide, livraison, voix off, Gemini 503, thème.
 - `tests/test_montage.py` — liens, plans de 5 s, transitions, audio.
 - `tests/js/job-utils.test.cjs` — persistance des travaux RsT côté navigateur.
 
