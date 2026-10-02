@@ -1554,12 +1554,16 @@ def test_decouvrir_moteur_sans_resultat_n_appelle_pas_le_relais():
 
 
 def test_requete_moteur_adapte_le_format_au_moteur():
-    """SearXNG agrège des moteurs qui perdent l'opérateur « site: » : sa requête
-    cible TikTok par mots-clés ; les moteurs classiques gardent « site: »."""
-    assert app._requete_moteur("chef", "", "duckduckgo") == "site:tiktok.com/@chef video"
+    """DuckDuckGo et SearXNG ciblent TikTok par mots-clés : « site: » rend la page
+    vide sur DDG servi via le relais de traduction, et leurs moteurs agrégés le
+    perdent. Ecosia et Bing gardent « site: »."""
+    assert app._requete_moteur("chef", "", "duckduckgo") == "tiktok.com @chef video"
     assert app._requete_moteur("chef", "", "searxng") == "tiktok.com @chef video"
+    assert app._requete_moteur("chef", "", "ecosia") == "site:tiktok.com/@chef video"
+    assert app._requete_moteur("chef", "", "bing") == "site:tiktok.com/@chef video"
     assert app._requete_moteur("", "Galaxy A56", "bing") == "site:tiktok.com Galaxy A56 video"
     assert app._requete_moteur("", "Galaxy A56", "searxng") == "tiktok.com Galaxy A56 video"
+    assert app._requete_moteur("", "Galaxy A56", "duckduckgo") == "tiktok.com Galaxy A56 video"
     assert app._requete_moteur("", "  #paris  ", "ecosia") == "site:tiktok.com paris video"
     assert app._requete_moteur("", "", "searxng") == ""
 
@@ -1751,14 +1755,14 @@ def test_chaine_publique_bloque_les_sources_en_echec_et_reessaie_la_gagnante(mon
 
     etat = app.EtatSourcesDecouverte()
     liens = asyncio.run(app._decouvrir_publique(None, requete="paris", limite=5, etat=etat))
-    assert ordre == ["searxng", "duckduckgo", "ecosia", "bing", "urlebird"]
+    assert ordre == ["duckduckgo", "searxng", "ecosia", "bing", "urlebird"]
     assert etat.bloquees == {"duckduckgo", "urlebird"}
     assert etat.gagnante == "ecosia"
     assert [l["origin"] for l in liens] == ["Ecosia : recherche « paris »"]
 
     ordre.clear()
     liens2 = asyncio.run(app._decouvrir_publique(None, requete="lyon", limite=5, etat=etat))
-    # La gagnante passe en tête, les bloquées ne sont plus tentées.
+    # La gagnante passe en tête, les bloquées (duckduckgo, urlebird) ne le sont plus.
     assert ordre == ["ecosia", "searxng", "bing"]
     assert [l["origin"] for l in liens2] == ["Ecosia : recherche « lyon »"]
 

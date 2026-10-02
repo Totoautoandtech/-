@@ -1663,12 +1663,13 @@ def _extraire_liens_tiktok_texte(texte: str, auteur_attendu: str = "") -> list[s
 def _requete_moteur(auteur: str, requete: str, moteur: str = "") -> str:
     """Recherche qui cible les pages vidéo TikTok, par auteur ou par nom.
 
-    SearXNG agrège des moteurs qui gèrent mal l'opérateur « site: » (Bing
-    l'ignore, d'autres le perdent et rendent des résultats génériques) : pour
-    lui, TikTok est ciblé par les mots-clés seuls. Le filtre final reste
+    Les moteurs qui perdent l'opérateur « site: » (SearXNG l'agrège, Bing
+    l'ignore) ou qui le servent mal aux requêteurs relais (DuckDuckGo via le
+    proxy de traduction Google rend une page vide avec « site:tiktok.com/@… »,
+    et riche sans) ciblent TikTok par mots-clés seuls. Le filtre final reste
     l'extraction de vrais liens vidéo, puis la revalidation TikWM /api/.
     """
-    avec_site = moteur != "searxng"
+    avec_site = moteur in {"ecosia", "bing"}
     if auteur:
         pseudo = auteur.strip().lstrip("@")
         if avec_site:
@@ -2025,7 +2026,7 @@ async def _decouvrir_publique(
         return []
     etat = etat or EtatSourcesDecouverte()
 
-    sources = ["searxng", "duckduckgo", "ecosia", "bing"]
+    sources = ["duckduckgo", "searxng", "ecosia", "bing"]
     if auteur:
         sources.append("wayback")
     sources.append("urlebird")
