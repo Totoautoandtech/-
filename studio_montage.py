@@ -57,6 +57,8 @@ class ConfigurationMontage:
     crf: int = 23
     threads_ffmpeg: int = 1
     autoriser_1080: bool = False
+    # Mode RsT strict : refuser un plan « beau mais hors sujet » plutôt que le monter.
+    exiger_pertinence_visuelle: bool = False
 
 
 class Rapporteur:
@@ -396,9 +398,17 @@ PROMPT_ANALYSE = """Tu analyses un aperçu vidéo léger mais couvrant TOUTE la 
 Parties du script : {segments}
 Retourne UNIQUEMENT cet objet JSON strict :
 {{"scenes":[{{"debut":0.0,"fin":5.0,"sujet":"...","action_mouvement":"...","qualite":"bonne|moyenne|faible","nettete":0.8,"cadrage":"...","texte_visible":false,"watermark":false,"pertinence_script":[{{"id":0,"score":0.8}}],"rythme":"dynamique|modéré|statique","transition_recommandee":"cut|fade|slide|zoom","score_pertinence":0.8}}]}}
-Contraintes : temps réels dans [0,{duree:.2f}], scènes intéressantes seulement, actions complètes si possible, score 0..1. Décris le sujet, l'action, la qualité/netteté, le cadrage, tout texte/watermark, la pertinence POUR CHAQUE partie concernée, le rythme et la transition. N'invente rien et n'ajoute aucune clé."""
+Contraintes : temps réels dans [0,{duree:.2f}], scènes intéressantes seulement, actions complètes si possible, score 0..1. Décris le sujet, l'action, la qualité/netteté, le cadrage, tout texte/watermark, la pertinence POUR CHAQUE partie concernée, le rythme et la transition. N'invente rien et n'ajoute aucune clé.
+PERTINENCE VISUELLE STRICTE (critère le plus important) :
+- N'accorde JAMAIS un bon score à un plan seulement parce qu'il est esthétique ou bien filmé : la beauté ne fait pas la pertinence.
+- Un paysage, bâtiment, skyline, ville, voyage ou b-roll générique, sans personne, objet ou action lié au script, doit recevoir un score_pertinence et des pertinence_script à 0.25 MAXIMUM.
+- Sujet tech/téléphone/produit : privilégie uniquement les plans montrant le téléphone, l'écran, le produit nommé, une prise en main, une démonstration ou une comparaison réelle.
+- Un plan de skyline, gratte-ciel ou tour (par exemple Burj Khalifa, Dubaï) sur un script de téléphone doit être noté FAIBLE, sauf si le script parle explicitement de Dubaï ou de ce bâtiment.
+- pertinence_script mesure le lien DIRECT entre l'image et le texte du segment, jamais la qualité technique de l'image.
+"""
 
 PROMPT_STYLE = """Analyse uniquement la GRAMMAIRE VISUELLE de cette vidéo de référence, jamais son contenu créatif. Ne propose pas d'en recopier les images, le son, le logo ou le watermark.
+La référence sert uniquement à décrire un STYLE de montage imitable : rythme, durée moyenne des plans, transitions, style de sous-titres (position, taille, couleurs, accent). Ses images, son sujet et son contenu ne doivent jamais être réutilisés dans le montage.
 Retourne UNIQUEMENT un objet JSON strict avec : duree_moyenne_plans (secondes), rythme, coupes (cut/fade/slide/zoom), zooms_legers (booléen), transitions, style_police (sans/serif/mono/arrondie), position_sous_titres (haut/centre/bas), taille_sous_titres (ratio 0.03..0.10 de la hauteur), couleur_texte (#RRGGBB), couleur_contour, couleur_accent, epaisseur_contour (1..8), ombre (booléen), mots_par_ecran (1..8), apparition (pop/progressive/fondu/simple), mots_mis_en_avant (booléen). Aucune autre clé."""
 
 
@@ -532,6 +542,15 @@ ECHELLES_INTENSITE_TRANSITIONS = {0: 0.15, 1: 0.6, 2: 1.0, 3: 1.35}
 DUREE_MAX_PLAN_DEFAUT = 5.0
 DUREE_MIN_PLAN = 0.55
 
+# Mode RsT « pertinence visuelle stricte » : pertinence minimale (0..1) exigée d'une
+# scène pour rester candidate, côté accroche puis côté corps du script. En dessous, la
+# scène est jugée hors sujet — un plan beau mais sans rapport avec le script ne doit
+# jamais être monté. Ces seuils s'appliquent à la pertinence brute renvoyée par
+# l'analyse (pertinence_script du segment, sinon score_pertinence), pas au score de
+# classement qui mélange esthétique et alternance des sources.
+SEUIL_PERTINENCE_HOOK = 0.36
+SEUIL_PERTINENCE_CORPS = 0.45
+
 
 def _borner_duree_plan(valeur: Any) -> float:
     """Ramène une durée de plan demandée dans une plage réellement exploitable."""
@@ -612,6 +631,25 @@ def _score_scene(scene: dict[str, Any], segment_id: int, source: str, precedente
     return score
 
 
+def _pertinence_scene(scene: dict[str, Any], segment_id: int) -> float:
+    """Pertinence DIRECTE d'une scène pour un segment du script, sans bonus esthétique.
+
+    Utilise la pertinence du segment si l'analyse la fournit, sinon le score global de
+    la scène. C'est la valeur soumise aux seuils du mode strict — jamais le score de
+    classement, qui mélange netteté, alternance et pénalités de rythme.
+    """
+    for entree in scene.get("pertinence_script") or []:
+        try:
+            if int(entree.get("id", -1)) == segment_id:
+                return float(entree.get("score", 0.0))
+        except (TypeError, ValueError):
+            continue
+    try:
+        return float(scene.get("score_pertinence", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def selectionner_plan(
     segments: list[dict[str, Any]],
     analyses: dict[str, list[dict[str, Any]]],
@@ -619,6 +657,7 @@ def selectionner_plan(
     style: StyleReference,
     intensite_transitions: int = 2,
     duree_max_plan: float = DUREE_MAX_PLAN_DEFAUT,
+    exiger_pertinence_visuelle: bool = False,
 ) -> list[dict[str, Any]]:
     if not metadonnees:
         raise ErreurMontage("Aucune source valide n’est disponible pour le montage.")
@@ -660,6 +699,26 @@ def selectionner_plan(
                 if segment["hook"] and "stat" not in str(scene.get("rythme", "")).lower():
                     score += 0.12
                 candidats.append((score, source, scene))
+        if exiger_pertinence_visuelle:
+            # Mode strict : un plan n'est retenu que s'il est VRAIMENT pertinent pour
+            # ce segment. Un plan beau mais hors sujet est exclu, pas simplement
+            # rétrogradé — c'est ce filtre qui empêche une skyline de Dubaï de se
+            # glisser dans un montage de téléphone.
+            seuil = SEUIL_PERTINENCE_HOOK if segment["hook"] else SEUIL_PERTINENCE_CORPS
+            candidats = [
+                element for element in candidats
+                if _pertinence_scene(element[2], int(segment["id"])) >= seuil
+            ]
+            if not candidats and str(segment.get("texte", "")).strip():
+                extrait = " ".join(str(segment["texte"]).split())
+                if len(extrait) > 60:
+                    extrait = extrait[:57].rstrip() + "…"
+                raise ErreurMontage(
+                    f"Aucune scène assez pertinente pour le segment « {extrait} ». "
+                    "RsT arrête le rendu plutôt que de produire une vidéo hors sujet. "
+                    "Relance avec une vidéo de départ plus précise ou colle manuellement "
+                    "de meilleures sources."
+                )
         candidats.sort(key=lambda element: element[0], reverse=True)
 
         if candidats:
@@ -950,6 +1009,7 @@ async def construire_montage_professionnel(
     appel_gemini: AppelGemini,
     intensite_transitions: int = 2,
     voix_off: Optional[Path] = None,
+    reference_optionnelle: bool = False,
 ) -> dict[str, Any]:
     debut_global = time.monotonic()
     propres, erreurs_forme, doublons = normaliser_liens_tiktok(liens)
@@ -976,6 +1036,9 @@ async def construire_montage_professionnel(
         reference_propre = ""
         reference_direct = ""
         reference_infos: Optional[dict[str, Any]] = None
+        # Avertissement sur la référence de style : rempli dès qu'une référence
+        # optionnelle (mode RsT) devient inutilisable, puis par l'analyse de style.
+        avertissement_reference = ""
 
         timeout_http = aiohttp.ClientTimeout(total=45, connect=12, sock_read=30)
         async with aiohttp.ClientSession(timeout=timeout_http) as session:
@@ -1014,7 +1077,17 @@ async def construire_montage_professionnel(
                             f"limite {config.duree_max_source:.0f} s."
                         )
                 except Exception as exc:
-                    raise ErreurMontage(f"Vidéo de référence inaccessible : {exc}") from exc
+                    if reference_optionnelle:
+                        # En RsT, la référence de style est un apport : si elle devient
+                        # inaccessible, on garde les sources et le style professionnel
+                        # par défaut plutôt que de perdre tout le travail.
+                        avertissement_reference = (
+                            f"Vidéo de référence de style inutilisable, "
+                            f"style professionnel conservé : {exc}"
+                        )
+                        reference_propre, reference_direct, reference_infos = "", "", None
+                    else:
+                        raise ErreurMontage(f"Vidéo de référence inaccessible : {exc}") from exc
 
             if not directs:
                 raise ErreurMontage(
@@ -1058,7 +1131,18 @@ async def construire_montage_professionnel(
             if reference_direct and reference_infos:
                 reference_path = dossier / "reference_style.mp4"
                 rapporteur.update("downloading", 34, "Téléchargement de la référence de style")
-                await telechargeur(session, reference_direct, reference_path)
+                try:
+                    await telechargeur(session, reference_direct, reference_path)
+                except Exception as exc:
+                    if reference_optionnelle:
+                        reference_path.unlink(missing_ok=True)
+                        reference_path = None
+                        avertissement_reference = (
+                            f"Vidéo de référence de style inutilisable, "
+                            f"style professionnel conservé : {exc}"
+                        )
+                    else:
+                        raise
 
         if not sources:
             raise ErreurMontage("Tous les téléchargements ont échoué ; consulte les erreurs par source.")
@@ -1097,23 +1181,28 @@ async def construire_montage_professionnel(
         await asyncio.gather(*(analyser_une(nom) for nom in sources))
 
         style_reference = STYLE_DEFAUT.model_copy(deep=True)
-        avertissement_reference = ""
         if reference_path and reference_infos:
             rapporteur.update("analysing", 72, "Analyse de la grammaire visuelle de la référence")
             style_reference, warning = await analyser_style_reference(
                 reference_path, float(reference_infos["duration"]), config, rapporteur, appel_gemini
             )
-            avertissement_reference = warning or ""
+            avertissement_reference = warning or avertissement_reference
             reference_path.unlink(missing_ok=True)
         elif style_sous_titres == "jaune":
             style_reference = style_reference.model_copy(update={"couleur_texte": "#FFD43B"})
         elif style_sous_titres == "centre":
             style_reference = style_reference.model_copy(update={"position_sous_titres": "centre"})
 
-        rapporteur.update("selecting", 76, "Sélection et alternance des meilleurs plans")
+        rapporteur.update(
+            "selecting", 76,
+            "Sélection stricte : seuls les plans pertinents pour le script"
+            if config.exiger_pertinence_visuelle
+            else "Sélection et alternance des meilleurs plans",
+        )
         plan = selectionner_plan(
             segments, analyses, metadonnees, style_reference, intensite_transitions,
             config.duree_max_plan,
+            exiger_pertinence_visuelle=config.exiger_pertinence_visuelle,
         )
         rapporteur.update(
             "editing", 82,

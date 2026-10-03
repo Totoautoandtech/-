@@ -436,6 +436,15 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
     assert montages[0]["resolution"] == "720"
     assert montages[0]["hook"] == "Hook RsT"
 
+    # La vidéo de départ devient RÉFÉRENCE DE STYLE (pas de contenu) et le mode
+    # « pertinence visuelle stricte » est actif : lien normalisé, plans ≤ 5 s.
+    assert montages[0]["lien_reference"] == "https://www.tiktok.com/@chef/video/111"
+    assert montages[0]["reference_optionnelle"] is True
+    assert montages[0]["config"].exiger_pertinence_visuelle is True
+    assert montages[0]["config"].duree_max_plan == app.RST_DUREE_MAX_PLAN == 5.0
+    # Aucune voix importée : la vidéo finale reste muette (export sans piste audio).
+    assert montages[0]["voix_off"] is None
+
     # Les recherches réellement effectuées sont exposées, l'historique aussi.
     assert any("cuisine" in requete for requete in job["search_queries"])
     historique = client.get("/api/jobs").json()["jobs"]
@@ -449,6 +458,82 @@ def test_rst_rejette_lien_non_tiktok(client):
     response = client.post("/api/jobs/rst", json={"lien": "https://example.com/article"})
     assert response.status_code == 400
     assert "invalide" in response.json()["detail"]
+
+
+def test_rst_ecarte_les_videos_generiques_pour_un_sujet_telephone(client, monkeypatch):
+    """Échec réel du 3 octobre : un plan de skyline de Dubaï (Burj Khalifa) monté sur
+    un script « TOP 3 téléphone ». Pour un sujet téléphone, une source voyage/skyline
+    sans aucun mot tech ne doit jamais être retenue, même si elle est « jolie »."""
+    telephone = [
+        {"video_id": "p1", "title": "TOP 3 telephone a acheter #telephone #samsung",
+         "duration": 14, "author": {"unique_id": "actu"}},
+        {"video_id": "p2", "title": "test smartphone en main", "duration": 15,
+         "author": {"unique_id": "actu"}},
+        {"video_id": "p3", "title": "comparatif ecran iphone vs galaxy", "duration": 13,
+         "author": {"unique_id": "actu"}},
+        {"video_id": "p4", "title": "batterie du telephone test", "duration": 16,
+         "author": {"unique_id": "actu"}},
+    ]
+    generiques = [
+        {"video_id": "g1", "title": "DUBAI 4K skyline travel vlog", "duration": 14,
+         "author": {"unique_id": "actu"}},
+        {"video_id": "g2", "title": "voyage dubai burj khalifa sunset", "duration": 15,
+         "author": {"unique_id": "actu"}},
+    ]
+
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            return {
+                "id": "77", "title": "TOP 3 telephones a eviter #telephone #iphone",
+                "duration": 21, "author": {"unique_id": "actu"},
+            }
+        if chemin == "/user/posts":
+            return {"videos": [*telephone, *generiques]}
+        if chemin == "/feed/search":
+            return {"videos": []}
+        raise AssertionError(f"endpoint TikWM inattendu : {chemin}")
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
+
+    async def script(_texte):
+        return {"hook": "Hook téléphone", "corps": "Corps du script téléphone.",
+                "mot_cle_broll": "téléphone en main"}
+
+    monkeypatch.setattr(app, "generer_script", script)
+
+    montages = []
+
+    async def montage_fake(**kwargs):
+        montages.append(kwargs)
+        return {"url": "/videos/rst_tel.mp4", "path": app.DOSSIER_VIDEOS / "rst_tel.mp4",
+                "sources": [], "source_errors": []}
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    response = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@actu/video/77",
+    })
+    assert response.status_code == 202, response.text
+    job = _attendre_job(client, response.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+
+    # La carte « Vidéos trouvées par RsT » garde l'origine réelle et explique les rejets.
+    trouves = job["found_videos"]
+    par_id = {v["video_id"]: v for v in trouves}
+    assert set(par_id) == {"p1", "p2", "p3", "p4", "g1", "g2"}
+    for vid in ("g1", "g2"):
+        assert par_id[vid]["selected"] is False
+        assert "hors sujet" in par_id[vid]["rejet"]
+        assert par_id[vid]["origin"]  # origine réelle conservée
+    # Les sources téléphone sont retenues et envoyées au montage, jamais les autres.
+    retenues = [v for v in trouves if v["selected"]]
+    assert {v["video_id"] for v in retenues} == {"p1", "p2", "p3", "p4"}
+    assert montages[0]["liens"] == [v["url"] for v in retenues]
+    assert all("tiktok.com/@" in lien for lien in montages[0]["liens"])
+    # Référence de style = vidéo de départ normalisée, mode strict actif.
+    assert montages[0]["lien_reference"] == "https://www.tiktok.com/@actu/video/77"
+    assert montages[0]["config"].exiger_pertinence_visuelle is True
 
 
 def test_rst_aucune_video_trouvee_echoue_honnetement(client, monkeypatch):
@@ -782,6 +867,50 @@ def test_repartir_par_nom_alterne_les_noms_et_relegue_le_fil_auteur():
     assert [c["video_id"] for c in ordonnes] == ["a1", "b1", "c1", "a2", "c2", "z1"]
 
 
+def test_rst_score_texte_priorise_le_sujet_et_penalise_le_generique():
+    """Score texte simple : le nom recherché et les mots tech montent, une skyline de
+    Dubaï sans mot tech coule — uniquement pour un sujet téléphone/produit."""
+    assert app._sujet_telephone_rst("TOP 3 téléphones à éviter #samsung", "") is True
+    assert app._sujet_telephone_rst("Recette de pancakes faciles #cuisine", "cuisine maison") is False
+
+    def candidate(titre, origine, nom=""):
+        return {"title": titre, "origin": origine, "nom": nom}
+
+    sujet = True
+    assert app._score_texte_candidat_rst(
+        candidate("Test iPhone 15 en main", "recherche « iPhone 15 »", "iPhone 15"), sujet
+    ) == 0.95  # nom dans le titre + mot tech
+    assert app._score_texte_candidat_rst(
+        candidate("top 3 telephone a eviter", "publications de @actu"), sujet
+    ) == 0.55   # mot tech, sans nom
+    assert app._score_texte_candidat_rst(
+        candidate("un lundi comme les autres", "recherche « iPhone 15 »"), sujet
+    ) == 0.30   # neutre : aucune promesse inventée
+    # Hors sujet : générique (titre OU origine) sans mot tech ni nom dans le titre.
+    assert app._score_texte_candidat_rst(
+        candidate("DUBAI 4K skyline travel", "recherche « iPhone 15 »", "iPhone 15"), sujet
+    ) == 0.0
+    assert app._score_texte_candidat_rst(
+        candidate("coucher de soleil", "publications de @travel_life"), sujet
+    ) == 0.0
+    # Un sujet NON téléphone ne subit pas la pénalité voyage : hors périmètre.
+    assert app._score_texte_candidat_rst(
+        candidate("DUBAI 4K skyline travel", "recherche « pancakes »", "pancakes"), False
+    ) == 0.30
+
+    # Le classement met le téléphone devant la skyline, la sélection l'écarte.
+    classes = app._classer_candidats_rst([
+        {"video_id": "g", "title": "voyage dubai", "origin": "recherche « iPhone 15 »",
+         "nom": "iPhone 15", "duration": 12},
+        {"video_id": "p", "title": "test iphone 15", "origin": "recherche « iPhone 15 »",
+         "nom": "iPhone 15", "duration": 12},
+    ], True)
+    assert [c["video_id"] for c in classes] == ["p", "g"]
+    retenues, tous = app._selectionner_sources_rst([dict(c) for c in classes], 5, 180.0)
+    assert [c["video_id"] for c in retenues] == ["p"]
+    assert tous[1]["rejet"].startswith("titre hors sujet")
+
+
 def test_rst_cinq_noms_lance_cinq_recherches_et_couvre_chaque_nom(client, monkeypatch):
     noms_ia = ["Mbappé", "Real Madrid", "Bernabéu", "Vinicius", "Ancelotti"]
 
@@ -836,8 +965,12 @@ def test_rst_cinq_noms_lance_cinq_recherches_et_couvre_chaque_nom(client, monkey
     # Le fil de l'auteur ouvre la marche, puis une recherche par nom, dans l'ordre.
     assert job["search_queries"] == ["@foot", *noms_ia]
     assert sorted(job["noms_couverts"]) == sorted(noms_ia)  # aucun nom laissé de côté
-    # Le montage RsT impose des plans de 5 s maximum.
+    # Le montage RsT impose des plans de 5 s maximum, la vidéo de départ sert de
+    # référence de style, et le mode pertinence visuelle stricte est actif.
     assert recus[0]["config"].duree_max_plan == app.RST_DUREE_MAX_PLAN == 5.0
+    assert recus[0]["lien_reference"] == "https://www.tiktok.com/@foot/video/42"
+    assert recus[0]["config"].exiger_pertinence_visuelle is True
+    assert recus[0]["voix_off"] is None  # vidéo finale muette sans voix importée
 
 
 def test_config_publique_expose_le_top_n(client):

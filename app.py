@@ -305,9 +305,15 @@ DUREE_MAX_APERCU_IA = CONFIG.duree_max_source  # compatibilité des anciens help
 
 
 def _configuration_montage(
-    mode: str = "rapide", duree_max_plan: float = DUREE_MAX_PLAN_DEFAUT
+    mode: str = "rapide",
+    duree_max_plan: float = DUREE_MAX_PLAN_DEFAUT,
+    exiger_pertinence_visuelle: bool = False,
 ) -> ConfigurationMontage:
-    """Configuration du pipeline ; le mode « qualite » privilégie un encodage plus fin."""
+    """Configuration du pipeline ; le mode « qualite » privilégie un encodage plus fin.
+
+    `exiger_pertinence_visuelle` active le mode strict RsT : aucun plan n'est monté
+    s'il n'est pas réellement pertinent pour le segment de script qu'il illustre.
+    """
     qualite = str(mode).lower() == "qualite"
     return ConfigurationMontage(
         dossier_travail=DOSSIER_TRAVAIL,
@@ -323,6 +329,7 @@ def _configuration_montage(
         threads_ffmpeg=CONFIG.threads_ffmpeg,
         autoriser_1080=CONFIG.autoriser_export_1080,
         duree_max_plan=float(duree_max_plan),
+        exiger_pertinence_visuelle=bool(exiger_pertinence_visuelle),
     )
 
 
@@ -1488,6 +1495,86 @@ async def livrer_script_et_voix(
 
 DUREE_MIN_SOURCE_RST = 5.0
 
+# Pertinence TEXTE des candidates RsT : un plan « joli mais hors sujet » (skyline de
+# Dubaï sur un script de téléphone, par exemple) doit être repoussé voire écarté avant
+# même le montage. Le score ne s'appuie que sur des données réelles : titre TikWM,
+# nom recherché, origine de la découverte. Aucune métadonnée n'est inventée.
+
+# Mots qui signalent un contenu tech / téléphone / produit (frontières de mots).
+_MOTS_TECH_RST = (
+    "telephone", "téléphone", "telephones", "téléphones", "smartphone", "smartphones",
+    "iphone", "ipad", "android", "ios", "samsung", "galaxy", "pixel", "xiaomi", "redmi",
+    "realme", "oppo", "vivo", "oneplus", "honor", "huawei", "motorola", "nokia",
+    "mobile", "écran", "ecran", "screen", "phone", "unboxing", "batterie", "chargeur",
+    "5g", "comparatif", "test", "review", "avis", "modele", "modèle",
+)
+# Mots qui signalent un b-roll générique sans rapport avec un sujet produit/tech.
+_MOTS_GENERIQUES_RST = (
+    "voyage", "travel", "dubai", "dubaï", "skyline", "gratte-ciel", "gratte ciel",
+    "building", "burj", "khalifa", "tour eiffel", "city", "ville", "lifestyle", "vlog",
+    "paysage", "coucher de soleil", "sunset", "hotel", "hôtel", "resort", "vacances",
+    "holiday", "aesthetic", "nature",
+)
+SCORE_TEXTE_BASE_RST = 0.30        # neutre : titre sans signal particulier
+SCORE_TEXTE_NOM_RST = 0.40         # le nom recherché apparaît dans le titre
+SCORE_TEXTE_TECH_RST = 0.25        # mot tech/produit dans le titre ou l'origine
+SCORE_TEXTE_HORS_SUJET_RST = -0.55  # b-roll générique sans aucun mot du sujet
+# En dessous de ce score texte, une candidate est carrément hors sujet : jamais retenue.
+SEUIL_SCORE_TEXTE_RST = 0.10
+
+
+def _mots_presents(texte: str, mots: tuple[str, ...]) -> bool:
+    """Vrai si l'un des mots apparaît en entier (frontières de mots, casse ignorée)."""
+    minuscule = texte.casefold()
+    return any(re.search(rf"(?<!\w){re.escape(mot)}(?!\w)", minuscule) for mot in mots)
+
+
+def _sujet_telephone_rst(*textes: str) -> bool:
+    """Détecte un sujet tech/téléphone/produit dans les vrais textes de départ."""
+    combine = " ".join(t for t in textes if t)
+    return _mots_presents(combine, _MOTS_TECH_RST)
+
+
+def _score_texte_candidat_rst(candidate: dict, sujet_telephone: bool) -> float:
+    """Score texte simple (0..1) sur des données réelles : titre (hashtags inclus),
+    nom recherché et origine de la découverte.
+
+    Priorité aux titres contenant le nom recherché ou un mot du sujet (téléphone,
+    smartphone, modèle, marque). Pour un sujet téléphone, une vidéo dont le titre ou
+    l'origine évoque voyage / ville / skyline sans AUCUN mot tech dans le titre est
+    fortement pénalisée : jolie ne veut pas dire pertinente.
+    """
+    titre = str(candidate.get("title") or "").casefold()
+    origine = str(candidate.get("origin") or "").casefold()
+    nom = str(candidate.get("nom") or "").strip().casefold().lstrip("#")
+    nom_dans_titre = bool(nom and nom in titre)
+    mot_tech_dans_titre = _mots_presents(titre, _MOTS_TECH_RST)
+    score = SCORE_TEXTE_BASE_RST
+    if nom_dans_titre:
+        score += SCORE_TEXTE_NOM_RST
+    if sujet_telephone and mot_tech_dans_titre:
+        score += SCORE_TEXTE_TECH_RST
+    if (
+        sujet_telephone
+        and (_mots_presents(titre, _MOTS_GENERIQUES_RST) or _mots_presents(origine, _MOTS_GENERIQUES_RST))
+        and not mot_tech_dans_titre
+        and not nom_dans_titre
+    ):
+        score += SCORE_TEXTE_HORS_SUJET_RST
+    return round(min(1.0, max(0.0, score)), 3)
+
+
+def _classer_candidats_rst(candidats: list[dict], sujet_telephone: bool) -> list[dict]:
+    """Annote chaque candidate avec son score texte puis les trie par pertinence.
+
+    Le tri se fait avant la répartition par nom : dans chaque file de nom, les titres
+    les plus proches du sujet passent devant, les b-rolls génériques ferment la marche.
+    """
+    for candidate in candidats:
+        candidate["score_texte"] = _score_texte_candidat_rst(candidate, sujet_telephone)
+    return sorted(candidats, key=lambda c: float(c.get("score_texte") or 0), reverse=True)
+
+
 _MOTS_VIDES_RST = {
     "avec", "bien", "cette", "dans", "depuis", "des", "elle", "elles", "est", "les", "leur",
     "mais", "moins", "mes", "meme", "nous", "parce", "pour", "puis", "que", "qui", "sans",
@@ -2171,12 +2258,21 @@ def _repartir_par_nom(candidats: list[dict], noms: list[str]) -> list[dict]:
 def _selectionner_sources_rst(
     candidats: list[dict], limite: int, duree_max: float
 ) -> tuple[list[dict], list[dict]]:
-    """Retient jusqu'à `limite` candidates dont la durée réelle est exploisable."""
+    """Retient jusqu'à `limite` candidates dont la durée réelle est exploitable.
+
+    Une candidate dont le score texte est sous `SEUIL_SCORE_TEXTE_RST` (b-roll
+    générique sans rapport avec le sujet : voyage, skyline, lifestyle…) est écartée
+    quelle que soit la place restante : mieux vaut moins de sources que du hors sujet.
+    """
     for candidate in candidats:
         candidate.setdefault("selected", False)
         candidate.setdefault("rejet", "")
     retenues: list[dict] = []
     for candidate in candidats:
+        score_texte = candidate.get("score_texte")
+        if score_texte is not None and float(score_texte) < SEUIL_SCORE_TEXTE_RST:
+            candidate["rejet"] = "titre hors sujet (voyage / ville / skyline sans mot-clé du sujet)"
+            continue
         if len(retenues) >= limite:
             if not candidate.get("rejet"):
                 candidate["rejet"] = "quota de sources atteint"
@@ -2197,13 +2293,19 @@ def _selectionner_sources_rst(
 
 
 def _reduire_selon_estimation(
-    sources: list[dict], config: ConfigurationMontage, plafond: int = 540
+    sources: list[dict], config: ConfigurationMontage, plafond: int = 540,
+    duree_reference: float = 0.0,
 ) -> list[dict]:
-    """Retire les dernières sources tant que l'estimation dépasse le plafond prudent."""
+    """Retire les dernières sources tant que l'estimation dépasse le plafond prudent.
+
+    La vidéo de départ — désormais référence de style — est téléchargée et analysée
+    comme une source de plus : son coût est compté dans l'estimation.
+    """
     while len(sources) > 3:
-        estimation = estimer_duree_traitement(
-            [float(s.get("duration") or 0) for s in sources], 0.0, config
-        )
+        durees = [float(s.get("duration") or 0) for s in sources]
+        if duree_reference > 0:
+            durees = [min(duree_reference, config.duree_max_source)] + durees
+        estimation = estimer_duree_traitement(durees, 0.0, config)
         if estimation["estimated_seconds"] <= plafond:
             break
         retiree = sources.pop()
@@ -2460,8 +2562,18 @@ async def _produire_rst(
                 if candidats:
                     break
 
-    # Chaque nom du TOP N est représenté à tour de rôle avant de plafonner les candidates.
-    trouves = _repartir_par_nom(list(candidats.values()), noms)[: CONFIG.rst_candidats_max]
+    # Pertinence TEXTE des candidates : pour un sujet téléphone/produit, une vidéo
+    # « voyage / skyline / Dubaï » sans aucun mot tech est jolie mais hors sujet —
+    # elle passe derrière les titres proches du sujet, ou est écartée à la sélection.
+    sujet_telephone = _sujet_telephone_rst(
+        legende, script.get("mot_cle_broll", ""), " ".join(noms),
+        script.get("hook", ""), script.get("corps", ""),
+    )
+    # Chaque nom du TOP N est représenté à tour de rôle avant de plafonner les
+    # candidates ; dans chaque file de nom, les titres les plus pertinents ouvrent.
+    trouves = _repartir_par_nom(
+        _classer_candidats_rst(list(candidats.values()), sujet_telephone), noms
+    )[: CONFIG.rst_candidats_max]
     contexte.update(
         statut="searching", progress=42,
         detail=f"{len(trouves)} vidéo(s) trouvée(s) — sélection des meilleures sources",
@@ -2481,16 +2593,31 @@ async def _produire_rst(
             f"{len(requetes_reelles)} recherche(s) tentée(s) — {detail}."
         )
 
-    configuration = _configuration_montage(requete.mode, RST_DUREE_MAX_PLAN)
+    # Mode strict RsT : la vidéo de départ sert de référence de STYLE et aucun plan
+    # hors sujet ne doit passer. Mieux vaut échouer clairement qu'un montage nul.
+    configuration = _configuration_montage(
+        requete.mode, RST_DUREE_MAX_PLAN, exiger_pertinence_visuelle=True
+    )
     selectionnees, trouves = _selectionner_sources_rst(
         trouves, CONFIG.rst_sources_max, float(CONFIG.duree_max_source)
     )
     plafond_reel = max(
         90, min(540, int(contexte.restant()) - int(LIVRAISON_RESERVE) - 45)
     )
-    selectionnees = _reduire_selon_estimation(selectionnees, configuration, plafond_reel)
+    try:
+        duree_reference = float(seed_infos.get("duration") or 0)
+    except (TypeError, ValueError):
+        duree_reference = 0.0
+    selectionnees = _reduire_selon_estimation(
+        selectionnees, configuration, plafond_reel, duree_reference=duree_reference
+    )
     if not selectionnees:
-        raise ErreurApp("Aucune vidéo trouvée n'entre dans les limites de durée utilisables.")
+        rejets = [str(c.get("rejet") or "raison inconnue") for c in trouves if not c.get("selected")]
+        detail = " ; ".join(rejets[:6]) if rejets else "durées hors limites"
+        raise ErreurApp(
+            "Aucune vidéo trouvée n'est exploitable pour le montage. "
+            f"Principaux rejets : {detail}."
+        )
     noms_couverts = sorted({s["nom"] for s in selectionnees if s.get("nom")})
     budget_restant = max(0, int(contexte.restant()))
     contexte.update(
@@ -2507,7 +2634,11 @@ async def _produire_rst(
     resolution = "1080" if (requete.mode == "qualite" and CONFIG.autoriser_export_1080) else "720"
     resultat = await construire_montage_professionnel(
         liens=[candidate["url"] for candidate in selectionnees],
-        lien_reference="",
+        # La vidéo de départ sert de RÉFÉRENCE DE STYLE (rythme, durée des plans,
+        # sous-titres, transitions) — jamais de contenu : ses images, son logo et
+        # son watermark ne sont pas réutilisés. Inaccessible ? Style par défaut.
+        lien_reference=lien,
+        reference_optionnelle=True,
         hook=script["hook"].strip(),
         corps=script["corps"].strip(),
         resolution=resolution,
