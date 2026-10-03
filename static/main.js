@@ -687,7 +687,9 @@
     const info = el('div', 'found-info');
     info.append(el('strong', '', `@${video.author || 'tiktok'}`));
     info.append(el('span', 'found-title', video.title || '(vidéo sans légende)'));
-    info.append(el('span', 'found-meta', `${fmtDuree(video.duration)} · ${video.origin || 'recherche TikTok'}`));
+    let meta = `${fmtDuree(video.duration)} · ${video.origin || 'recherche TikTok'}`;
+    if (typeof video.score_texte === 'number') meta += ` · pertinence texte ${Math.round(video.score_texte * 100)}%`;
+    info.append(el('span', 'found-meta', meta));
     if (video.nom) info.append(el('span', 'found-nom', `Nom recherché : ${video.nom}`));
     if (!video.selected && video.rejet) info.append(el('span', 'found-rejet', `Écartée : ${video.rejet}`));
     item.append(info);

@@ -3,7 +3,7 @@
 Récapitulatif destiné à la **prochaine session**. Il ne décrit que ce qui a été
 réellement vérifié : ce qui tourne, ce qui n'a jamais pu être testé, et pourquoi.
 
-Dernière mise à jour : 30 septembre 2026.
+Dernière mise à jour : 3 octobre 2026.
 
 ---
 
@@ -87,9 +87,49 @@ Pour **chaque** lien de départ :
    `found_videos`. Rien n'est jamais inventé.
 6. **Répartition** : `_repartir_par_nom()` sert les candidates nom par nom, à tour
    de rôle, pour qu'un nom prolifique ne monopolise pas le quota de sources.
+   Avant la répartition, `_classer_candidats_rst()` annote chaque candidate d'un
+   **score texte** (0..1) calculé sur des données réelles uniquement (titre TikWM
+   + hashtags, nom recherché, origine de la découverte) : priorité aux titres
+   contenant le nom recherché ou un mot du sujet (téléphone, smartphone, modèle,
+   marque) ; pour un sujet téléphone, une vidéo dont le titre **ou** l'origine
+   évoque voyage / Dubaï / skyline / building / lifestyle **sans aucun mot tech**
+   est fortement pénalisée puis écartée. Le score est affiché dans la carte
+   « Vidéos trouvées par RsT », l'origine réelle reste conservée.
 7. **Sélection** : jusqu'à 20 sources dans les limites de durée et de temps Render.
-8. **Montage** en **plans de 5 s maximum** (`RST_DUREE_MAX_PLAN = 5.0`).
-9. **Livraison séparée** : voir §4.
+   Une candidate sous `SEUIL_SCORE_TEXTE_RST` est rejetée avec le motif
+   « titre hors sujet », même s'il reste de la place. Si tout est rejeté, le
+   travail échoue en listant les vrais motifs de rejet.
+8. **Montage** en **plans de 5 s maximum** (`RST_DUREE_MAX_PLAN = 5.0`). La vidéo
+   de départ est passée en **référence de STYLE** (`lien_reference=lien`,
+   `reference_optionnelle=True`) : `analyser_style_reference()` en extrait la
+   grammaire visuelle (rythme, durée moyenne des plans, transitions, style de
+   sous-titres) pour reproduire ce style de montage — **jamais le contenu** :
+   images, logo et watermark de la référence ne sont pas réutilisés (voir
+   `PROMPT_STYLE`). Référence inaccessible → repli honnête sur le style
+   professionnel par défaut, avec avertissement.
+9. **Pertinence visuelle stricte** : `exiger_pertinence_visuelle=True` dans la
+   configuration RsT. `PROMPT_ANALYSE` interdit à Gemini de noter un plan pour sa
+   seule esthétique (paysage / skyline / b-roll générique sans lien avec le
+   script : 0.25 maximum) ; `selectionner_plan()` filtre ensuite chaque segment
+   sous des seuils durs (hook 0.36, corps 0.45) et le repli temporel aveugle est
+   interdit pour un segment contenant du texte.
+10. **Livraison séparée** : voir §4.
+
+### Règle RsT n°1 : échouer plutôt que livrer hors sujet
+
+Le 3 octobre 2026, un rendu réel est parti en production avec un plan de
+**skyline / Burj Khalifa à Dubaï** sous le sous-titre « Des performances
+incroyables… » alors que la vidéo de départ était un **TOP 3 téléphones** de
+`@actumobile.fr` — un b-roll générique « joli mais sans aucun rapport ».
+
+Décision définitive : **RsT doit échouer proprement plutôt que de livrer un
+montage hors sujet.** Concrètement, si aucun plan ne passe les seuils de
+pertinence pour un segment, le rendu s'arrête avec le message :
+`Aucune scène assez pertinente pour le segment « … ». RsT arrête le rendu plutôt
+que de produire une vidéo hors sujet. Relance avec une vidéo de départ plus
+précise ou colle manuellement de meilleures sources.` Dans ce cas : relever le
+message exact + la carte « Vidéos trouvées par RsT » (durées, rejets), **ne rien
+inventer**.
 
 ### Diagnostic en production
 
@@ -187,6 +227,36 @@ réseau n'est contacté dans les tests.
 
 ## 6. Tests
 
+### Correctif RsT — pertinence visuelle stricte + référence de style (3 octobre 2026)
+
+Un rendu réel (départ `@actumobile.fr`, TOP 3 téléphones) a produit un plan de
+skyline / Burj Khalifa sous « Des performances incroyables… » : la découverte
+publique ramenait de vraies vidéos… mais hors sujet, et le montage acceptait un
+plan « beau » sans vérifier son lien avec le script.
+
+Correctif à conserver :
+
+- la vidéo de départ est passée en **référence de style** à
+  `construire_montage_professionnel` (`lien_reference=lien`,
+  `reference_optionnelle=True`) : le montage reprend la grammaire visuelle de la
+  source (rythme, durée des plans, sous-titres, transitions), jamais son contenu ;
+- `ConfigurationMontage.exiger_pertinence_visuelle` (activé seulement en RsT)
+  pousse `selectionner_plan()` en mode strict : filtrage sous les seuils
+  hook 0.36 / corps 0.45, refus du repli temporel aveugle pour un segment avec du
+  texte, et `ErreurMontage` claire si aucune scène ne passe ;
+- `PROMPT_ANALYSE` interdit explicitement de récompenser l'esthétique sans lien
+  avec le script (paysage/skyline/b-roll générique : 0.25 max) ;
+- `_classer_candidats_rst()` + `_score_texte_candidat_rst()` classent les
+  candidates par pertinence texte et `_selectionner_sources_rst()` écarte les
+  titres « voyage / ville / skyline » sans mot du sujet (seuil 0.10) —
+  l'origine réelle reste dans `found_videos`, rien n'est inventé ;
+- la durée de la vidéo de départ est comptée dans l'estimation Render
+  (`_reduire_selon_estimation(..., duree_reference=…)`) puisqu'elle est
+  téléchargée et analysée comme une source de plus.
+
+Règle associée (voir §3) : **RsT échoue plutôt que de livrer un montage hors
+sujet**, et la vidéo de départ sert de **référence de style, pas de contenu**.
+
 ### Correctif RsT — plafond d'analyses sous Render Free (2 octobre 2026)
 
 Un travail réel a échoué pendant « Analyse 5/16 » : 16 sources avaient été
@@ -210,7 +280,7 @@ Correctif à conserver :
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt -r requirements.txt
-.venv/bin/python -m pytest -q                    # 108 tests
+.venv/bin/python -m pytest -q                    # 112 tests
 node --test tests/js/job-utils.test.cjs          # 7 tests
 ```
 

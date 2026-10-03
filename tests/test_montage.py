@@ -257,3 +257,78 @@ def test_duree_max_plan_invalide_retombe_sur_cinq_secondes(valeur):
 def test_configuration_montage_porte_la_duree_max_plan(tmp_path):
     config = montage.ConfigurationMontage(dossier_travail=tmp_path, dossier_videos=tmp_path)
     assert config.duree_max_plan == montage.DUREE_MAX_PLAN_DEFAUT
+    # Le mode « pertinence visuelle stricte » est désactivé par défaut : seuls les
+    # montages RsT l'activent, les autres modes ne changent pas de comportement.
+    assert config.exiger_pertinence_visuelle is False
+    strict = montage.ConfigurationMontage(
+        dossier_travail=tmp_path, dossier_videos=tmp_path, exiger_pertinence_visuelle=True
+    )
+    assert strict.exiger_pertinence_visuelle is True
+
+
+# -------------------------------------------------------------------------------------
+# Mode RsT « pertinence visuelle stricte » : un plan beau mais hors sujet est refusé
+# -------------------------------------------------------------------------------------
+
+
+def _scene(segments, sujet, action, score):
+    """Scène d'analyse : superbe (nettete 0.95) mais avec la pertinence donnée."""
+    return {
+        "debut": 0.0, "fin": 20.0, "sujet": sujet, "action_mouvement": action,
+        "qualite": "bonne", "nettete": 0.95, "cadrage": "vertical", "texte_visible": False,
+        "watermark": False,
+        "pertinence_script": [{"id": s["id"], "score": score} for s in segments],
+        "rythme": "dynamique", "transition_recommandee": "cut", "score_pertinence": score,
+    }
+
+
+def test_mode_strict_refuse_les_plans_trop_peu_pertinents():
+    """Échec réel du 3 octobre : une skyline de Dubaï montée sur un script téléphone.
+
+    En mode strict, un plan esthétique mais sans rapport avec le script (pertinence
+    0.22, sous les seuils hook 0.36 / corps 0.45) doit faire échouer le rendu plutôt
+    que de glisser dans le montage.
+    """
+    segments = montage.creer_segments_script(
+        "Top 3 des téléphones", "Ce téléphone a un écran incroyable."
+    )
+    analyses = {"source_0": [_scene(segments, "gratte-ciel à Dubai", "panoramique aérien de la skyline", 0.22)]}
+    metadata = {"source_0": {"duration": 20.0}}
+    with pytest.raises(montage.ErreurMontage) as excinfo:
+        montage.selectionner_plan(
+            segments, analyses, metadata, montage.STYLE_DEFAUT,
+            exiger_pertinence_visuelle=True,
+        )
+    message = str(excinfo.value)
+    assert "Aucune scène assez pertinente" in message
+    assert "segment" in message
+    assert "hors sujet" in message
+    assert "meilleures sources" in message
+
+
+def test_mode_strict_garde_les_plans_vraiment_pertinents():
+    """Une scène vraiment pertinente (smartphone en main, 0.86) passe le filtre strict.
+
+    Une scène hors sujet reste disponible sur une autre source : elle ne doit jamais
+    être choisie tant qu'un plan pertinent existe.
+    """
+    segments = montage.creer_segments_script(
+        "Top 3 des téléphones", "Ce téléphone a un écran incroyable."
+    )
+    analyses = {
+        "source_0": [_scene(segments, "smartphone tenu en main", "démonstration de l'écran", 0.86)],
+        "source_1": [_scene(segments, "skyline de Dubai", "vue aérienne", 0.22)],
+    }
+    metadata = {"source_0": {"duration": 20.0}, "source_1": {"duration": 20.0}}
+    plan = montage.selectionner_plan(
+        segments, analyses, metadata, montage.STYLE_DEFAUT,
+        exiger_pertinence_visuelle=True,
+    )
+    assert plan
+    # Seule la scène réellement pertinente est montée — jamais la skyline.
+    assert all(p["source"] == "source_0" for p in plan)
+    assert all(p["duree"] <= montage.DUREE_MAX_PLAN_DEFAUT for p in plan)
+    # Hors mode strict, le comportement historique est inchangé (la skyline reste
+    # candidate, simplement moins bien classée).
+    plan_souplet = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
+    assert plan_souplet and all(p["duree"] <= montage.DUREE_MAX_PLAN_DEFAUT for p in plan_souplet)
