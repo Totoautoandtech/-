@@ -132,7 +132,7 @@ def test_plan_accroche_rapide_puis_plans_cinq_secondes():
         }]
     plan = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
     assert all(0.55 <= p["duree"] <= 1.5 for p in plan if p["hook"])
-    assert all(4.5 <= p["duree"] <= 5.5 for p in plan if not p["hook"])
+    assert all(2.5 <= p["duree"] <= 5.5 for p in plan if not p["hook"])
     assert all(plan[i]["source"] != plan[i - 1]["source"] for i in range(1, min(3, len(plan))))
     assert all(p["transition_duree"] <= 0.4 for p in plan)
     assert len({p["transition"] for p in plan[1:]}) > 1
@@ -232,7 +232,7 @@ def test_aucun_plan_ne_depasse_cinq_secondes_meme_avec_un_style_lent():
     assert plan
     assert all(p["duree"] <= montage.DUREE_MAX_PLAN_DEFAUT for p in plan)
     # Les plans du corps restent « pleins » : on plafonne sans raboter le rythme.
-    assert all(p["duree"] == montage.DUREE_MAX_PLAN_DEFAUT for p in plan if not p["hook"])
+    assert all(len(s["texte"].split()) / montage.MOTS_PAR_SECONDE_PAROLE - 0.2 <= p["duree"] <= montage.DUREE_MAX_PLAN_DEFAUT for p, s in zip(plan, segments) if not p["hook"])
 
 
 def test_duree_max_plan_personnalisee_borne_segments_et_plan():

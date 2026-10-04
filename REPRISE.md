@@ -319,3 +319,8 @@ travail a dû être **entièrement refait**.
 
 **Pousser la branche dès le premier commit.** Un commit local n'est pas une
 sauvegarde ; seul `git push` en est une.
+
+
+## Calage sur le temps de parole (3 octobre)
+
+Le rendu de 22 s pour 1 min 01 de voix venait de blocs de 18 mots, incompatibles avec des plans limités à 5 s, et de scènes trop courtes tronquées au lieu d’être enchaînées. Le correctif calibre les segments sur le débit de parole, autorise plusieurs prises pertinentes, fusionne les sous-titres d’un même segment et estime l’export à 2,2 s par seconde de sortie.

@@ -290,7 +290,7 @@ async def diagnostiquer_montage(
 
 
 def estimer_duree_traitement(
-    durees: list[float], duree_reference: float, config: ConfigurationMontage
+    durees: list[float], duree_reference: float, config: ConfigurationMontage, duree_sortie_estimee: float = 0.0
 ) -> dict[str, Any]:
     """Estimation conservatrice pour un petit CPU Render ; ce n'est jamais une promesse."""
     total = sum(min(d, config.duree_max_source) for d in durees)
@@ -300,13 +300,16 @@ def estimer_duree_traitement(
     # Sur Render Free, une analyse Gemini complète peut prendre ~60 s quand l'API
     # sature (réessais 2/4/8/16 s). On réserve donc 30 s d'analyse + 8 s de
     # transfert/latence par source au lieu de sous-estimer à 10 s par analyse.
+    export = 30 * 3.0
+    if duree_sortie_estimee > 0:
+        export = max(export, 30.0 + 2.2 * duree_sortie_estimee)
     secondes = (
         15
         + total_analyse * 0.38
         + nb_analyses * 30
         + nb_analyses * 8
         + total * 0.08
-        + 30 * 3.0
+        + export
     )
     secondes = int(math.ceil(secondes / 5.0) * 5)
     plafond_prudent = min(540, max(60, int(config.delai_job - 20)))
@@ -541,6 +544,8 @@ ECHELLES_INTENSITE_TRANSITIONS = {0: 0.15, 1: 0.6, 2: 1.0, 3: 1.35}
 # un rythme court : aucun plan ne reste à l'écran plus longtemps que cette valeur.
 DUREE_MAX_PLAN_DEFAUT = 5.0
 DUREE_MIN_PLAN = 0.55
+MOTS_PAR_SECONDE_PAROLE = 2.3
+DUREE_MIN_SUITE_PLAN = 1.2
 
 # Mode RsT « pertinence visuelle stricte » : pertinence minimale (0..1) exigée d'une
 # scène pour rester candidate, côté accroche puis côté corps du script. En dessous, la
@@ -605,7 +610,8 @@ def creer_segments_script(
     phrases = [p.strip() for p in re.split(r"(?<=[.!?])\s+|\n+", corps.strip()) if p.strip()]
     for phrase in phrases:
         mots = phrase.split()
-        morceaux = [mots[i:i + 18] for i in range(0, len(mots), 18)] or [[]]
+        mots_par_segment = max(4, int(plafond * MOTS_PAR_SECONDE_PAROLE))
+        morceaux = [mots[i:i + mots_par_segment] for i in range(0, len(mots), mots_par_segment)] or [[]]
         for morceau in morceaux:
             segments.append({
                 "id": len(segments), "texte": " ".join(morceau), "hook": False,
@@ -687,6 +693,9 @@ def selectionner_plan(
         cible = min(plafond, float(segment["duree_cible"]))
         if not segment["hook"]:
             cible = min(plafond, max(plancher_plein, style.duree_moyenne_plans))
+            parole_segment = len(str(segment.get("texte", "")).split()) / MOTS_PAR_SECONDE_PAROLE
+            if parole_segment + 0.8 < cible:
+                cible = max(DUREE_MIN_SUITE_PLAN, parole_segment + 0.8)
         candidats: list[tuple[float, str, dict[str, Any]]] = []
         for source, scenes in analyses.items():
             for scene in scenes:
@@ -721,26 +730,34 @@ def selectionner_plan(
                 )
         candidats.sort(key=lambda element: element[0], reverse=True)
 
+        prises = []
         if candidats:
-            _, source, scene = candidats[0]
-            debut_scene = max(0.0, float(scene["debut"]))
-            fin_scene = min(float(metadonnees[source]["duration"]), float(scene["fin"]))
-            disponible = max(0.55, fin_scene - debut_scene)
-            duree = min(cible, disponible)
-            if not segment["hook"] and disponible >= plancher_plein:
-                duree = min(plafond, max(plancher_plein, min(cible, disponible)))
-            debut = debut_scene
-            recommandation = str(scene.get("transition_recommandee", "cut")).lower()
+            restant=cible; deja=set()
+            while restant >= DUREE_MIN_PLAN:
+                pos=next((i for i in range(len(candidats)) if i not in deja and candidats[i][1] != precedente), None)
+                if pos is None: pos=next((i for i in range(len(candidats)) if i not in deja), None)
+                if pos is None: break
+                _,source,scene=candidats[pos]; deja.add(pos)
+                debut=max(0.,float(scene["debut"])); fin=min(float(metadonnees[source]["duration"]),float(scene["fin"]))
+                disponible=max(DUREE_MIN_PLAN,fin-debut); duree=min(plafond,restant,disponible)
+                if not segment["hook"] and restant >= plancher_plein and disponible >= plancher_plein: duree=min(plafond,max(plancher_plein,min(restant,disponible)))
+                if duree < DUREE_MIN_PLAN or (prises and duree < DUREE_MIN_SUITE_PLAN): break
+                prises.append({"source":source,"debut":round(debut,3),"duree":round(min(plafond,max(DUREE_MIN_PLAN,duree)),3),"recommandation":str(scene.get("transition_recommandee","cut")).lower()})
+                restant-=duree; precedente=source
         else:
-            choix = [s for s in sources if s != precedente] or sources
-            source = choix[index % len(choix)]
-            duree_source = float(metadonnees[source]["duration"])
-            duree = min(cible, duree_source)
-            if not segment["hook"] and duree_source >= plancher_plein:
-                duree = min(plafond, duree_source)
-            debut = min(curseurs_repli[source], max(0.0, duree_source - duree))
-            curseurs_repli[source] = (debut + duree + 0.5) % max(duree_source, 0.6)
-            recommandation = "cut"
+            choix=[x for x in sources if x != precedente] or sources; source=choix[index % len(choix)]; ds=float(metadonnees[source]["duration"]); duree=min(cible,ds)
+            debut=min(curseurs_repli[source],max(0.,ds-duree)); curseurs_repli[source]=(debut+duree+.5)%max(ds,.6)
+            prises.append({"source":source,"debut":round(debut,3),"duree":round(min(plafond,max(DUREE_MIN_PLAN,duree)),3),"recommandation":"cut"}); precedente=source
+        for prise in prises:
+            rang=len(plan); transition=prise["recommandation"] if prise["recommandation"] in autorisees and prise["recommandation"] in cycle else cycle[rang % len(cycle)]
+            if len(cycle)>1 and transition==transition_precedente: transition=next(x for x in cycle[rang%len(cycle):]+cycle[:rang%len(cycle)] if x != transition_precedente)
+            if rang==0: transition,td="none",0.0
+            elif transition=="cut": td=.05
+            else: td=(.22,.28,.34)[rang%3]*echelle_intensite
+            td=min(.55,td,max(.02,prise["duree"]/3))
+            plan.append({**segment,"source":prise["source"],"debut":prise["debut"],"duree":prise["duree"],"transition":transition,"transition_duree":round(td,3)})
+            transition_precedente=transition
+        continue
 
         transition = (
             recommandation if recommandation in autorisees and recommandation in cycle
@@ -806,27 +823,25 @@ def _mettre_accent_ass(texte: str, style: StyleReference) -> str:
 
 
 def construire_cues(plan: list[dict[str, Any]], mots_par_ecran: int) -> list[dict[str, Any]]:
-    cues: list[dict[str, Any]] = []
-    debut_clip = 0.0
-    for index, clip in enumerate(plan):
-        if index:
-            debut_clip -= float(clip["transition_duree"])
-        fin_affichage = debut_clip + float(clip["duree"])
-        if index + 1 < len(plan):
-            fin_affichage -= float(plan[index + 1]["transition_duree"])
-        mots = str(clip.get("texte", "")).split()
-        groupes = [mots[i:i + mots_par_ecran] for i in range(0, len(mots), mots_par_ecran)]
-        if groupes:
-            fenetre = max(0.2, fin_affichage - debut_clip)
-            pas = fenetre / len(groupes)
-            for no, groupe in enumerate(groupes):
-                cues.append({
-                    "texte": " ".join(groupe), "debut": debut_clip + no * pas,
-                    "fin": min(fin_affichage, debut_clip + (no + 1) * pas),
-                })
-        debut_clip += float(clip["duree"])
+    fenetres: list[dict[str, Any]] = []
+    curseur = 0.0
+    for clip in plan:
+        if fenetres: curseur -= float(clip["transition_duree"])
+        texte = str(clip.get("texte", ""))
+        if fenetres and texte and fenetres[-1]["texte"] == texte and fenetres[-1]["id"] == clip.get("id"):
+            fenetres[-1]["fin"] = curseur + float(clip["duree"])
+        else:
+            fenetres.append({"id": clip.get("id"), "texte": texte, "debut": curseur, "fin": curseur + float(clip["duree"])})
+        curseur += float(clip["duree"])
+    cues=[]
+    for i,f in enumerate(fenetres):
+        mots=f["texte"].split()
+        if not mots: continue
+        fin=min(f["fin"], fenetres[i+1]["debut"] if i+1<len(fenetres) else f["fin"])
+        groupes=[mots[j:j+mots_par_ecran] for j in range(0,len(mots),mots_par_ecran)]
+        pas=max(.2,fin-f["debut"])/len(groupes)
+        for n,g in enumerate(groupes): cues.append({"texte":" ".join(g),"debut":f["debut"]+n*pas,"fin":min(fin,f["debut"]+(n+1)*pas)})
     return cues
-
 
 def ecrire_ass(
     destination: Path,

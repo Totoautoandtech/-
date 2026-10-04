@@ -55,6 +55,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from studio_montage import (
     DUREE_MAX_PLAN_DEFAUT,
+    MOTS_PAR_SECONDE_PAROLE,
     ConfigurationMontage,
     ErreurMontage,
     Rapporteur,
@@ -2294,7 +2295,7 @@ def _selectionner_sources_rst(
 
 def _reduire_selon_estimation(
     sources: list[dict], config: ConfigurationMontage, plafond: int = 540,
-    duree_reference: float = 0.0,
+    duree_reference: float = 0.0, duree_sortie_estimee: float = 0.0,
 ) -> list[dict]:
     """Retire les dernières sources tant que l'estimation dépasse le plafond prudent.
 
@@ -2305,7 +2306,7 @@ def _reduire_selon_estimation(
         durees = [float(s.get("duration") or 0) for s in sources]
         if duree_reference > 0:
             durees = [min(duree_reference, config.duree_max_source)] + durees
-        estimation = estimer_duree_traitement(durees, 0.0, config)
+        estimation = estimer_duree_traitement(durees, 0.0, config, duree_sortie_estimee=duree_sortie_estimee)
         if estimation["estimated_seconds"] <= plafond:
             break
         retiree = sources.pop()
@@ -2608,8 +2609,11 @@ async def _produire_rst(
         duree_reference = float(seed_infos.get("duration") or 0)
     except (TypeError, ValueError):
         duree_reference = 0.0
+    mots_script = len(script["hook"].split()) + len(script["corps"].split())
+    duree_parole = round(mots_script / MOTS_PAR_SECONDE_PAROLE, 1)
     selectionnees = _reduire_selon_estimation(
-        selectionnees, configuration, plafond_reel, duree_reference=duree_reference
+        selectionnees, configuration, plafond_reel, duree_reference=duree_reference,
+        duree_sortie_estimee=duree_parole
     )
     if not selectionnees:
         rejets = [str(c.get("rejet") or "raison inconnue") for c in trouves if not c.get("selected")]
