@@ -410,7 +410,7 @@ Retourne UNIQUEMENT cet objet JSON strict :
 {{"scenes":[{{"debut":0.0,"fin":5.0,"sujet":"...","action_mouvement":"...","qualite":"bonne|moyenne|faible","nettete":0.8,"cadrage":"...","texte_visible":false,"texte_sous_titres":false,"personne_visible":false,"watermark":false,"logo_visible":false,"autre_element_superpose":false,"pertinence_script":[{{"id":0,"score":0.8}}],"rythme":"dynamique|modéré|statique","transition_recommandee":"cut|fade|slide|zoom","score_pertinence":0.8}}]}}
 Contraintes : temps réels dans [0,{duree:.2f}], scènes intéressantes seulement, actions complètes si possible, score 0..1. Décris le sujet, l'action, la qualité/netteté et le cadrage. Distingue précisément : texte_visible = tout texte, texte_sous_titres = uniquement une transcription de paroles, personne_visible = une personne même partielle, watermark, logo_visible = logo ajouté/incrusté à l'image (pas l'emblème physique normal du produit filmé), autre_element_superpose = stickers, pseudos, boutons ou décorations. Indique la pertinence POUR CHAQUE partie concernée, le rythme et la transition. N'invente rien et n'ajoute aucune clé.
 PERTINENCE VISUELLE ET IDENTITÉ STRICTES (critères les plus importants) :
-- Identifie exactement le modèle, produit, personne, lieu ou objet demandé. Si le script dit « Golf 8 », une autre Volkswagen, une Golf 7 ou une voiture générique est hors sujet et reçoit 0.15 MAXIMUM.
+- Identifie exactement le modèle, produit, personne, lieu ou objet demandé. Si le script donne un modèle ou un identifiant exact, toute variante ou image générique est hors sujet et reçoit 0.15 MAXIMUM.
 - N'accepte aucune personne visible sur les plans d'objet/voiture/produit, même si elle ne cache qu'une petite partie du sujet.
 - Les sous-titres TikTok déjà incrustés sont autorisés. Tout autre texte, logo, watermark, sticker, pseudo ou élément graphique superposé est interdit.
 - N'accorde JAMAIS un bon score à un plan seulement parce qu'il est esthétique ou bien filmé : la beauté ne fait pas la pertinence.
@@ -839,8 +839,8 @@ def selectionner_plan(
             recommandation = str(scene.get("transition_recommandee", "cut")).lower()
         else:
             raise ErreurMontage(
-                "Aucune scène cohérente, professionnelle et sans personne/logo/watermark "
-                "n'est disponible. Les sous-titres intégrés sont les seuls overlays autorisés. "
+                "Aucune scène cohérente, professionnelle, sans personne, sans texte ni watermark, "
+                "ou sans logo ajouté n'est disponible. Les sous-titres intégrés sont les seuls overlays autorisés. "
             )
 
         transition = (

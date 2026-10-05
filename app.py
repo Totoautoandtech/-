@@ -39,6 +39,7 @@ import re
 import secrets
 import shutil
 import time
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,7 +52,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from studio_montage import (
     DUREE_MAX_PLAN_DEFAUT,
@@ -61,6 +62,7 @@ from studio_montage import (
     TravailAnnule,
     analyser_video,
     construire_montage_professionnel,
+    creer_apercu,
     diagnostiquer_montage,
     estimer_duree_traitement,
     executer_commande,
@@ -263,6 +265,10 @@ DOSSIER_TRAVAIL = RACINE / "travail"
 DOSSIER_TRAVAIL.mkdir(exist_ok=True)
 DOSSIER_VOIX_OFF = DOSSIER_TRAVAIL / "voixoff"
 DOSSIER_VOIX_OFF.mkdir(parents=True, exist_ok=True)
+# Profils d'entraînement privés : un seul JSON 0600 par cookie de session.
+# Le nom du sujet n'est jamais utilisé pour choisir un fichier ou un chemin.
+DOSSIER_PROFILS_ENTRAINEMENT = DOSSIER_TRAVAIL / "profils-entrainement"
+DOSSIER_PROFILS_ENTRAINEMENT.mkdir(parents=True, exist_ok=True)
 
 
 def _dossier_voix_off(session_id: str) -> Path:
@@ -328,15 +334,16 @@ def _configuration_montage(
         budget_disque_sources=CONFIG.budget_disque_sources,
         analyses_concurrentes=CONFIG.analyses_concurrentes,
         preset=CONFIG.preset_export,
-        # La qualité d'encodage est désormais constante, même si un ancien client
-        # envoie encore « rapide ». La résolution 1080 reste protégée par la variable.
-        crf=21,
+        # Le mode Qualité respecte CRF 21 ; le mode Rapide garde CRF 23 pour
+        # terminer plus vite sur Render. Les exports de la configuration par défaut
+        # restent donc en qualité, sans promettre du 1080 si l'instance ne l'autorise.
+        crf=21 if mode == "qualite" else 23,
         threads_ffmpeg=CONFIG.threads_ffmpeg,
         autoriser_1080=CONFIG.autoriser_export_1080,
         duree_max_plan=float(duree_max_plan),
         exiger_validation_ia=True,
         # Tous les modes exigent désormais une correspondance directe entre le texte
-        # et l'objet exact visible (ex. Golf 8, jamais une voiture générique).
+        # et l'objet exact visible (ex. un modèle exact, jamais un produit générique).
         exiger_pertinence_visuelle=True,
         duree_min_video=DUREE_MIN_VIDEO_SECONDES,
     )
@@ -2368,7 +2375,8 @@ def _selectionner_sources_rst(
         if duree > duree_max:
             candidate["rejet"] = f"durée {duree:.0f} s au-delà de la limite de {duree_max:.0f} s"
             continue
-        candidate["selected"] = True
+        candidate["selected"] = False
+        candidate["validation_status"] = "awaiting_visual_ai"
         retenues.append(candidate)
     return retenues, candidats
 
@@ -2692,6 +2700,13 @@ async def _produire_rst(
     selectionnees = _reduire_selon_estimation(
         selectionnees, configuration, plafond_reel, duree_reference=duree_reference
     )
+    # Une candidate n'est pas affichée comme « retenue » pendant que Gemini et
+    # FFprobe valident encore ses plans. Le statut est publié provisoirement ;
+    # `selected=True` n'est rétabli qu'après le montage réussi ci-dessous.
+    for candidate in trouves:
+        if candidate in selectionnees:
+            candidate["selected"] = False
+            candidate["validation_status"] = "awaiting_visual_ai"
     if not selectionnees:
         rejets = [str(c.get("rejet") or "raison inconnue") for c in trouves if not c.get("selected")]
         detail = " ; ".join(rejets[:6]) if rejets else "durées hors limites"
@@ -2705,7 +2720,7 @@ async def _produire_rst(
         statut="selecting", progress=44,
         detail=(
             f"Budget restant : {budget_restant} s — "
-            f"{len(selectionnees)} source(s) retenue(s) sur {len(trouves)} trouvée(s)"
+            f"{len(selectionnees)} candidate(s) en validation sur {len(trouves)} trouvée(s)"
             + (f" — {len(noms_couverts)}/{len(noms)} nom(s) couvert(s)" if noms else "")
         ),
         found_videos=trouves, search_queries=requetes_reelles, noms=noms,
@@ -2732,6 +2747,10 @@ async def _produire_rst(
         intensite_transitions=requete.intensite_transitions,
         voix_off=_resoudre_voix_off(session_id, requete.voix_off),
     )
+    # La construction a terminé toutes les validations visuelles nécessaires.
+    for candidate in selectionnees:
+        candidate["selected"] = True
+        candidate["validation_status"] = "validated"
     await envoyer_script_et_video(script["hook"], script["corps"], resultat["path"])
 
     # Livraison séparée : la vidéo reste muette, le script et la voix off partent à côté.
@@ -2758,6 +2777,493 @@ async def _produire_rst(
         script=script, found_videos=trouves, search_queries=requetes_reelles,
         noms=noms, nombre_noms=nombre_noms, noms_couverts=noms_couverts,
         duree_max_plan=RST_DUREE_MAX_PLAN, **livraison,
+    )
+    return resultat
+
+
+
+# ======================================================================================
+# PROFILS D'ENTRAÎNEMENT VISUEL
+# ======================================================================================
+
+PROMPT_PROFIL_VISUEL = """Tu es un contrôleur visuel strict. Regarde toute la vidéo jointe et retourne
+UNIQUEMENT un objet JSON valide. Sujet demandé : {sujet}. Alias autorisés : {alias}.
+Le but est d'apprendre une signature visuelle, pas de deviner à partir du titre.
+Schéma exact :
+{{"sujet_visible":"", "sujet_correspond":true, "confiance":0.0,
+"passages_propres":[{{"debut":0.0,"fin":5.0,"raison":""}}],
+"personnes":[], "watermarks":[], "logos_ajoutes":[], "textes":[],
+"sous_titres_tiktok":[], "qualite":"bonne", "nettete":0.0,
+"signature_positive":"", "signature_negative":"", "valide":false,
+"raison_refus":""}}
+Règles non négociables : une personne, même partielle, un pseudo, sticker, watermark,
+logo ajouté ou texte autre qu'un vrai sous-titre TikTok rend le passage invalide.
+L'emblème physique normal du produit ou véhicule filmé n'est pas un logo ajouté.
+Identifie visuellement le sujet exact et le modèle, ne te fie ni à la popularité ni à la légende.
+Les signatures déjà apprises, si elles existent, sont des contraintes supplémentaires : positive = {signature_positive}, négative = {signature_negative}.
+Les timestamps doivent rester dans la durée de la vidéo et ne retenir que des passages nets,
+sans personne et sans overlay interdit. La confiance est un nombre entre 0 et 1."""
+
+
+def _fichier_profils_session(session_id: str) -> Path:
+    empreinte = hashlib.sha256(str(session_id or "anonyme").encode("utf-8")).hexdigest()
+    return DOSSIER_PROFILS_ENTRAINEMENT / f"{empreinte}.json"
+
+
+def _profils_session(session_id: str) -> list[dict[str, Any]]:
+    chemin = _fichier_profils_session(session_id)
+    try:
+        donnees = json.loads(chemin.read_text(encoding="utf-8")) if chemin.exists() else []
+        return donnees if isinstance(donnees, list) else []
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Profils d'entraînement illisibles pour la session : %s", exc)
+        return []
+
+
+def _ecrire_profils_session(session_id: str, profils: list[dict[str, Any]]) -> None:
+    chemin = _fichier_profils_session(session_id)
+    temporaire = chemin.with_suffix(".tmp")
+    temporaire.write_text(json.dumps(profils, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.chmod(temporaire, 0o600)
+    temporaire.replace(chemin)
+    os.chmod(chemin, 0o600)
+
+
+def _liste_propre(valeur: Any, limite: int = 30) -> list[str]:
+    if isinstance(valeur, str):
+        valeurs = re.split(r"[\n,;]+", valeur)
+    elif isinstance(valeur, (list, tuple)):
+        valeurs = valeur
+    else:
+        valeurs = []
+    resultat: list[str] = []
+    vus: set[str] = set()
+    for entree in valeurs:
+        texte = re.sub(r"\s+", " ", str(entree or "").strip())
+        if not texte or len(texte) > 200 or texte.casefold() in vus:
+            continue
+        vus.add(texte.casefold())
+        resultat.append(texte)
+        if len(resultat) >= limite:
+            break
+    return resultat
+
+
+def _liens_propres_profil(valeur: Any, limite: int = 30) -> list[str]:
+    resultat: list[str] = []
+    vus: set[str] = set()
+    valeurs = valeur if isinstance(valeur, list) else re.split(r"[\n,;]+", str(valeur or ""))
+    for brut in valeurs:
+        if not str(brut).strip():
+            continue
+        try:
+            lien = normaliser_lien_tiktok(str(brut))
+        except ErreurMontage:
+            continue
+        if lien not in vus:
+            vus.add(lien)
+            resultat.append(lien)
+        if len(resultat) >= limite:
+            break
+    return resultat
+
+
+def _profil_depuis_payload(payload: dict[str, Any], existant: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Normalise les noms français et anglais afin que le format persistant reste stable."""
+    base = dict(existant or {})
+    source = {**base, **(payload or {})}
+    nom = str(source.get("nom_sujet") or source.get("subject") or source.get("subject_name") or source.get("name") or "").strip()
+    if not nom:
+        raise ErreurApp("Le nom du sujet est obligatoire pour un profil d'entraînement.")
+    aliases = source.get("alias", source.get("aliases", source.get("alias_sujet", [])))
+    bons = source.get("bons_exemples", source.get("good_examples", source.get("good_examples_tiktok", source.get("good", []))))
+    mauvais = source.get("mauvais_exemples", source.get("bad_examples", source.get("bad_examples_tiktok", source.get("bad", []))))
+    identifiant = str(source.get("id") or uuid.uuid4().hex).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", identifiant):
+        identifiant = uuid.uuid4().hex
+    maintenant = time.time()
+    return {
+        "id": identifiant,
+        "nom_sujet": nom,
+        "alias": _liste_propre(aliases),
+        "aliases": _liste_propre(aliases),
+        "bons_exemples": _liens_propres_profil(bons),
+        "mauvais_exemples": _liens_propres_profil(mauvais),
+        "donnees": dict(source.get("donnees") or {}) if isinstance(source.get("donnees"), dict) else {},
+        # Ces collections sont conservées lors d'une édition ou d'une nouvelle analyse.
+        "sources_validees": list(source.get("sources_validees") or []) if isinstance(source.get("sources_validees"), list) else [],
+        "sources_auto_ajoutees": list(source.get("sources_auto_ajoutees") or []) if isinstance(source.get("sources_auto_ajoutees"), list) else [],
+        "updated_at": float(source.get("updated_at") or maintenant),
+    }
+
+
+def _profil_public(profil: dict[str, Any]) -> dict[str, Any]:
+    resultat = dict(profil)
+    resultat["aliases"] = list(profil.get("aliases") or profil.get("alias") or [])
+    resultat["source_count"] = len(profil.get("sources_validees") or [])
+    resultat["sources_automatiquement_ajoutees"] = len(profil.get("sources_auto_ajoutees") or [])
+    return resultat
+
+
+def _champ_bool(analysis: dict[str, Any], *cles: str) -> bool:
+    return any(bool(analysis.get(cle)) for cle in cles)
+
+
+def _score_confiance_profil(analysis: dict[str, Any]) -> float:
+    try:
+        return max(0.0, min(1.0, float(analysis.get("confiance", 0))))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _analyse_profil_valide(analysis: dict[str, Any], profil: dict[str, Any]) -> tuple[bool, str]:
+    texte_sujet = str(analysis.get("sujet_visible") or "").casefold()
+    termes = [profil.get("nom_sujet", ""), *(profil.get("alias") or [])]
+    sujet_confirme = bool(analysis.get("sujet_correspond")) and any(
+        terme and (terme.casefold() in texte_sujet or texte_sujet in terme.casefold()) for terme in termes
+    )
+    personnes = analysis.get("personnes") or analysis.get("personne_visible")
+    watermarks = analysis.get("watermarks") or analysis.get("watermark")
+    logos = analysis.get("logos_ajoutes") or analysis.get("logo_visible")
+    textes = analysis.get("textes") or analysis.get("texte_interdit")
+    try:
+        nettete = float(analysis.get("nettete", 0))
+    except (TypeError, ValueError):
+        nettete = 0.0
+    qualite = str(analysis.get("qualite", "")).casefold()
+    propre = qualite in {"bonne", "excellent", "excellente", "professionnelle"} and nettete >= 0.65
+    if not sujet_confirme:
+        return False, "sujet différent ou sujet exact non confirmé"
+    if personnes:
+        return False, "personne visible"
+    if watermarks:
+        return False, "watermark détecté"
+    if logos:
+        return False, "logo ajouté détecté"
+    if textes:
+        return False, "texte ou sticker interdit détecté"
+    if not propre:
+        return False, "qualité ou netteté insuffisante"
+    if _score_confiance_profil(analysis) < 0.65:
+        return False, "confiance IA insuffisante"
+    passages = analysis.get("passages_propres") or []
+    if not passages:
+        return False, "aucun passage propre horodaté"
+    return True, "source visuellement validée"
+
+
+async def analyser_exemple_entrainement(
+    session: aiohttp.ClientSession,
+    url: str,
+    profil: dict[str, Any],
+    *,
+    est_bon: bool = True,
+) -> dict[str, Any]:
+    """Télécharge un exemple, le fait regarder par Gemini et conserve tous ses signaux."""
+    url = normaliser_lien_tiktok(url)
+    direct = await _resoudre_video_tiktok(session, url)
+    with tempfile.TemporaryDirectory(prefix="profil-", dir=str(DOSSIER_TRAVAIL)) as dossier_str:
+        dossier = Path(dossier_str)
+        source = dossier / "source.mp4"
+        await _telecharger_fichier(session, direct, source)
+        infos = await sonder_video(source, timeout=min(30, CONFIG.delai_ffmpeg))
+        config = _configuration_montage("qualite", RST_DUREE_MAX_PLAN, True)
+        rapporteur = Rapporteur(lambda *_args, **_kwargs: None, lambda: False, lambda: 1e9)
+        apercu = dossier / "apercu.mp4"
+        await creer_apercu(source, apercu, float(infos["duration"]), config, rapporteur)
+        contenu = await asyncio.to_thread(apercu.read_bytes)
+        parts = [{"inline_data": {"mime_type": "video/mp4", "data": base64.b64encode(contenu).decode("ascii")}}, {
+            "text": PROMPT_PROFIL_VISUEL.format(
+                sujet=profil["nom_sujet"], alias=json.dumps(profil.get("alias") or [], ensure_ascii=False),
+                signature_positive=json.dumps((profil.get("donnees") or {}).get("signature_positive", []), ensure_ascii=False),
+                signature_negative=json.dumps((profil.get("donnees") or {}).get("signature_negative", []), ensure_ascii=False),
+            )
+        }]
+        brut = await asyncio.wait_for(
+            _appel_gemini_brut(parts, temperature=0.1, json_mode=True),
+            timeout=CONFIG.delai_gemini,
+        )
+    objet = _parser_json(brut)
+    if not isinstance(objet, dict):
+        raise ErreurApp("Analyse du profil invalide : Gemini n'a pas renvoyé un objet JSON.")
+    objet.setdefault("sujet_visible", "")
+    objet.setdefault("sujet_correspond", False)
+    objet.setdefault("confiance", 0.0)
+    objet.setdefault("passages_propres", [])
+    objet.setdefault("personnes", [])
+    objet.setdefault("watermarks", [])
+    objet.setdefault("logos_ajoutes", [])
+    objet.setdefault("textes", [])
+    objet.setdefault("sous_titres_tiktok", [])
+    objet.setdefault("signature_positive", "")
+    objet.setdefault("signature_negative", "")
+    objet["url"] = url
+    objet["duration"] = infos["duration"]
+    objet["est_bon_exemple"] = est_bon
+    valide, raison = _analyse_profil_valide(objet, profil)
+    objet["valide"] = valide
+    objet["raison_refus"] = "" if valide else raison
+    if valide and not str(objet.get("signature_positive") or "").strip():
+        objet["signature_positive"] = (
+            f"Sujet exact « {objet.get('sujet_visible', profil['nom_sujet'])} », "
+            "passages propres, sans personne ni overlay interdit, qualité confirmée."
+        )
+    if not valide and not str(objet.get("signature_negative") or "").strip():
+        objet["signature_negative"] = raison
+    # Les timestamps sont bornés et triés avant d'être persistés.
+    passages = []
+    for passage in objet.get("passages_propres") or []:
+        try:
+            debut, fin = max(0.0, float(passage.get("debut", 0))), min(float(infos["duration"]), float(passage.get("fin", 0)))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if fin > debut and fin - debut <= RST_DUREE_MAX_PLAN:
+            passages.append({**passage, "debut": round(debut, 3), "fin": round(fin, 3)})
+    objet["passages_propres"] = passages
+    return objet
+
+
+async def _candidates_profil(session: aiohttp.ClientSession, profil: dict[str, Any], limite: int = 10) -> list[dict[str, Any]]:
+    candidats: dict[str, dict[str, Any]] = {}
+    requetes = _liste_propre([profil["nom_sujet"], *(profil.get("alias") or [])], 10)
+    for requete in requetes:
+        try:
+            donnees = await _donnees_tikwm(session, "/feed/search", {"keywords": requete, "count": str(max(5, limite // max(1, len(requetes))) )})
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Recherche de profil indisponible pour %s : %s", requete, exc)
+            continue
+        for video in donnees.get("videos") or []:
+            candidat = _normaliser_candidat_rst(video, f"entraînement « {requete} »", requete)
+            if candidat and candidat["video_id"] not in candidats:
+                candidats[candidat["video_id"]] = candidat
+            if len(candidats) >= limite:
+                break
+        if len(candidats) >= limite:
+            break
+    return list(candidats.values())
+
+
+async def analyser_profil_entrainement(profil: dict[str, Any]) -> dict[str, Any]:
+    """Analyse les exemples positifs/négatifs puis enrichit le profil avec des sources validées."""
+    profil = _profil_depuis_payload(profil, profil)
+    exemples: list[dict[str, Any]] = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90, connect=15)) as session:
+        for url in profil["bons_exemples"]:
+            try:
+                exemples.append(await analyser_exemple_entrainement(session, url, profil, est_bon=True))
+            except Exception as exc:  # garder le profil complet même si un exemple échoue
+                exemples.append({"url": url, "est_bon_exemple": True, "valide": False, "raison_refus": str(exc)})
+        for url in profil["mauvais_exemples"]:
+            try:
+                exemples.append(await analyser_exemple_entrainement(session, url, profil, est_bon=False))
+            except Exception as exc:
+                exemples.append({"url": url, "est_bon_exemple": False, "valide": False, "raison_refus": str(exc)})
+
+        profil.setdefault("donnees", {})["exemples_analyses"] = exemples
+        profil["donnees"]["signature_positive"] = [e.get("signature_positive", "") for e in exemples if e.get("est_bon_exemple") and e.get("valide")]
+        profil["donnees"]["signature_negative"] = [
+            e.get("signature_negative") or e.get("raison_refus", "")
+            for e in exemples if not e.get("est_bon_exemple") or not e.get("valide")
+        ]
+        profil["donnees"]["confiance_moyenne"] = round(
+            sum(_score_confiance_profil(e) for e in exemples) / max(1, len(exemples)), 3
+        )
+        profil["donnees"]["sources_exemples_analysees"] = len(exemples)
+
+        existantes = {str(source.get("video_id") or source.get("url", "")).strip() for source in profil.get("sources_validees", [])}
+        automatiques: list[dict[str, Any]] = []
+        for candidat in await _candidates_profil(session, profil, limite=10):
+            if candidat["video_id"] in existantes:
+                continue
+            try:
+                analyse = await analyser_exemple_entrainement(session, candidat["url"], profil, est_bon=True)
+            except Exception as exc:
+                candidat.update(valide=False, raison_refus=str(exc), validation_status="rejected")
+                continue
+            if analyse.get("valide"):
+                candidat.update(
+                    validation_status="validated", validation=analyse,
+                    passages_propres=analyse.get("passages_propres", []),
+                    video_id=candidat["video_id"],
+                )
+                automatiques.append(candidat)
+                existantes.add(candidat["video_id"])
+            # Les refus ne sont pas ajoutés aux sources utilisables, mais leur analyse
+            # reste dans l'historique afin de préserver les données du profil.
+            profil["donnees"].setdefault("candidates_analysees", []).append({
+                **candidat, "validation": analyse,
+            })
+        profil.setdefault("sources_validees", []).extend(automatiques)
+        profil["sources_auto_ajoutees"] = automatiques
+        profil["donnees"]["nombre_sources_auto_ajoutees"] = len(automatiques)
+        profil["donnees"]["termine_le"] = time.time()
+    profil["updated_at"] = time.time()
+    return profil
+
+
+
+# ======================================================================================
+# SsT : noms saisis manuellement, recherche indépendante et référence de montage
+# ======================================================================================
+
+PROMPT_ADAPTATION_SST = """Réécris le script de cette vidéo TikTok pour une vidéo TOP {nombre}.
+Les seuls sujets autorisés sont exactement ceux de cette liste : {noms}.
+Tu ne dois supprimer, remplacer, corriger, traduire, compléter ou inventer aucun nom.
+N'ajoute aucun autre nom propre. Garde le rythme et l'intention de la source.
+Retourne uniquement un JSON avec les clés hook, corps et mot_cle_broll.
+Le hook doit être court ; le corps doit contenir chaque nom autorisé au moins une fois.
+Source : {source}"""
+
+
+def _noms_sst_valides(noms: Any, nombre: Any) -> list[str]:
+    try:
+        attendu = int(nombre)
+    except (TypeError, ValueError):
+        raise ErreurApp("SsT accepte uniquement TOP 3 ou TOP 5.")
+    if attendu not in RST_NOMS_CHOIX:
+        raise ErreurApp("SsT accepte uniquement TOP 3 ou TOP 5.")
+    resultat = [re.sub(r"\s+", " ", str(nom or "").strip()) for nom in (noms or [])]
+    if len(resultat) != attendu or any(not nom or len(nom) > 80 for nom in resultat):
+        raise ErreurApp(f"SsT exige exactement {attendu} noms différents saisis manuellement.")
+    if len({nom.casefold() for nom in resultat}) != attendu:
+        raise ErreurApp("SsT exige des noms tous différents ; l'IA ne les remplacera pas.")
+    return resultat
+
+
+async def adapter_script_sst(source: str, noms: list[str]) -> dict[str, str]:
+    """Adapte un texte sans jamais déléguer le choix des noms à l'IA."""
+    prompt = PROMPT_ADAPTATION_SST.format(
+        nombre=len(noms), noms=json.dumps(noms, ensure_ascii=False), source=source[:6000]
+    )
+    try:
+        brut = await _appel_gemini_brut([{"text": prompt}], temperature=0.2, json_mode=True)
+        resultat = _parser_json(brut)
+        if not isinstance(resultat, dict):
+            raise ErreurApp("Réponse SsT non exploitable.")
+        hook = str(resultat.get("hook") or "").strip()
+        corps = str(resultat.get("corps") or "").strip()
+        mot_cle = str(resultat.get("mot_cle_broll") or "").strip() or "sujet principal"
+        if not hook or not corps:
+            raise ErreurApp("Réponse SsT incomplète.")
+    except Exception as exc:  # repli déterministe, sans création de nom
+        logger.warning("Adaptation SsT IA indisponible, repli contrôlé : %s", exc)
+        hook = f"TOP {len(noms)} : {noms[0]} et les autres"
+        corps = "Voici les sujets demandés : " + ", ".join(noms) + ". " + source[:500]
+        mot_cle = noms[0]
+    # Une réponse IA qui oublierait un nom est complétée avec les noms fournis, jamais
+    # avec des noms extraits ou déduits. Cela rend le contrat SsT vérifiable côté serveur.
+    manquants = [nom for nom in noms if nom.casefold() not in f"{hook} {corps}".casefold()]
+    if manquants:
+        corps = f"{corps.rstrip('.')} . " + " . ".join(manquants)
+    return {"hook": hook, "corps": corps, "mot_cle_broll": mot_cle}
+
+
+def _selectionner_sources_sst(candidats: list[dict[str, Any]], noms: list[str], limite: int, duree_max: float) -> list[dict[str, Any]]:
+    """Sélectionne en tours équilibrés sans annoncer une source avant la validation IA."""
+    ordonnes = _repartir_par_nom(candidats, noms)
+    retenues: list[dict[str, Any]] = []
+    vus_noms: set[str] = set()
+    for candidat in ordonnes:
+        candidat["selected"] = False
+        candidat["validation_status"] = "awaiting_visual_ai"
+        duree = float(candidat.get("duration") or 0)
+        if duree < DUREE_MIN_SOURCE_RST:
+            candidat["rejet"] = f"durée {duree:.0f} s trop courte"
+            candidat["validation_status"] = "rejected_before_ai"
+            continue
+        if duree > duree_max:
+            candidat["rejet"] = f"durée {duree:.0f} s au-delà de la limite"
+            candidat["validation_status"] = "rejected_before_ai"
+            continue
+        # Un tour complet par nom est prioritaire. Les tours suivants complètent le quota.
+        cle = str(candidat.get("nom") or "").casefold()
+        if len(retenues) < limite and (cle not in vus_noms or len(vus_noms) >= len(noms)):
+            retenues.append(candidat)
+            vus_noms.add(cle)
+        else:
+            candidat["rejet"] = "quota équilibré atteint"
+    # Si une recherche n'a aucun résultat, remplir avec les noms qui ont encore des vidéos.
+    for candidat in ordonnes:
+        if len(retenues) >= limite:
+            break
+        if candidat in retenues or candidat.get("rejet"):
+            continue
+        retenues.append(candidat)
+    return retenues
+
+
+async def _produire_sst(requete: "RequeteSst", contexte: "ContexteJob", session_id: str = "") -> dict[str, Any]:
+    lien = normaliser_lien_tiktok(requete.lien.strip())
+    noms = _noms_sst_valides(requete.noms, requete.nombre_noms)
+    profil = None
+    if requete.profil_id:
+        profil = next((item for item in _profils_session(session_id) if item.get("id") == requete.profil_id), None)
+        if profil is None:
+            raise ErreurApp("Le profil d'entraînement sélectionné n'existe plus dans cette session.")
+    contexte.update(statut="analysing", progress=4, detail="Lecture de la vidéo source SsT", noms_saisis=noms, profil_id=requete.profil_id)
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90, connect=15)) as session:
+        donnees = await _donnees_tikwm(session, "/", {"url": lien, "hd": "1"})
+        source = str(donnees.get("title") or "").strip()
+        if not source:
+            raise ErreurApp("La vidéo source SsT ne possède pas de texte exploitable.")
+        contexte.update(statut="analysing", progress=14, detail="Adaptation du script aux noms saisis", noms_saisis=noms)
+        script = await adapter_script_sst(source, noms)
+        contexte.update(statut="searching", progress=20, detail="Recherche indépendante du nom 1", script=script, noms_saisis=noms)
+        candidats: dict[str, dict[str, Any]] = {}
+        recherches: list[str] = []
+        quota_par_nom = max(5, CONFIG.rst_candidats_max // len(noms))
+        identifiant_source = str(donnees.get("id") or donnees.get("video_id") or "")
+        for rang, nom in enumerate(noms, 1):
+            recherches.append(nom)
+            contexte.update(
+                statut="searching", progress=20 + int(22 * rang / len(noms)),
+                detail=f"Recherche indépendante {rang}/{len(noms)} : « {nom} »",
+                recherches=recherches, noms_saisis=noms,
+            )
+            try:
+                resultats = await _donnees_tikwm(session, "/feed/search", {"keywords": nom, "count": str(quota_par_nom)})
+            except Exception as exc:  # une recherche isolée ne remplace pas un nom
+                logger.info("Recherche SsT indisponible pour %s : %s", nom, exc)
+                continue
+            for video in resultats.get("videos") or []:
+                candidat = _normaliser_candidat_rst(video, f"recherche SsT « {nom} »", nom)
+                if not candidat or candidat["video_id"] == identifiant_source:
+                    continue
+                candidats.setdefault(candidat["video_id"], candidat)
+        trouves = _repartir_par_nom(list(candidats.values()), noms)[: CONFIG.rst_candidats_max]
+        contexte.update(
+            statut="selecting", progress=45,
+            detail=f"{len(trouves)} candidate(s) trouvée(s) — validation visuelle IA obligatoire",
+            found_videos=trouves, recherches=recherches, noms_saisis=noms,
+        )
+        selectionnees = _selectionner_sources_sst(trouves, noms, CONFIG.rst_sources_max, float(CONFIG.duree_max_source))
+        if not selectionnees:
+            raise ErreurApp("SsT n'a trouvé aucune source exploitable pour les noms saisis.")
+        configuration = _configuration_montage(requete.mode, RST_DUREE_MAX_PLAN, True)
+        resultat = await construire_montage_professionnel(
+            liens=[candidate["url"] for candidate in selectionnees],
+            lien_reference=lien,
+            reference_optionnelle=False,
+            hook=script["hook"], corps=script["corps"], resolution="720",
+            style_sous_titres="classique", config=configuration,
+            rapporteur=_rapporteur_decale(contexte, 48.0, 0.45),
+            resolveur=_resoudre_video_tiktok, telechargeur=_telecharger_fichier,
+            appel_gemini=_appel_gemini_brut,
+            intensite_transitions=requete.intensite_transitions,
+            voix_off=_resoudre_voix_off(session_id, requete.voix_off),
+        )
+    # Le statut « retenue » n'apparaît qu'après le téléchargement, l'analyse IA,
+    # le montage et le FFprobe final. Une candidate rejetée n'est jamais affichée comme retenue.
+    urls_validees = {str(item.get("url")) for item in resultat.get("sources") or [] if item.get("status") in {"analysed", "downloaded"}}
+    for candidate in trouves:
+        if candidate in selectionnees and (not urls_validees or candidate["url"] in urls_validees):
+            candidate.update(selected=True, validation_status="validated")
+        elif candidate.get("validation_status") == "awaiting_visual_ai":
+            candidate.update(selected=False, validation_status="rejected_by_visual_ai", rejet="validation visuelle IA non concluante")
+    resultat.update(
+        script=script, found_videos=trouves, noms_saisis=noms, noms=noms,
+        nombre_noms=len(noms), search_queries=recherches, profile_id=requete.profil_id,
+        source_video_reference=lien, source_video_used_only_as_reference=True,
     )
     return resultat
 
@@ -2929,6 +3435,55 @@ class RequeteRst(BaseModel):
             attendus = " ou ".join(str(choix) for choix in RST_NOMS_CHOIX)
             raise ValueError(f"nombre_noms doit valoir {attendus}.")
         return valeur
+
+
+class RequeteSst(BaseModel):
+    """SsT : une vidéo de départ, puis 3 ou 5 noms saisis par l'utilisateur.
+
+    Contrairement à RsT, aucun nom n'est extrait ou ajouté par l'IA. La validation
+    ci-dessous est volontairement stricte afin qu'une recherche ne puisse jamais
+    remplacer silencieusement un nom demandé par un sujet populaire voisin.
+    """
+    titre: str = Field(default="", max_length=120)
+    lien: str = Field(min_length=1, max_length=2048)
+    nombre_noms: int = Field(default=3)
+    noms: list[str] = Field(default_factory=list, min_length=0, max_length=5)
+    # Alias accepté pour les clients qui reprennent le nom affiché dans le tracker.
+    noms_saisis: list[str] = Field(default_factory=list, min_length=0, max_length=5)
+    profil_id: str = Field(default="", max_length=80)
+    mode: str = Field(default="qualite", pattern="^(rapide|qualite)$")
+    intensite_transitions: int = Field(default=2, ge=0, le=3)
+    voix_off: str = Field(default="", max_length=64)
+    idempotency_key: str = Field(default="", max_length=80)
+
+    @model_validator(mode="after")
+    def _valider_noms_saisis(self):
+        if self.nombre_noms not in RST_NOMS_CHOIX:
+            raise ValueError("nombre_noms doit valoir 3 ou 5.")
+        noms_bruts = self.noms or self.noms_saisis
+        noms = [re.sub(r"\s+", " ", str(nom).strip()) for nom in noms_bruts]
+        if len(noms) != self.nombre_noms or any(not nom or len(nom) > 80 for nom in noms):
+            raise ValueError(f"SsT exige exactement {self.nombre_noms} noms non vides.")
+        if len({nom.casefold() for nom in noms}) != len(noms):
+            raise ValueError("SsT exige des noms tous différents.")
+        self.noms = noms
+        self.noms_saisis = noms
+        return self
+
+
+class RequeteProfilEntrainement(BaseModel):
+    """Données persistées d'un profil visuel, sans nom de sujet codé en dur."""
+    id: str = Field(default="", max_length=80)
+    nom_sujet: str = Field(min_length=1, max_length=160)
+    alias: list[str] = Field(default_factory=list, max_length=30)
+    bons_exemples: list[str] = Field(default_factory=list, max_length=30)
+    mauvais_exemples: list[str] = Field(default_factory=list, max_length=30)
+    donnees: dict[str, Any] = Field(default_factory=dict)
+    updated_at: float = Field(default=0.0, ge=0)
+
+
+class RequeteSynchronisationProfils(BaseModel):
+    profils: list[RequeteProfilEntrainement] = Field(default_factory=list, max_length=50)
 
 
 class RequeteDiagnosticMontage(BaseModel):
@@ -3228,7 +3783,7 @@ def _demarrer_job(
     job_id = uuid.uuid4().hex
     maintenant = time.monotonic()
     titre = str(getattr(modele, "titre", "") or "").strip()
-    titre_defaut = "Création RsT" if type_job == "rst" else "Création vidéo"
+    titre_defaut = "Création RsT" if type_job == "rst" else ("Création SsT" if type_job == "sst" else "Création vidéo")
     JOBS[job_id] = {
         "job_id": job_id, "type": type_job, "owner": session_id, "status": "queued",
         "title": titre or (f"Création {batch_index + 1}" if batch_total > 1 else titre_defaut),
@@ -3325,6 +3880,13 @@ async def configuration_publique() -> dict[str, Any]:
             "noms_defaut": RST_NOMS_DEFAUT,
             "duree_max_plan": RST_DUREE_MAX_PLAN,
         },
+        "sst": {
+            "noms_choix": list(RST_NOMS_CHOIX),
+            "noms_defaut": RST_NOMS_DEFAUT,
+            "duree_max_plan": RST_DUREE_MAX_PLAN,
+            "source_video_reference_only": True,
+        },
+        "training_profiles": {"persistent": True, "server_storage": "private_session_json"},
         "voix_off_max_mo": VOIX_OFF_MAX_MO,
         "voix_off_extensions": sorted(VOIX_OFF_EXTENSIONS),
         "voix_off_generee": {
@@ -3636,6 +4198,120 @@ async def styles() -> dict[str, Any]:
     return {"styles": list(STYLES_SOUS_TITRES.keys())}
 
 
+async def _json_request(request: Request) -> dict[str, Any]:
+    try:
+        donnees = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, "Corps JSON invalide.") from exc
+    if not isinstance(donnees, dict):
+        raise HTTPException(400, "Un objet JSON est attendu.")
+    return donnees
+
+
+def _reponse_profil(payload: dict[str, Any], request: Request, session_id: str, nouveau: bool) -> JSONResponse:
+    response = JSONResponse(payload)
+    if nouveau:
+        _poser_cookie(response, session_id, request)
+    return response
+
+
+@app.get("/api/profils-entrainement")
+@app.get("/api/training-profiles")
+async def lister_profils_entrainement(request: Request) -> dict[str, Any]:
+    session_id, nouveau = _session_id(request)
+    profils = [_profil_public(profil) for profil in _profils_session(session_id)]
+    response = JSONResponse({"profiles": profils, "profils": profils, "updated_at": time.time()})
+    if nouveau:
+        _poser_cookie(response, session_id, request)
+    return response
+
+
+@app.post("/api/profils-entrainement/synchroniser")
+@app.post("/api/training-profiles/sync")
+async def synchroniser_profils_entrainement(request: Request) -> dict[str, Any]:
+    session_id, nouveau = _session_id(request)
+    payload = await _json_request(request)
+    entrants = payload.get("profiles", payload.get("profils", []))
+    if not isinstance(entrants, list) or len(entrants) > 50:
+        raise HTTPException(400, "50 profils maximum.")
+    existants = {profil["id"]: profil for profil in _profils_session(session_id)}
+    for brut in entrants:
+        try:
+            profil = _profil_depuis_payload(brut if isinstance(brut, dict) else {})
+        except ErreurApp:
+            continue
+        ancien = existants.get(profil["id"])
+        if ancien and float(ancien.get("updated_at", 0)) > float(profil.get("updated_at", 0)):
+            continue
+        existants[profil["id"]] = profil
+    profils = list(existants.values())[:50]
+    _ecrire_profils_session(session_id, profils)
+    publics = [_profil_public(profil) for profil in profils]
+    return _reponse_profil({"profiles": publics, "profils": publics, "synchronized": True}, request, session_id, nouveau)
+
+
+@app.post("/api/profils-entrainement")
+@app.post("/api/training-profiles")
+async def creer_profil_entrainement(request: Request) -> dict[str, Any]:
+    session_id, nouveau = _session_id(request)
+    try:
+        profil = _profil_depuis_payload(await _json_request(request))
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
+    profils = _profils_session(session_id)
+    profils = [item for item in profils if item.get("id") != profil["id"]]
+    profils.insert(0, profil)
+    _ecrire_profils_session(session_id, profils[:50])
+    return _reponse_profil({"profile": _profil_public(profil), "profil": _profil_public(profil)}, request, session_id, nouveau)
+
+
+@app.put("/api/profils-entrainement/{profile_id}")
+@app.put("/api/training-profiles/{profile_id}")
+async def modifier_profil_entrainement(profile_id: str, request: Request) -> dict[str, Any]:
+    session_id, nouveau = _session_id(request)
+    profils = _profils_session(session_id)
+    ancien = next((item for item in profils if item.get("id") == profile_id), None)
+    if ancien is None:
+        raise HTTPException(404, "Profil d'entraînement introuvable.")
+    payload = await _json_request(request)
+    payload["id"] = profile_id
+    payload["updated_at"] = time.time()
+    try:
+        profil = _profil_depuis_payload(payload, ancien)
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _ecrire_profils_session(session_id, [profil if item.get("id") == profile_id else item for item in profils])
+    return _reponse_profil({"profile": _profil_public(profil), "profil": _profil_public(profil)}, request, session_id, nouveau)
+
+
+@app.delete("/api/profils-entrainement/{profile_id}")
+@app.delete("/api/training-profiles/{profile_id}")
+async def supprimer_profil_entrainement(profile_id: str, request: Request) -> dict[str, Any]:
+    session_id, nouveau = _session_id(request)
+    profils = _profils_session(session_id)
+    restants = [item for item in profils if item.get("id") != profile_id]
+    if len(restants) == len(profils):
+        raise HTTPException(404, "Profil d'entraînement introuvable.")
+    _ecrire_profils_session(session_id, restants)
+    return _reponse_profil({"ok": True, "deleted": profile_id}, request, session_id, nouveau)
+
+
+@app.post("/api/profils-entrainement/{profile_id}/analyser")
+@app.post("/api/training-profiles/{profile_id}/analyze")
+async def analyser_profil_endpoint(profile_id: str, request: Request) -> dict[str, Any]:
+    session_id, nouveau = _session_id(request)
+    profils = _profils_session(session_id)
+    profil = next((item for item in profils if item.get("id") == profile_id), None)
+    if profil is None:
+        raise HTTPException(404, "Profil d'entraînement introuvable.")
+    try:
+        resultat = await analyser_profil_entrainement(profil)
+    except (ErreurApp, ErreurMontage, asyncio.TimeoutError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    _ecrire_profils_session(session_id, [resultat if item.get("id") == profile_id else item for item in profils])
+    return _reponse_profil({"profile": _profil_public(resultat), "profil": _profil_public(resultat)}, request, session_id, nouveau)
+
+
 @app.post("/api/montage/diagnostic")
 async def diagnostic_montage(requete: RequeteDiagnosticMontage) -> dict[str, Any]:
     try:
@@ -3689,6 +4365,22 @@ async def lancer_job_montage(requete: RequeteMontage, request: Request):
     job_id, reused = _demarrer_job(
         "montage", requete, session_id,
         lambda contexte: _produire_montage(requete, contexte, session_id),
+    )
+    return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
+
+
+@app.post("/api/jobs/sst", status_code=202)
+async def lancer_job_sst(requete: RequeteSst, request: Request):
+    """SsT : TOP 3/TOP 5 strictement saisi, distinct du pipeline RsT."""
+    try:
+        normaliser_lien_tiktok(requete.lien.strip())
+        _noms_sst_valides(requete.noms, requete.nombre_noms)
+    except (ErreurMontage, ErreurApp) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    session_id, nouveau = _session_id(request)
+    job_id, reused = _demarrer_job(
+        "sst", requete, session_id,
+        lambda contexte: _produire_sst(requete, contexte, session_id),
     )
     return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 

@@ -29,6 +29,10 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
           <span>Créer</span>
         </button>
+        <button class="nav-item" data-view="entrainement">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a4 4 0 0 0-4 4v2.5a4 4 0 0 0 8 0V7a4 4 0 0 0-4-4Z"/><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v2M8 21h8"/></svg>
+          <span>Entraînement IA</span>
+        </button>
         <button class="nav-item" data-view="creations">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9.5 5 2.5-5 2.5z"/></svg>
           <span>Mes créations</span>
@@ -72,6 +76,7 @@
           <div class="seg tabs" role="tablist" id="tabs-creer">
             <button class="seg-item active" data-tab="lien" role="tab">Lien → vidéo</button>
             <button class="seg-item" data-tab="rst" role="tab">RsT</button>
+            <button class="seg-item" data-tab="sst" role="tab">SsT</button>
             <button class="seg-item" data-tab="montage" role="tab">Montage multi-source</button>
           </div>
 
@@ -219,12 +224,63 @@
             </div>
           </div>
 
-          <!-- ============ SECTION 3 : MONTAGE MULTI-SOURCE ============ -->
+          <!-- ============ SECTION SsT : TOP N MANUEL ============ -->
+          <div class="tool" data-tool="sst">
+            <div class="card">
+              <div class="card-head">
+                <h2>SsT</h2>
+                <span class="chip">03</span>
+              </div>
+              <p class="lead">Colle une vidéo TikTok source, choisis <strong>TOP 3 ou TOP 5</strong> et saisis exactement les noms à traiter. Ici, l’IA ne remplace ni n’invente jamais un nom : une recherche indépendante et équitable est lancée pour chaque nom. La vidéo source sert uniquement de référence de rythme et de montage.</p>
+              <div class="field">
+                <label for="sst-lien">Vidéo TikTok source</label>
+                <div class="input-group">
+                  <input id="sst-lien" type="text" inputmode="url" placeholder="https://www.tiktok.com/@…/video/…" autocomplete="off">
+                  <button class="btn ghost" id="sst-coller" type="button">Coller</button>
+                </div>
+              </div>
+              <div class="field">
+                <label>Classement</label>
+                <div class="seg choices" id="sst-nombre-choices">
+                  <button class="seg-item active" data-sst-nombre="3" type="button">TOP 3</button>
+                  <button class="seg-item" data-sst-nombre="5" type="button">TOP 5</button>
+                </div>
+              </div>
+              <div class="field">
+                <div class="field-label-row">
+                  <label class="field-label">Noms saisis manuellement</label>
+                  <span class="counter" id="sst-noms-counter">0/3</span>
+                </div>
+                <div class="sst-noms" id="sst-noms">
+                  <input data-sst-nom="0" type="text" placeholder="Nom 1" autocomplete="off">
+                  <input data-sst-nom="1" type="text" placeholder="Nom 2" autocomplete="off">
+                  <input data-sst-nom="2" type="text" placeholder="Nom 3" autocomplete="off">
+                  <input data-sst-nom="3" type="text" placeholder="Nom 4" autocomplete="off" hidden>
+                  <input data-sst-nom="4" type="text" placeholder="Nom 5" autocomplete="off" hidden>
+                </div>
+                <p class="hint">Les noms sont transmis tels quels. Ils doivent être tous différents ; l’IA ne peut pas en ajouter un autre.</p>
+              </div>
+              <div class="field">
+                <label for="sst-profil">Profil d’entraînement visuel · facultatif</label>
+                <select id="sst-profil"><option value="">Aucun profil</option></select>
+                <button class="btn ghost" id="sst-open-training" type="button">Ouvrir Entraînement IA ↗</button>
+              </div>
+              <div class="actions">
+                <button class="btn primary" id="btn-sst"><span>Rechercher et créer SsT</span><span aria-hidden="true">✦</span></button>
+              </div>
+              <p class="status" id="statut-sst"></p>
+              <div class="sst-rules">
+                <span>✓ sources validées par Gemini</span><span>✓ plans ≤ 5 s</span><span>✓ sortie ≥ 1 min 1 s</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- ============ SECTION 4 : MONTAGE MULTI-SOURCE ============ -->
           <div class="tool" data-tool="montage">
             <div class="card">
               <div class="card-head">
                 <h2>Montage multi-source</h2>
-                <span class="chip">03</span>
+                <span class="chip">04</span>
               </div>
               <p class="lead">Colle manuellement jusqu’à 20 liens TikTok. Chaque vidéo est regardée par l’IA ; seuls les plans professionnels sans personne, logo ni watermark (sous-titres TikTok autorisés) sont montés. La sortie dure au moins <strong>1 min 1 s</strong>.</p>
 
@@ -322,7 +378,7 @@
                     <button class="seg-item" data-intensite="2" type="button">Modérée</button>
                     <button class="seg-item" data-intensite="3" type="button">Forte</button>
                   </div>
-                  <p class="hint">De « coupes franches uniquement » à « transitions appuyées entre chaque plan ». Ces réglages s’appliquent aux trois sections.</p>
+                  <p class="hint">De « coupes franches uniquement » à « transitions appuyées entre chaque plan ». Ces réglages s’appliquent aux quatre sections.</p>
                 </div>
                 <div class="field">
                   <label>Sous-titres (sans référence de style)</label>
@@ -354,6 +410,47 @@
                 <button class="btn primary full" id="btn-launch-batch"><span>Lancer la file</span><span aria-hidden="true">✦</span></button>
               </div>
             </div>
+          </div>
+        </section>
+
+        <!-- ======================= VUE ENTRAÎNEMENT IA (séparée de Créer) ======================= -->
+        <section class="view" id="view-entrainement">
+          <div class="card">
+            <div class="card-head"><h2>Entraînement IA</h2><span class="chip">VISUEL</span></div>
+            <p class="lead">Crée une mémoire visuelle persistante par sujet. Gemini regarde chaque exemple, repère les passages propres et conserve une signature positive et négative. Les nouvelles candidates ne sont ajoutées qu’après leur validation visuelle complète.</p>
+            <div class="grid-2 training-form">
+              <div class="field">
+                <label for="profil-nom">Nom du sujet</label>
+                <input id="profil-nom" type="text" maxlength="160" placeholder="Sujet à reconnaître exactement">
+              </div>
+              <div class="field">
+                <label for="profil-alias">Alias</label>
+                <input id="profil-alias" type="text" placeholder="un alias, un autre alias">
+              </div>
+            </div>
+            <div class="grid-2">
+              <div class="field">
+                <label for="profil-bons">Bons exemples TikTok</label>
+                <textarea id="profil-bons" rows="6" placeholder="Un lien TikTok par ligne"></textarea>
+                <p class="hint">Plans propres du sujet demandé : Gemini vérifiera sujet, timestamps, personnes, watermark, logos et textes.</p>
+              </div>
+              <div class="field">
+                <label for="profil-mauvais">Mauvais exemples TikTok</label>
+                <textarea id="profil-mauvais" rows="6" placeholder="Un lien TikTok par ligne"></textarea>
+                <p class="hint">Contre-exemples : hors sujet, personne, watermark, logo ajouté, pseudo, sticker ou mauvaise qualité.</p>
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn primary" id="btn-analyser-profil"><span>Analyser avec l’IA et alimenter</span><span aria-hidden="true">✦</span></button>
+              <button class="btn ghost" id="btn-nouveau-profil" type="button">Nouveau profil</button>
+            </div>
+            <p class="status" id="statut-profil"></p>
+            <div class="training-result hidden" id="training-result"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Profils mémorisés</h2><span class="counter" id="training-profile-count">0 profil</span></div>
+            <p class="hint">Synchronisés entre le localStorage de ce navigateur et le fichier JSON privé de ta session serveur. Supprimer un profil le retire des deux emplacements.</p>
+            <div class="training-profile-list" id="training-profile-list"><p class="hint">Chargement…</p></div>
           </div>
         </section>
 
@@ -425,7 +522,7 @@
         <section class="view" id="view-parametres">
           <div class="card">
             <div class="card-head"><h2>Paramètres de génération</h2></div>
-            <p class="lead">Ces réglages s’appliquent aux trois sections : Lien → vidéo, RsT et Montage multi-source. Ils sont conservés dans ce navigateur.</p>
+            <p class="lead">Ces réglages s’appliquent aux quatre sections : Lien → vidéo, RsT, SsT et Montage multi-source. Ils sont conservés dans ce navigateur.</p>
 
             <div class="field">
               <label>Mode de génération</label>
