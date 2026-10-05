@@ -227,6 +227,40 @@ réseau n'est contacté dans les tests.
 
 ## 6. Tests
 
+### Correctif SsT — secours public de recherche (5 octobre 2026)
+
+Symptôme : « SsT n'a trouvé aucune source exploitable pour les noms saisis » alors
+que les noms étaient valides. Cause : SsT n'utilisait que TikWM `/feed/search`,
+qui répond 403 ou vide depuis certaines IP de serveur (Render) alors que
+l'endpoint unitaire `/api/` fonctionne encore. RsT avait déjà une chaîne de
+secours publique ; SsT ne l'utilisait pas.
+
+Correctif (refait après la perte du commit local `d407a4f`, jamais poussé) :
+
+- `_produire_sst()` enchaîne, **pour chaque nom saisi séparément** : TikWM
+  `/feed/search` puis, s'il répond 403/vide/erreur, la même chaîne publique que
+  RsT (`_decouvrir_publique` : moteurs publics, relais publics, archive Wayback,
+  miroir Urlebird) avec un `EtatSourcesDecouverte` partagé (disjoncteurs) ;
+- chaque lien public est **revalidé par TikWM `/api/`** (identifiant, auteur,
+  titre, durée réels) à la cadence de 1 req/s avant de devenir une candidate ;
+- les doublons TikTok sont écartés par identifiant vidéo ; la vidéo source SsT
+  n'est jamais candidate (référence de style uniquement) ;
+- après le premier 403, `/feed/search` n'est plus réessayé pour les noms
+  suivants (même comportement que RsT) ;
+- l'échec « aucune source » détaille désormais : noms recherchés, recherches
+  tentées, erreurs TikWM, erreurs des sources publiques, raisons de rejet ;
+- `_selectionner_sources_sst()` rejette explicitement « durée inconnue ou
+  invalide » et marque les non-retenues `rejected_before_ai` ; aucune candidate
+  n'est `selected=true` avant la validation visuelle Gemini ;
+- les candidates refusées par l'entraînement IA portent leur `raison_refus`
+  directement sur l'entrée `candidates_analysees` du profil ;
+- l'interface Entraînement IA signale clairement un profil « seulement
+  enregistré, pas encore entraîné » (0 source, 0 exemple, confiance 0 %), et la
+  sélection d'un tel profil dans SsT affiche le message d'invitation.
+
+Règle associée : **aucun nom saisi n'est jamais remplacé, complété ou cherché
+« à la place »** — le secours public utilise exactement le nom demandé.
+
 ### Correctif RsT — pertinence visuelle stricte + référence de style (3 octobre 2026)
 
 Un rendu réel (départ `@actumobile.fr`, TOP 3 téléphones) a produit un plan de

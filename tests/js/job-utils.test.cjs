@@ -105,3 +105,40 @@ test('RsT multiple : les travaux survivent à une actualisation', () => {
   U.clearRstJobs(storage);
   assert.deepEqual(U.loadRstJobs(storage), []);
 });
+
+test('les profils d’entraînement survivent dans le localStorage et fusionnent par date', () => {
+  const values = new Map();
+  const storage = {
+    setItem: (key, value) => values.set(key, value),
+    getItem: key => values.get(key) || null,
+    removeItem: key => values.delete(key)
+  };
+  assert.equal(U.TRAINING_PROFILES_KEY, 'vesper.trainingProfiles.v1');
+  assert.deepEqual(U.loadTrainingProfiles(storage), []);
+
+  const local = {
+    id: 'profil-1', nom_sujet: 'Sujet A', aliases: ['SA'],
+    bons_exemples: ['https://www.tiktok.com/@a/video/1'], mauvais_exemples: [],
+    donnees: { sources_exemples_analysees: 2, confiance_moyenne: 0.8 }, updated_at: 1000
+  };
+  U.saveTrainingProfiles(storage, [local, { id: '', nom_sujet: 'sans id' }]);
+  assert.deepEqual(U.loadTrainingProfiles(storage), [local]);
+
+  // Fusion navigateur/serveur : la version la plus récente gagne, l'autre est perdue.
+  const serveur = {
+    id: 'profil-1', nom_sujet: 'Sujet A (serveur)', aliases: ['SA'],
+    bons_exemples: [], mauvais_exemples: [], donnees: {}, updated_at: 500
+  };
+  const fusionnes = U.mergeTrainingProfiles([local], [serveur]);
+  assert.equal(fusionnes.length, 1);
+  assert.equal(fusionnes[0].nom_sujet, 'Sujet A');
+  assert.equal(fusionnes[0].donnees.sources_exemples_analysees, 2);
+
+  const serveur_plus_recent = { ...serveur, nom_sujet: 'Sujet A (serveur)', updated_at: 2000 };
+  assert.equal(U.mergeTrainingProfiles([local], [serveur_plus_recent])[0].nom_sujet, 'Sujet A (serveur)');
+
+  // Un profil sans id est ignoré ; 50 profils maximum sont conservés.
+  assert.equal(U.mergeTrainingProfiles([{ id: 'x', updated_at: 1 }], [{ id: '', updated_at: 9 }]).length, 1);
+  U.saveTrainingProfiles(storage, Array.from({ length: 60 }, (_, i) => ({ id: `p${i}`, updated_at: i })));
+  assert.equal(U.loadTrainingProfiles(storage).length, 50);
+});
