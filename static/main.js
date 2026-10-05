@@ -1,7 +1,7 @@
 /* =====================================================================
    ς੮ ς८Րɿƿ┮ — Dashboard vidéo (JS natif, aucune dépendance).
 
-   Trois sections de création :
+   Quatre sections de création :
      1. « Lien → vidéo »     : un lien → script éditable → vidéo verticale.
      2. « RsT »               : jusqu'à 6 liens TikTok, un travail indépendant par
                                 lien → analyse, script, extraction de 3 ou 5 noms
@@ -41,13 +41,16 @@
   let rstJobs = U.loadRstJobs(localStorage);
   const rstEtats = {};   // job_id -> dernier état réel renvoyé par l'API
   const rstSuivis = new Set();
+  let trainingProfiles = U.loadTrainingProfiles(localStorage);
+  let activeTrainingProfileId = '';
+  let sstNombreNoms = 3;
   // Voix off importée par section : identifiant renvoyé par POST /api/voixoff.
   const voixOff = { lien: '', rst: '', montage: '' };
 
   const guards = {
     analyser: U.submissionGuard(), video: U.submissionGuard(),
-    reference: U.submissionGuard(), rst: U.submissionGuard(),
-    montage: U.submissionGuard(), diagnostic: U.submissionGuard(),
+    reference: U.submissionGuard(), rst: U.submissionGuard(), sst: U.submissionGuard(),
+    montage: U.submissionGuard(), training: U.submissionGuard(), diagnostic: U.submissionGuard(),
     batch: U.submissionGuard()
   };
 
@@ -60,7 +63,7 @@
 
   const typeLabels = {
     analyser: 'Analyse', video: 'Lien → vidéo', reference: 'Référence',
-    rst: 'RsT', montage: 'Montage'
+    rst: 'RsT', sst: 'SsT', montage: 'Montage'
   };
 
   const ETATS_FINAL = ['completed', 'failed', 'cancelled'];
@@ -222,7 +225,7 @@
   ------------------------------------------------------------------ */
 
   const viewTitles = {
-    creer: 'Créer', creations: 'Mes créations',
+    creer: 'Créer', entrainement: 'Entraînement IA', creations: 'Mes créations',
     connexions: 'Connexions', parametres: 'Paramètres'
   };
 
@@ -595,11 +598,11 @@
   }
 
   /* ------------------------------------------------------------------
-     SUIVI RÉEL DE GÉNÉRATION (tracker commun aux trois sections)
+     SUIVI RÉEL DE GÉNÉRATION (tracker commun aux quatre sections)
   ------------------------------------------------------------------ */
 
   function setBusy(busy) {
-    ['btn-analyser', 'btn-video', 'btn-rst', 'btn-reference', 'btn-montage',
+    ['btn-analyser', 'btn-video', 'btn-rst', 'btn-sst', 'btn-reference', 'btn-montage',
       'btn-add-project', 'btn-launch-batch'].forEach((id) => {
       const bouton = $(id);
       if (!bouton) return;
@@ -612,7 +615,7 @@
   }
 
   function appendSource(conteneur, source, forcerErreur = false) {
-    const echec = forcerErreur || ['error', 'invalid', 'unavailable', 'download_error', 'analysis_fallback'].includes(source.status);
+    const echec = forcerErreur || ['error', 'invalid', 'unavailable', 'download_error', 'analysis_fallback', 'rejected_by_ai'].includes(source.status);
     const avertissement = source.status === 'analysis_fallback';
     const ligne = el('div', `source-item${echec && !avertissement ? ' error' : avertissement ? ' warn' : ''}`);
     ligne.append(el('i'));
@@ -655,7 +658,7 @@
     renderSources($('tracker-sources'), data);
 
     const panneauScript = $('tracker-script');
-    if (data.type === 'rst' && data.script) {
+    if ((data.type === 'rst' || data.type === 'sst') && data.script) {
       panneauScript.replaceChildren();
       panneauScript.append(el('strong', '', `Accroche — ${data.script.hook || ''}`));
       panneauScript.append(el('p', '', data.script.corps || ''));
@@ -679,6 +682,7 @@
 
   function foundItem(video) {
     const item = el('div', `found-item${video.selected ? ' selected' : ''}`);
+    const pendingVisualValidation = !video.selected && video.validation_status === 'awaiting_visual_ai';
 
     const icone = el('div', 'found-icon');
     icone.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m10 8 6 4-6 4z"/></svg>';
@@ -691,11 +695,12 @@
     if (typeof video.score_texte === 'number') meta += ` · pertinence texte ${Math.round(video.score_texte * 100)}%`;
     info.append(el('span', 'found-meta', meta));
     if (video.nom) info.append(el('span', 'found-nom', `Nom recherché : ${video.nom}`));
+    if (pendingVisualValidation) info.append(el('span', 'found-meta', 'Validation visuelle Gemini en cours — aucune retenue annoncée'));
     if (!video.selected && video.rejet) info.append(el('span', 'found-rejet', `Écartée : ${video.rejet}`));
     item.append(info);
 
     const cote = el('div', 'found-side');
-    cote.append(el('span', `badge ${video.selected ? 'ok' : 'ko'}`, video.selected ? 'retenue' : 'écartée'));
+    cote.append(el('span', `badge ${video.selected ? 'ok' : pendingVisualValidation ? '' : 'ko'}`, video.selected ? 'retenue' : pendingVisualValidation ? 'en validation' : 'écartée'));
     const ouvrir = el('a', 'found-open', 'Ouvrir ↗');
     ouvrir.href = video.url;
     ouvrir.target = '_blank';
@@ -761,6 +766,163 @@
       onRetry: (message) => setStatus(statusElement, message)
     });
     return waitJob(data.job_id, type, statusElement);
+  }
+
+  /* ------------------------------------------------------------------
+     PROFILS D'ENTRAÎNEMENT IA (vue indépendante + double persistance)
+  ------------------------------------------------------------------ */
+
+  function profilAliasArray() {
+    return $('profil-alias').value.split(/[,;\n]+/).map((value) => value.trim()).filter(Boolean);
+  }
+
+  function renderTrainingProfileSelectors() {
+    const select = $('sst-profil');
+    if (!select) return;
+    const current = select.value;
+    select.replaceChildren(new Option('Aucun profil', ''));
+    trainingProfiles.forEach((profile) => {
+      select.append(new Option(
+        `${profile.nom_sujet || profile.subject || 'Sujet'}${(profile.aliases || profile.alias || []).length ? ` · ${(profile.aliases || profile.alias).join(', ')}` : ''}`,
+        profile.id
+      ));
+    });
+    if (trainingProfiles.some((profile) => profile.id === current)) select.value = current;
+  }
+
+  function renderTrainingProfiles() {
+    const list = $('training-profile-list');
+    if (!list) return;
+    list.replaceChildren();
+    $('training-profile-count').textContent = `${trainingProfiles.length} profil${trainingProfiles.length > 1 ? 's' : ''}`;
+    if (!trainingProfiles.length) {
+      list.append(el('p', 'hint', 'Aucun profil mémorisé. Crée ton premier sujet ci-dessus.'));
+      renderTrainingProfileSelectors();
+      return;
+    }
+    trainingProfiles.forEach((profile) => {
+      const aliases = profile.aliases || profile.alias || [];
+      const card = el('article', 'training-profile-card');
+      const head = el('div', 'training-profile-head');
+      head.append(el('div', '', profile.nom_sujet || profile.subject || 'Sujet sans nom'));
+      head.append(el('span', 'badge ok', `${Number(profile.sources_automatiquement_ajoutees || profile.source_count || 0)} source(s)`));
+      card.append(head);
+      card.append(el('p', 'training-profile-meta', aliases.length ? `Alias : ${aliases.join(' · ')}` : 'Aucun alias'));
+      const details = profile.donnees || {};
+      card.append(el('p', 'training-profile-meta',
+        `${(details.sources_exemples_analysees || 0)} exemple(s) analysé(s) · confiance moyenne ${Math.round(Number(details.confiance_moyenne || 0) * 100)}%`));
+      const actions = el('div', 'training-profile-actions');
+      actions.append(boutonAction('Utiliser dans SsT', () => {
+        showView('creer');
+        selectTab('sst');
+        $('sst-profil').value = profile.id;
+      }));
+      actions.append(boutonAction('Modifier / analyser', () => {
+        activeTrainingProfileId = profile.id;
+        $('profil-nom').value = profile.nom_sujet || '';
+        $('profil-alias').value = aliases.join(', ');
+        $('profil-bons').value = (profile.bons_exemples || []).join('\n');
+        $('profil-mauvais').value = (profile.mauvais_exemples || []).join('\n');
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      }));
+      actions.append(boutonAction('Supprimer', () => supprimerProfilEntrainement(profile.id)));
+      card.append(actions);
+      list.append(card);
+    });
+    renderTrainingProfileSelectors();
+  }
+
+  async function persisterProfilsServeur() {
+    try {
+      const data = await requestJSON('/api/profils-entrainement/synchroniser', {
+        body: { profiles: trainingProfiles }, retryTransient: true, retryForMs: 15000
+      });
+      if (Array.isArray(data.profiles)) {
+        trainingProfiles = U.mergeTrainingProfiles(trainingProfiles, data.profiles);
+        U.saveTrainingProfiles(localStorage, trainingProfiles);
+      }
+    } catch (_) {
+      // Le localStorage reste la copie de reprise si Render est momentanément indisponible.
+    }
+    renderTrainingProfiles();
+  }
+
+  async function loadTrainingProfiles() {
+    const local = U.loadTrainingProfiles(localStorage);
+    try {
+      const data = await requestJSON('/api/profils-entrainement', { retryTransient: true, retryForMs: 15000 });
+      trainingProfiles = U.mergeTrainingProfiles(local, data.profiles || data.profils || []);
+    } catch (_) {
+      trainingProfiles = local;
+    }
+    U.saveTrainingProfiles(localStorage, trainingProfiles);
+    renderTrainingProfiles();
+    // Synchronisation bidirectionnelle : le profil le plus récent est conservé.
+    await persisterProfilsServeur();
+  }
+
+  async function supprimerProfilEntrainement(id) {
+    if (!confirm('Supprimer ce profil du navigateur et du serveur privé ?')) return;
+    try {
+      await requestJSON(`/api/profils-entrainement/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      trainingProfiles = trainingProfiles.filter((profile) => profile.id !== id);
+      U.saveTrainingProfiles(localStorage, trainingProfiles);
+      if (activeTrainingProfileId === id) activeTrainingProfileId = '';
+      renderTrainingProfiles();
+      toast('Profil supprimé des deux emplacements.');
+    } catch (error) { setStatus($('statut-profil'), error.message, 'error'); }
+  }
+
+  async function analyserProfilEntrainement(id) {
+    const bouton = $('btn-analyser-profil');
+    bouton.disabled = true;
+    setStatus($('statut-profil'), 'Téléchargement des exemples, analyse Gemini et recherche de nouvelles candidates…');
+    try {
+      const data = await requestJSON(`/api/profils-entrainement/${encodeURIComponent(id)}/analyser`, {
+        body: {}, retryTransient: true, retryForMs: 30000,
+        onRetry: (message) => setStatus($('statut-profil'), message)
+      });
+      const profile = data.profile || data.profil;
+      trainingProfiles = trainingProfiles.map((item) => item.id === id ? profile : item);
+      U.saveTrainingProfiles(localStorage, trainingProfiles);
+      renderTrainingProfiles();
+      const result = $('training-result');
+      result.classList.remove('hidden');
+      result.textContent = `Apprentissage terminé : ${profile.sources_automatiquement_ajoutees || 0} nouvelle(s) source(s) validée(s), signatures positive et négative conservées.`;
+      setStatus($('statut-profil'), 'Profil analysé et alimenté uniquement avec des sources validées.', 'success');
+    } catch (error) { setStatus($('statut-profil'), error.message, 'error'); }
+    finally { bouton.disabled = false; }
+  }
+
+  function bindTrainingProfiles() {
+    $('btn-nouveau-profil').addEventListener('click', () => {
+      activeTrainingProfileId = '';
+      ['profil-nom', 'profil-alias', 'profil-bons', 'profil-mauvais'].forEach((id) => { $(id).value = ''; });
+      $('training-result').classList.add('hidden');
+      setStatus($('statut-profil'), 'Nouveau profil prêt.');
+    });
+    $('btn-analyser-profil').addEventListener('click', () => guards.training.run(async () => {
+      const nom = $('profil-nom').value.trim();
+      if (!nom) { setStatus($('statut-profil'), 'Le nom du sujet est obligatoire.', 'error'); return; }
+      const body = {
+        id: activeTrainingProfileId,
+        nom_sujet: nom,
+        aliases: profilAliasArray(),
+        good_examples: $('profil-bons').value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+        bad_examples: $('profil-mauvais').value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+      };
+      try {
+        const endpoint = activeTrainingProfileId
+          ? `/api/profils-entrainement/${encodeURIComponent(activeTrainingProfileId)}` : '/api/profils-entrainement';
+        const data = await requestJSON(endpoint, { method: activeTrainingProfileId ? 'PUT' : 'POST', body });
+        const profile = data.profile || data.profil;
+        activeTrainingProfileId = profile.id;
+        trainingProfiles = [profile, ...trainingProfiles.filter((item) => item.id !== profile.id)];
+        U.saveTrainingProfiles(localStorage, trainingProfiles);
+        renderTrainingProfiles();
+        await analyserProfilEntrainement(profile.id);
+      } catch (error) { setStatus($('statut-profil'), error.message, 'error'); }
+    }));
   }
 
   /* ------------------------------------------------------------------
@@ -1133,6 +1295,66 @@
     renderRstJobs();
     setStatus($('statut-rst'), 'Reprise du suivi des travaux RsT après actualisation…');
     rstJobs.forEach((entree) => suivreRstJob(entree));
+  }
+
+  /* ------------------------------------------------------------------
+     SECTION SsT : TOP 3 / TOP 5 manuel
+  ------------------------------------------------------------------ */
+
+  function syncSstUI() {
+    document.querySelectorAll('[data-sst-nombre]').forEach((button) => {
+      const value = Number(button.dataset.sstNombre);
+      button.classList.toggle('active', value === sstNombreNoms);
+    });
+    document.querySelectorAll('[data-sst-nom]').forEach((input) => {
+      const visible = Number(input.dataset.sstNom) < sstNombreNoms;
+      input.hidden = !visible;
+      input.required = visible;
+    });
+    $('sst-noms-counter').textContent = `0/${sstNombreNoms}`;
+  }
+
+  function collectSstNames() {
+    const names = [...document.querySelectorAll('[data-sst-nom]')]
+      .slice(0, sstNombreNoms).map((input) => input.value.trim());
+    $('sst-noms-counter').textContent = `${names.filter(Boolean).length}/${sstNombreNoms}`;
+    return names;
+  }
+
+  function bindSst() {
+    document.querySelectorAll('[data-sst-nombre]').forEach((button) => button.addEventListener('click', () => {
+      sstNombreNoms = Number(button.dataset.sstNombre);
+      syncSstUI();
+    }));
+    document.querySelectorAll('[data-sst-nom]').forEach((input) => input.addEventListener('input', collectSstNames));
+    $('sst-coller').addEventListener('click', () => collerPressePapier((texte) => {
+      $('sst-lien').value = texte.split(/\r?\n/)[0].trim();
+    }));
+    $('sst-open-training').addEventListener('click', () => showView('entrainement'));
+    $('btn-sst').addEventListener('click', () => guards.sst.run(async () => {
+      const lien = $('sst-lien').value.trim();
+      const names = collectSstNames();
+      const parsed = U.normalizeTikTokLink(lien);
+      if (!parsed.ok) { setStatus($('statut-sst'), `Lien source invalide : ${parsed.error}.`, 'error'); return; }
+      if (names.some((name) => !name) || new Set(names.map((name) => name.toLocaleLowerCase())).size !== names.length) {
+        setStatus($('statut-sst'), `Saisis exactement ${sstNombreNoms} noms différents.`, 'error'); return;
+      }
+      const button = $('btn-sst');
+      button.disabled = true;
+      setStatus($('statut-sst'), 'SsT lance une recherche distincte pour chaque nom…');
+      try {
+        const data = await launchJob('sst', {
+          titre: `SsT · TOP ${sstNombreNoms}`,
+          lien: parsed.url, nombre_noms: sstNombreNoms, noms: names,
+          profil_id: $('sst-profil').value, mode: settings.mode,
+          intensite_transitions: settings.intensite, voix_off: voixOff.rst,
+          idempotency_key: uuid()
+        }, $('statut-sst'));
+        setStatus($('statut-sst'), `SsT terminé : ${data.noms_saisis?.length || sstNombreNoms} noms utilisés tels quels.`, 'success');
+      } catch (error) { setStatus($('statut-sst'), error.message, 'error'); }
+      finally { button.disabled = Boolean(activeJobId); }
+    }));
+    syncSstUI();
   }
 
   /* ------------------------------------------------------------------
@@ -1522,10 +1744,11 @@
     if (saved.type === 'rst') { U.clearActiveJob(localStorage); return; }  // RsT a son propre suivi multiple
     const statut = saved.type === 'montage' ? $('statut-montage')
       : saved.type === 'rst' ? $('statut-rst')
-        : saved.type === 'reference' ? $('statut-reference')
+        : saved.type === 'sst' ? $('statut-sst')
+          : saved.type === 'reference' ? $('statut-reference')
           : saved.type === 'video' ? $('statut-video') : $('statut-analyser');
     showView('creer');
-    selectTab(saved.type === 'montage' ? 'montage' : saved.type === 'rst' ? 'rst' : 'lien');
+    selectTab(saved.type === 'montage' ? 'montage' : saved.type === 'rst' ? 'rst' : saved.type === 'sst' ? 'sst' : 'lien');
     setStatus(statut, 'Reprise du suivi après actualisation…');
     try {
       const data = await waitJob(saved.id, saved.type, statut);
@@ -1556,6 +1779,8 @@
     bindSettings();
     bindLienVideo();
     bindRst();
+    bindSst();
+    bindTrainingProfiles();
     bindMontage();
     bindAnnulation();
     bindIntegrations();
@@ -1576,6 +1801,7 @@
 
     requestJSON('/api/styles').then((data) => chargerStyles(data.styles)).catch(() => chargerStyles());
     loadConfig().then(loadSante);
+    loadTrainingProfiles();
     loadIntegrations().then(loadHistory);
     resumeJob();
     resumeRstJobs();

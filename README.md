@@ -8,9 +8,9 @@ Le dashboard (sombre, premium, responsive) est construit en HTML/CSS/JS natif un
 
 - `static/index.html` — structure des vues ;
 - `static/styles.css` — thème sombre complet, mobile inclus ;
-- `static/main.js` — logique des trois sections, suivi des jobs, historique, OAuth.
+- `static/main.js` — logique des quatre sections, suivi des jobs, historique, OAuth.
 
-La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **Paramètres**. La vue Créer propose exactement trois sections :
+La barre latérale contient **Créer**, **Entraînement IA**, **Mes créations**, **Connexions** et **Paramètres**. La vue Créer propose quatre sections :
 
 1. **Lien → vidéo** — un lien d'article, de page ou de TikTok devient un script éditable (accroche + corps + univers visuel), puis une vidéo verticale sous-titrée à partir de B-roll Pexels.
 2. **RsT** — jusqu'à **6 liens TikTok de départ** (un par ligne, compteur `0/6`, boutons Coller et
@@ -44,11 +44,16 @@ La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **
    `GET /api/rst/sources` vérifie en direct, depuis le serveur, quelle source passe.
    **Livraison séparée** : la vidéo finale reste **muette**, tandis que le **script `.txt`** et une
    **voix off `.mp3` générée** se téléchargent à côté, depuis la carte du travail.
-3. **Montage multi-source** — jusqu'à 20 liens collés manuellement, organisés en onglets Script / Sources / Référence / Réglages, avec les boutons Coller, Valider et Tout supprimer. La validation affiche l'état réel de chaque source (accessible, durée, dimensions, codec, erreur).
+3. **SsT** — une vidéo TikTok de référence, TOP 3 ou TOP 5 et exactement 3 ou 5 noms saisis manuellement. Chaque nom est recherché indépendamment, les sources sont réparties équitablement et aucun nom n'est extrait, remplacé ou inventé par l'IA. La vidéo source sert uniquement de référence de grammaire de montage ; un profil visuel mémorisé peut être sélectionné depuis la page Entraînement IA.
+4. **Montage multi-source** — jusqu'à 20 liens collés manuellement, organisés en onglets Script / Sources / Référence / Réglages, avec les boutons Coller, Valider et Tout supprimer. La validation affiche l'état réel de chaque source (accessible, durée, dimensions, codec, erreur).
 
-Toutes les sorties durent désormais **au moins 1 min 1 s** (contrôle FFprobe après export). Chaque source est visionnée par Gemini sur toute sa durée : seuls les plans nets de qualité professionnelle, **sans personne, logo ni watermark**, peuvent être montés. Les sous-titres TikTok déjà intégrés restent autorisés ; tout autre texte ou élément superposé est refusé. L’objet doit correspondre exactement au texte (par exemple une vraie Golf 8, jamais une voiture générique). Une analyse IA invalide n'autorise plus de plan de repli non vérifié. Lorsqu'une référence est fournie — automatiquement en RsT — sa cadence, ses coupes, transitions, zooms et sous-titres guident fidèlement le nouveau montage, sans recopier son contenu.
+### Entraînement IA et mémoire visuelle
 
-Les **modes Rapide et Qualité** (qualité CRF 21 dans les deux cas, 1080 × 1920 si `AUTORISER_EXPORT_1080`) et l'**intensité des transitions** (aucune, légère, modérée, forte) sont réglables dans Paramètres et dans l'onglet Réglages ; ils s'appliquent aux trois sections. Le suivi de génération est réel (états, progression, état par source), l'historique des 6 dernières heures permet lecture, téléchargement, Drive et annulation, et un travail en cours est repris après actualisation de la page. Aucun faux compte, aucune fausse donnée, aucun abonnement payant.
+La page **Entraînement IA** est une vue indépendante de Créer. Elle accepte un sujet, ses alias, des bons exemples et des mauvais exemples TikTok. `POST /api/profils-entrainement/{id}/analyser` télécharge les exemples, fait analyser toute leur durée par Gemini, conserve les timestamps propres, les personnes, watermarks, logos ajoutés, textes, sous-titres TikTok, confiance et signatures positive/négative, puis recherche et valide chaque nouvelle candidate. Une candidate n'est ajoutée qu'après validation du sujet exact, de la qualité et de l'absence d'overlay interdit. Les profils sont synchronisés dans le `localStorage` et dans un JSON `0600` privé du cookie de session ; la suppression appelle les deux côtés.
+
+Toutes les sorties durent désormais **au moins 1 min 1 s** (contrôle FFprobe après export). Chaque source est visionnée par Gemini sur toute sa durée : seuls les plans nets de qualité professionnelle, **sans personne, logo ni watermark**, peuvent être montés. Les sous-titres TikTok déjà intégrés restent autorisés ; tout autre texte ou élément superposé est refusé. L’objet doit correspondre exactement au texte (jamais un produit générique à la place du sujet demandé). Une analyse IA invalide n'autorise plus de plan de repli non vérifié. Lorsqu'une référence est fournie — automatiquement en RsT — sa cadence, ses coupes, transitions, zooms et sous-titres guident fidèlement le nouveau montage, sans recopier son contenu.
+
+Les **modes Rapide et Qualité** (CRF 23 en Rapide, CRF 21 en Qualité, 1080 × 1920 si `AUTORISER_EXPORT_1080`) et l'**intensité des transitions** (aucune, légère, modérée, forte) sont réglables dans Paramètres et dans l'onglet Réglages ; ils s'appliquent aux quatre sections. Le suivi de génération est réel (états, progression, état par source), l'historique des 6 dernières heures permet lecture, téléchargement, Drive et annulation, et un travail en cours est repris après actualisation de la page. Aucun faux compte, aucune fausse donnée, aucun abonnement payant.
 
 ## Voix off : importée ou générée
 
