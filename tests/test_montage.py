@@ -254,6 +254,50 @@ def test_duree_max_plan_invalide_retombe_sur_cinq_secondes(valeur):
     assert montage._borner_duree_plan(valeur) == montage.DUREE_MAX_PLAN_DEFAUT
 
 
+def test_duree_minimale_61_secondes_transitions_comprises():
+    segments = montage.creer_segments_script("Accroche", "Une phrase courte.")
+    etendus = montage.garantir_duree_minimale_segments(segments, 61.0, 5.0)
+    duree_prudente = sum(s["duree_cible"] for s in etendus) - (len(etendus) - 1) * 0.55
+    assert duree_prudente >= 61.0
+    assert all(s["duree_cible"] <= 5.0 for s in etendus)
+    assert all(s["texte"] == "" for s in etendus[len(segments):])
+
+
+def test_selection_accepte_sous_titres_mais_refuse_personne_et_overlays():
+    segments = montage.creer_segments_script("Golf 8", "La Golf 8 roule sur la route.")
+    analyses, metadata = _analyses_longues(segments, nombre=1)
+    scene = analyses["source_0"][0]
+    scene.update(texte_visible=True, texte_sous_titres=True)
+    plan = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
+    assert plan
+
+    scene["personne_visible"] = True
+    with pytest.raises(montage.ErreurMontage, match="sans personne"):
+        montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
+
+
+def test_une_longue_source_revient_a_des_moments_differents():
+    segments = montage.creer_segments_script(
+        "Golf 8 impressionnante",
+        "La Golf 8 arrive. La Golf 8 tourne. La Golf 8 repart."
+    )
+    analyses, metadata = _analyses_longues(segments, nombre=1, duree=30.0)
+    plan = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
+    debuts = [p["debut"] for p in plan]
+    assert len(set(debuts[:min(5, len(debuts))])) == min(5, len(debuts))
+    assert all(p["duree"] <= 5.0 for p in plan)
+
+
+def test_selection_refuse_texte_watermark_et_image_mediocre():
+    segments = montage.creer_segments_script("Accroche forte", "Une phrase complète.")
+    analyses, metadata = _analyses_longues(segments, nombre=3)
+    analyses["source_0"][0]["texte_visible"] = True
+    analyses["source_1"][0]["watermark"] = True
+    analyses["source_2"][0]["nettete"] = 0.3
+    with pytest.raises(montage.ErreurMontage, match="sans texte ni watermark"):
+        montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
+
+
 def test_configuration_montage_porte_la_duree_max_plan(tmp_path):
     config = montage.ConfigurationMontage(dossier_travail=tmp_path, dossier_videos=tmp_path)
     assert config.duree_max_plan == montage.DUREE_MAX_PLAN_DEFAUT

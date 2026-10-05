@@ -46,7 +46,9 @@ La barre latérale contient **Créer**, **Mes créations**, **Connexions** et **
    **voix off `.mp3` générée** se téléchargent à côté, depuis la carte du travail.
 3. **Montage multi-source** — jusqu'à 20 liens collés manuellement, organisés en onglets Script / Sources / Référence / Réglages, avec les boutons Coller, Valider et Tout supprimer. La validation affiche l'état réel de chaque source (accessible, durée, dimensions, codec, erreur).
 
-Les **modes Rapide et Qualité** (720 × 1280 priorité vitesse, ou CRF 21 + 1080 × 1920 si `AUTORISER_EXPORT_1080`) et l'**intensité des transitions** (aucune, légère, modérée, forte) sont réglables dans Paramètres et dans l'onglet Réglages ; ils s'appliquent aux trois sections. Le suivi de génération est réel (états, progression, état par source), l'historique des 6 dernières heures permet lecture, téléchargement, Drive et annulation, et un travail en cours est repris après actualisation de la page. Aucun faux compte, aucune fausse donnée, aucun abonnement payant.
+Toutes les sorties durent désormais **au moins 1 min 1 s** (contrôle FFprobe après export). Chaque source est visionnée par Gemini sur toute sa durée : seuls les plans nets de qualité professionnelle, **sans personne, logo ni watermark**, peuvent être montés. Les sous-titres TikTok déjà intégrés restent autorisés ; tout autre texte ou élément superposé est refusé. L’objet doit correspondre exactement au texte (par exemple une vraie Golf 8, jamais une voiture générique). Une analyse IA invalide n'autorise plus de plan de repli non vérifié. Lorsqu'une référence est fournie — automatiquement en RsT — sa cadence, ses coupes, transitions, zooms et sous-titres guident fidèlement le nouveau montage, sans recopier son contenu.
+
+Les **modes Rapide et Qualité** (qualité CRF 21 dans les deux cas, 1080 × 1920 si `AUTORISER_EXPORT_1080`) et l'**intensité des transitions** (aucune, légère, modérée, forte) sont réglables dans Paramètres et dans l'onglet Réglages ; ils s'appliquent aux trois sections. Le suivi de génération est réel (états, progression, état par source), l'historique des 6 dernières heures permet lecture, téléchargement, Drive et annulation, et un travail en cours est repris après actualisation de la page. Aucun faux compte, aucune fausse donnée, aucun abonnement payant.
 
 ## Voix off : importée ou générée
 
@@ -78,7 +80,7 @@ Le mode **Montage multi-source** accepte de 1 à 20 liens TikTok (un par ligne).
 
 Pendant le travail, les téléchargements sont séquentiels. Les aperçus couvrent **toute la durée autorisée** à environ 360p/6 FPS, sans audio, et sont supprimés juste après l'analyse. Une seule analyse Gemini est lancée par défaut (`2` maximum configurable). Les originaux, jamais les aperçus, alimentent un graphe FFmpeg final en 720 × 1280, 24 FPS, H.264/yuv420p. L'accroche utilise des plans de 0,6 à 1,5 s ; les scènes principales visent 4,5 à 5,5 s.
 
-Une référence de style facultative peut guider approximativement le rythme, les coupes, les zooms et les sous-titres ASS. Ses images, son son, son logo, son watermark et son contenu créatif ne sont jamais recopiés.
+Une référence de style reproduit aussi fidèlement que possible le rythme, les coupes, les zooms et les sous-titres ASS. Sans référence explicite, la première source sert de référence. Ses images, son son, son logo, son watermark et son contenu créatif ne sont jamais recopiés.
 
 Les jobs publient les états `queued`, `validating`, `downloading`, `analysing`, `selecting`, `editing`, `subtitling`, `uploading`, `completed` ou `failed`, avec progression et détail. L'identifiant est gardé dans `localStorage` : une actualisation reprend le suivi. Les erreurs réseau/502/503/504 sont retentées avec backoff et un travail peut être annulé.
 
@@ -108,7 +110,7 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 |---|---:|---|
 | `GEMINI_MODEL` | `gemini-2.5-flash` | modèle Gemini principal |
 | `GEMINI_MODELES` | `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash` | chaîne de modèles de secours, essayés dans l'ordre en cas de 503 / 429 |
-| `DUREE_CIBLE_SECONDES` | `30` | durée du mode B-roll |
+| `DUREE_CIBLE_SECONDES` | `30` | ancienne durée indicative du script ; l'export final est toujours prolongé et vérifié à 61 s minimum |
 | `DUREE_MAX_SOURCE_SECONDES` | `180` | limite annoncée et appliquée par source/référence |
 | `JOB_TIMEOUT_SECONDES` | `570` | limite globale, soit 9 min 30 |
 | `FFMPEG_TIMEOUT_SECONDES` | `240` | timeout d'une commande FFmpeg |

@@ -57,8 +57,13 @@ class ConfigurationMontage:
     crf: int = 23
     threads_ffmpeg: int = 1
     autoriser_1080: bool = False
+    # En production, chaque source doit avoir été réellement validée par l'IA :
+    # aucune sélection de repli, aucun texte/logo et aucune image médiocre.
+    exiger_validation_ia: bool = False
     # Mode RsT strict : refuser un plan « beau mais hors sujet » plutôt que le monter.
     exiger_pertinence_visuelle: bool = False
+    # Toutes les sorties doivent durer au moins 1 min 1 s, transitions comprises.
+    duree_min_video: float = 61.0
 
 
 class Rapporteur:
@@ -343,7 +348,12 @@ class SceneAnalyse(BaseModel):
     nettete: float = Field(ge=0, le=1)
     cadrage: str = Field(min_length=1, max_length=200)
     texte_visible: bool
+    # Le texte TikTok est accepté uniquement s'il s'agit de vrais sous-titres.
+    texte_sous_titres: bool = False
+    personne_visible: bool = False
     watermark: bool
+    logo_visible: bool = False
+    autre_element_superpose: bool = False
     pertinence_script: list[PertinenceScript]
     rythme: str = Field(min_length=1, max_length=100)
     transition_recommandee: str = Field(min_length=1, max_length=100)
@@ -397,18 +407,21 @@ STYLE_DEFAUT = StyleReference(
 PROMPT_ANALYSE = """Tu analyses un aperçu vidéo léger mais couvrant TOUTE la source ({duree:.2f} secondes, 360p, 6 fps, sans audio).
 Parties du script : {segments}
 Retourne UNIQUEMENT cet objet JSON strict :
-{{"scenes":[{{"debut":0.0,"fin":5.0,"sujet":"...","action_mouvement":"...","qualite":"bonne|moyenne|faible","nettete":0.8,"cadrage":"...","texte_visible":false,"watermark":false,"pertinence_script":[{{"id":0,"score":0.8}}],"rythme":"dynamique|modéré|statique","transition_recommandee":"cut|fade|slide|zoom","score_pertinence":0.8}}]}}
-Contraintes : temps réels dans [0,{duree:.2f}], scènes intéressantes seulement, actions complètes si possible, score 0..1. Décris le sujet, l'action, la qualité/netteté, le cadrage, tout texte/watermark, la pertinence POUR CHAQUE partie concernée, le rythme et la transition. N'invente rien et n'ajoute aucune clé.
-PERTINENCE VISUELLE STRICTE (critère le plus important) :
+{{"scenes":[{{"debut":0.0,"fin":5.0,"sujet":"...","action_mouvement":"...","qualite":"bonne|moyenne|faible","nettete":0.8,"cadrage":"...","texte_visible":false,"texte_sous_titres":false,"personne_visible":false,"watermark":false,"logo_visible":false,"autre_element_superpose":false,"pertinence_script":[{{"id":0,"score":0.8}}],"rythme":"dynamique|modéré|statique","transition_recommandee":"cut|fade|slide|zoom","score_pertinence":0.8}}]}}
+Contraintes : temps réels dans [0,{duree:.2f}], scènes intéressantes seulement, actions complètes si possible, score 0..1. Décris le sujet, l'action, la qualité/netteté et le cadrage. Distingue précisément : texte_visible = tout texte, texte_sous_titres = uniquement une transcription de paroles, personne_visible = une personne même partielle, watermark, logo_visible = logo ajouté/incrusté à l'image (pas l'emblème physique normal du produit filmé), autre_element_superpose = stickers, pseudos, boutons ou décorations. Indique la pertinence POUR CHAQUE partie concernée, le rythme et la transition. N'invente rien et n'ajoute aucune clé.
+PERTINENCE VISUELLE ET IDENTITÉ STRICTES (critères les plus importants) :
+- Identifie exactement le modèle, produit, personne, lieu ou objet demandé. Si le script dit « Golf 8 », une autre Volkswagen, une Golf 7 ou une voiture générique est hors sujet et reçoit 0.15 MAXIMUM.
+- N'accepte aucune personne visible sur les plans d'objet/voiture/produit, même si elle ne cache qu'une petite partie du sujet.
+- Les sous-titres TikTok déjà incrustés sont autorisés. Tout autre texte, logo, watermark, sticker, pseudo ou élément graphique superposé est interdit.
 - N'accorde JAMAIS un bon score à un plan seulement parce qu'il est esthétique ou bien filmé : la beauté ne fait pas la pertinence.
 - Un paysage, bâtiment, skyline, ville, voyage ou b-roll générique, sans personne, objet ou action lié au script, doit recevoir un score_pertinence et des pertinence_script à 0.25 MAXIMUM.
-- Sujet tech/téléphone/produit : privilégie uniquement les plans montrant le téléphone, l'écran, le produit nommé, une prise en main, une démonstration ou une comparaison réelle.
+- Sujet tech/téléphone/produit : privilégie uniquement les plans montrant clairement l'objet exact, son écran, une démonstration sans personne ou une comparaison réelle sans mains ni visage.
 - Un plan de skyline, gratte-ciel ou tour (par exemple Burj Khalifa, Dubaï) sur un script de téléphone doit être noté FAIBLE, sauf si le script parle explicitement de Dubaï ou de ce bâtiment.
 - pertinence_script mesure le lien DIRECT entre l'image et le texte du segment, jamais la qualité technique de l'image.
 """
 
 PROMPT_STYLE = """Analyse uniquement la GRAMMAIRE VISUELLE de cette vidéo de référence, jamais son contenu créatif. Ne propose pas d'en recopier les images, le son, le logo ou le watermark.
-La référence sert uniquement à décrire un STYLE de montage imitable : rythme, durée moyenne des plans, transitions, style de sous-titres (position, taille, couleurs, accent). Ses images, son sujet et son contenu ne doivent jamais être réutilisés dans le montage.
+Le montage final doit reproduire le plus fidèlement possible la grammaire de la source : même cadence moyenne, même famille et intensité de coupes/transitions, même fréquence de zooms et même style de sous-titres (position, taille, couleurs, accent). Ses images, son sujet, son son, son texte incrusté, son logo et son watermark ne doivent jamais être réutilisés.
 Retourne UNIQUEMENT un objet JSON strict avec : duree_moyenne_plans (secondes), rythme, coupes (cut/fade/slide/zoom), zooms_legers (booléen), transitions, style_police (sans/serif/mono/arrondie), position_sous_titres (haut/centre/bas), taille_sous_titres (ratio 0.03..0.10 de la hauteur), couleur_texte (#RRGGBB), couleur_contour, couleur_accent, epaisseur_contour (1..8), ombre (booléen), mots_par_ecran (1..8), apparition (pop/progressive/fondu/simple), mots_mis_en_avant (booléen). Aucune autre clé."""
 
 
@@ -440,7 +453,9 @@ def _repli_scenes(duree: float, segments: list[dict[str, Any]]) -> list[dict[str
         "debut": 0.0, "fin": fin, "sujet": "contenu de la source",
         "action_mouvement": "mouvement non confirmé (repli sans analyse IA)",
         "qualite": "inconnue", "nettete": 0.5, "cadrage": "inconnu",
-        "texte_visible": False, "watermark": False,
+        "texte_visible": False, "texte_sous_titres": False,
+        "personne_visible": False, "watermark": False, "logo_visible": False,
+        "autre_element_superpose": False,
         "pertinence_script": [{"id": s["id"], "score": 0.25} for s in segments],
         "rythme": "modéré", "transition_recommandee": "cut", "score_pertinence": 0.25,
     }]
@@ -463,7 +478,10 @@ async def analyser_video(
         del donnees_video
         prompt = PROMPT_ANALYSE.format(
             duree=duree,
-            segments=json.dumps([{"id": s["id"], "texte": s["texte"]} for s in segments], ensure_ascii=False),
+            segments=json.dumps([
+                {"id": s["id"], "texte": s.get("texte_analyse") or s["texte"]}
+                for s in segments
+            ], ensure_ascii=False),
         )
         brut = await asyncio.wait_for(
             appel_gemini(
@@ -487,13 +505,21 @@ async def analyser_video(
                 raise ValueError("aucune scène temporelle valide")
             return scenes, None
         except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
+            if config.exiger_validation_ia:
+                raise ErreurMontage(f"Validation IA invalide pour {source.name} : {exc}") from exc
             avertissement = f"Réponse Gemini invalide, sélection de repli utilisée : {exc}"
             return _repli_scenes(duree, segments), avertissement
     except (TravailAnnule, asyncio.CancelledError):
         raise
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as exc:
+        if config.exiger_validation_ia:
+            raise ErreurMontage(f"Validation IA trop longue pour {source.name}.") from exc
         return _repli_scenes(duree, segments), "Délai Gemini dépassé, sélection de repli utilisée."
     except Exception as exc:  # une analyse en échec ne condamne pas les autres sources
+        if config.exiger_validation_ia:
+            if isinstance(exc, ErreurMontage):
+                raise
+            raise ErreurMontage(f"Validation IA indisponible pour {source.name} : {exc}") from exc
         return _repli_scenes(duree, segments), f"Analyse indisponible, sélection de repli utilisée : {exc}"
     finally:
         apercu.unlink(missing_ok=True)
@@ -614,6 +640,58 @@ def creer_segments_script(
     return segments
 
 
+def garantir_duree_minimale_segments(
+    segments: list[dict[str, Any]], duree_min: float, duree_max_plan: float
+) -> list[dict[str, Any]]:
+    """Ajoute des plans visuels sans sous-titre jusqu'à la durée minimale garantie.
+
+    On réserve 0,55 s par transition (le pire cas autorisé). Le texte n'est jamais
+    répété : les plans ajoutés prolongent seulement l'illustration professionnelle.
+    """
+    resultat = [dict(segment) for segment in segments]
+    plafond = _borner_duree_plan(duree_max_plan)
+    cible = max(61.0, float(duree_min or 0.0))
+
+    def duree_prudente() -> float:
+        total = sum(
+            float(segment["duree_cible"])
+            if segment.get("hook")
+            else min(float(segment["duree_cible"]), min(4.5, plafond))
+            for segment in resultat
+        )
+        return total - max(0, len(resultat) - 1) * 0.55
+
+    contexte_visuel = " ".join(
+        str(segment.get("texte", "")).strip() for segment in resultat
+        if str(segment.get("texte", "")).strip()
+    )[-500:]
+    while duree_prudente() < cible:
+        resultat.append({
+            "id": len(resultat), "texte": "", "texte_analyse": contexte_visuel,
+            "hook": False, "duree_cible": plafond, "prolongation": True,
+        })
+    return resultat
+
+
+def _scene_professionnelle_sans_texte(scene: dict[str, Any]) -> bool:
+    """Scène nette sans personne/overlay ; seuls les sous-titres TikTok sont tolérés."""
+    qualite = str(scene.get("qualite", "")).strip().lower()
+    try:
+        nettete = float(scene.get("nettete", 0.0))
+    except (TypeError, ValueError):
+        nettete = 0.0
+    texte_interdit = bool(scene.get("texte_visible")) and not bool(scene.get("texte_sous_titres"))
+    return (
+        not texte_interdit
+        and not bool(scene.get("personne_visible"))
+        and not bool(scene.get("watermark"))
+        and not bool(scene.get("logo_visible"))
+        and not bool(scene.get("autre_element_superpose"))
+        and qualite in {"bonne", "excellent", "excellente", "professionnelle"}
+        and nettete >= 0.65
+    )
+
+
 def _score_scene(scene: dict[str, Any], segment_id: int, source: str, precedente: str) -> float:
     pertinences = {int(p.get("id", -1)): float(p.get("score", 0)) for p in scene.get("pertinence_script", [])}
     score = pertinences.get(segment_id, float(scene.get("score_pertinence", 0))) * 0.65
@@ -668,7 +746,9 @@ def selectionner_plan(
     plan: list[dict[str, Any]] = []
     precedente = ""
     transition_precedente = ""
-    curseurs_repli = {nom: 0.0 for nom in sources}
+    # Compteur par fenêtre temporelle : une même source peut revenir plusieurs fois,
+    # mais on utilise d'abord ses moments différents (début, milieu, fin).
+    utilisations: dict[tuple[str, int], int] = {}
     autorisees = {"cut", "fade", "slide", "zoom"}
     style_cycle = [str(t).lower() for t in style.transitions + style.coupes if str(t).lower() in autorisees]
     intensite = borner_intensite_transitions(intensite_transitions)
@@ -687,30 +767,57 @@ def selectionner_plan(
         cible = min(plafond, float(segment["duree_cible"]))
         if not segment["hook"]:
             cible = min(plafond, max(plancher_plein, style.duree_moyenne_plans))
-        candidats: list[tuple[float, str, dict[str, Any]]] = []
+        candidats: list[tuple[float, str, dict[str, Any], float, tuple[str, int]]] = []
         for source, scenes in analyses.items():
             for scene in scenes:
-                disponible = float(scene.get("fin", 0)) - float(scene.get("debut", 0))
-                if disponible < min(0.55, cible):
+                # Condition non négociable : l'IA doit confirmer une image propre,
+                # sans personne ni overlay interdit. Les sous-titres sont autorisés.
+                if not _scene_professionnelle_sans_texte(scene):
                     continue
-                score = _score_scene(scene, int(segment["id"]), source, precedente)
+                debut_scene = max(0.0, float(scene.get("debut", 0)))
+                fin_scene = min(
+                    float(metadonnees[source]["duration"]), float(scene.get("fin", 0))
+                )
+                disponible = fin_scene - debut_scene
+                if disponible + 1e-6 < cible:
+                    continue
+                score_base = _score_scene(scene, int(segment["id"]), source, precedente)
                 if not segment["hook"] and disponible >= 4.5:
-                    score += 0.18
+                    score_base += 0.18
                 if segment["hook"] and "stat" not in str(scene.get("rythme", "")).lower():
-                    score += 0.12
-                candidats.append((score, source, scene))
-        if exiger_pertinence_visuelle:
-            # Mode strict : un plan n'est retenu que s'il est VRAIMENT pertinent pour
-            # ce segment. Un plan beau mais hors sujet est exclu, pas simplement
-            # rétrogradé — c'est ce filtre qui empêche une skyline de Dubaï de se
-            # glisser dans un montage de téléphone.
+                    score_base += 0.12
+
+                # Découpe virtuellement une longue scène en fenêtres distinctes de
+                # 5 s maximum. Les fenêtres jamais utilisées passent avant les redites.
+                pas = max(cible, 0.6)
+                positions: list[float] = []
+                position = debut_scene
+                while position + cible <= fin_scene + 1e-6:
+                    positions.append(position)
+                    position += pas
+                derniere = max(debut_scene, fin_scene - cible)
+                if not positions or derniere - positions[-1] >= max(0.5, cible * 0.5):
+                    positions.append(derniere)
+                for debut_possible in positions:
+                    cle_fenetre = (source, int(round(debut_possible * 1000)))
+                    repetitions = utilisations.get(cle_fenetre, 0)
+                    candidats.append((
+                        score_base - repetitions * 1.25,
+                        source, scene, debut_possible, cle_fenetre,
+                    ))
+        texte_pertinence = str(
+            segment.get("texte_analyse") or segment.get("texte", "")
+        ).strip()
+        if exiger_pertinence_visuelle and texte_pertinence:
+            # Mode strict : chaque plan, y compris une prolongation sans sous-titre,
+            # doit montrer exactement le sujet demandé par le script.
             seuil = SEUIL_PERTINENCE_HOOK if segment["hook"] else SEUIL_PERTINENCE_CORPS
             candidats = [
                 element for element in candidats
                 if _pertinence_scene(element[2], int(segment["id"])) >= seuil
             ]
-            if not candidats and str(segment.get("texte", "")).strip():
-                extrait = " ".join(str(segment["texte"]).split())
+            if not candidats:
+                extrait = " ".join(texte_pertinence.split())
                 if len(extrait) > 60:
                     extrait = extrait[:57].rstrip() + "…"
                 raise ErreurMontage(
@@ -722,25 +829,19 @@ def selectionner_plan(
         candidats.sort(key=lambda element: element[0], reverse=True)
 
         if candidats:
-            _, source, scene = candidats[0]
-            debut_scene = max(0.0, float(scene["debut"]))
+            _, source, scene, debut, cle_fenetre = candidats[0]
             fin_scene = min(float(metadonnees[source]["duration"]), float(scene["fin"]))
-            disponible = max(0.55, fin_scene - debut_scene)
+            disponible = max(0.55, fin_scene - debut)
             duree = min(cible, disponible)
             if not segment["hook"] and disponible >= plancher_plein:
                 duree = min(plafond, max(plancher_plein, min(cible, disponible)))
-            debut = debut_scene
+            utilisations[cle_fenetre] = utilisations.get(cle_fenetre, 0) + 1
             recommandation = str(scene.get("transition_recommandee", "cut")).lower()
         else:
-            choix = [s for s in sources if s != precedente] or sources
-            source = choix[index % len(choix)]
-            duree_source = float(metadonnees[source]["duration"])
-            duree = min(cible, duree_source)
-            if not segment["hook"] and duree_source >= plancher_plein:
-                duree = min(plafond, duree_source)
-            debut = min(curseurs_repli[source], max(0.0, duree_source - duree))
-            curseurs_repli[source] = (debut + duree + 0.5) % max(duree_source, 0.6)
-            recommandation = "cut"
+            raise ErreurMontage(
+                "Aucune scène cohérente, professionnelle et sans personne/logo/watermark "
+                "n'est disponible. Les sous-titres intégrés sont les seuls overlays autorisés. "
+            )
 
         transition = (
             recommandation if recommandation in autorisees and recommandation in cycle
@@ -1021,6 +1122,9 @@ async def construire_montage_professionnel(
     segments = creer_segments_script(hook, corps, config.duree_max_plan)
     if not segments:
         raise ErreurMontage("Le script est vide : aucun plan ne peut être préparé.")
+    segments = garantir_duree_minimale_segments(
+        segments, config.duree_min_video, config.duree_max_plan
+    )
 
     rapporteur.update(
         "validating", 2, f"Validation 0/{len(propres)}", source_errors=erreurs_forme,
@@ -1157,21 +1261,30 @@ async def construire_montage_professionnel(
             nonlocal terminees
             async with verrou:
                 rapporteur.checkpoint()
-                scenes, avertissement = await analyser_video(
-                    sources[nom], float(metadonnees[nom]["duration"]), segments,
-                    config, rapporteur, appel_gemini,
-                )
-                analyses[nom] = scenes
-                terminees += 1
                 index = int(metadonnees[nom]["index"])
-                rapports[index].update(
-                    status="analysed", scenes=len(scenes), analysis_warning=avertissement or ""
-                )
-                if avertissement:
+                try:
+                    scenes, avertissement = await analyser_video(
+                        sources[nom], float(metadonnees[nom]["duration"]), segments,
+                        config, rapporteur, appel_gemini,
+                    )
+                    analyses[nom] = scenes
+                    rapports[index].update(
+                        status="analysed", scenes=len(scenes), analysis_warning=avertissement or ""
+                    )
+                    if avertissement:
+                        erreurs_sources.append({
+                            "index": index, "url": metadonnees[nom]["url"],
+                            "error": avertissement, "status": "analysis_fallback",
+                        })
+                except ErreurMontage as exc:
+                    # Une source refusée par l'IA (texte, réponse invalide, timeout)
+                    # est exclue ; les autres sources propres peuvent continuer.
+                    rapports[index].update(status="rejected_by_ai", scenes=0, error=str(exc))
                     erreurs_sources.append({
                         "index": index, "url": metadonnees[nom]["url"],
-                        "error": avertissement, "status": "analysis_fallback",
+                        "error": str(exc), "status": "rejected_by_ai",
                     })
+                terminees += 1
                 rapporteur.update(
                     "analysing", 36 + int(34 * terminees / total_analyses),
                     f"Analyse {terminees}/{total_analyses}", sources=rapports,
@@ -1216,7 +1329,17 @@ async def construire_montage_professionnel(
             plan, sources, style_reference, config, rapporteur, resolution, dossier,
             voix_off=voix_off,
         )
+        infos_sortie = await sonder_video(
+            sortie, timeout=rapporteur.timeout(min(25, config.delai_ffmpeg))
+        )
+        if float(infos_sortie["duration"]) + 0.05 < config.duree_min_video:
+            sortie.unlink(missing_ok=True)
+            raise ErreurMontage(
+                f"La vidéo finale ne dure que {infos_sortie['duration']:.2f} s ; "
+                f"minimum requis : {config.duree_min_video:.0f} s."
+            )
         return {
+            "duration": infos_sortie["duration"],
             "path": sortie,
             "url": f"/videos/{sortie.name}",
             "sources": rapports,

@@ -165,10 +165,10 @@
     try {
       const brut = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
       return {
-        mode: brut && brut.mode === 'qualite' ? 'qualite' : 'rapide',
+        mode: brut && brut.mode === 'rapide' ? 'rapide' : 'qualite',
         intensite: brut && [0, 1, 2, 3].includes(Number(brut.intensite)) ? Number(brut.intensite) : 2
       };
-    } catch (_) { return { mode: 'rapide', intensite: 2 }; }
+    } catch (_) { return { mode: 'qualite', intensite: 2 }; }
   }
 
   function saveSettings() {
