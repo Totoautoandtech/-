@@ -59,12 +59,14 @@ from studio_montage import (
     ErreurMontage,
     Rapporteur,
     TravailAnnule,
+    analyser_video,
     construire_montage_professionnel,
     diagnostiquer_montage,
     estimer_duree_traitement,
     executer_commande,
     normaliser_lien_tiktok,
     normaliser_liens_tiktok,
+    sonder_video,
 )
 
 # ======================================================================================
@@ -126,6 +128,8 @@ RST_NOMS_CHOIX = (3, 5)
 RST_NOMS_DEFAUT = 3
 # Aucun plan du montage RsT ne dépasse 5 secondes.
 RST_DUREE_MAX_PLAN = 5.0
+# Règle globale, appliquée aux trois modes et vérifiée après l'export FFprobe.
+DUREE_MIN_VIDEO_SECONDES = 61.0
 
 # Livraison séparée : la vidéo finale reste MUETTE. Le script est livré en .txt et la
 # voix off est synthétisée en .mp3 par edge-tts — gratuit, sans clé d'API et sans compte.
@@ -314,7 +318,6 @@ def _configuration_montage(
     `exiger_pertinence_visuelle` active le mode strict RsT : aucun plan n'est monté
     s'il n'est pas réellement pertinent pour le segment de script qu'il illustre.
     """
-    qualite = str(mode).lower() == "qualite"
     return ConfigurationMontage(
         dossier_travail=DOSSIER_TRAVAIL,
         dossier_videos=DOSSIER_VIDEOS,
@@ -325,11 +328,17 @@ def _configuration_montage(
         budget_disque_sources=CONFIG.budget_disque_sources,
         analyses_concurrentes=CONFIG.analyses_concurrentes,
         preset=CONFIG.preset_export,
-        crf=21 if qualite else 23,
+        # La qualité d'encodage est désormais constante, même si un ancien client
+        # envoie encore « rapide ». La résolution 1080 reste protégée par la variable.
+        crf=21,
         threads_ffmpeg=CONFIG.threads_ffmpeg,
         autoriser_1080=CONFIG.autoriser_export_1080,
         duree_max_plan=float(duree_max_plan),
-        exiger_pertinence_visuelle=bool(exiger_pertinence_visuelle),
+        exiger_validation_ia=True,
+        # Tous les modes exigent désormais une correspondance directe entre le texte
+        # et l'objet exact visible (ex. Golf 8, jamais une voiture générique).
+        exiger_pertinence_visuelle=True,
+        duree_min_video=DUREE_MIN_VIDEO_SECONDES,
     )
 
 
@@ -648,8 +657,8 @@ PROMPT_SCRIPT = (
     "valide, sans texte avant/après, sans balises markdown, avec exactement trois clés :\n"
     '- "hook" : une phrase d\'accroche courte et percutante (moins de 12 mots), la toute première '
     "chose dite dans la vidéo, pour capter l'attention en 3 secondes.\n"
-    '- "corps" : la suite du script (3 à 6 phrases courtes), qui développe l\'idée, dans la même '
-    "langue que le contenu source.\n"
+    '- "corps" : la suite du script, 130 à 160 mots et au moins 13 phrases courtes, afin de '
+    "tenir naturellement au moins 1 min 1 s, dans la même langue que le contenu source.\n"
     '- "mot_cle_broll" : un thème visuel court (2 à 5 mots), l\'objet ou le concept principal à '
     "illustrer en vidéo, SANS aucune mention de texte à l'écran.\n"
     "Réponds strictement avec ce JSON."
@@ -892,8 +901,8 @@ PROMPT_REFERENCE = (
     "texte avant/après, sans balises markdown, avec exactement trois clés :\n"
     '- "hook" : recopie MOT POUR MOT la toute première phrase de la transcription (l\'accroche '
     "d'origine). Ne la traduis pas, ne la modifie pas, ne la reformule pas.\n"
-    '- "corps" : réécris et traduis en français le reste de la transcription, pour que ce soit '
-    "fluide et clair, sans en changer le sens ni les informations.\n"
+    '- "corps" : réécris et traduis en français le reste de la transcription en 130 à 160 mots '
+    "et au moins 13 phrases courtes, pour tenir au moins 1 min 1 s, sans changer le sens ni inventer d’informations.\n"
     '- "mot_cle_broll" : un thème visuel court (2 à 5 mots), sans mention de texte à l\'écran.\n'
     "Réponds strictement avec ce JSON."
 )
@@ -997,7 +1006,9 @@ async def chercher_broll(mot_cle: str, duree_visee: float) -> list[str]:
     if not candidats:
         raise ErreurApp(f"Aucune vidéo Pexels verticale trouvée pour « {mot_cle} ».")
 
-    nb_clips = max(3, min(8, -(-int(duree_visee) // 6)))  # ~6s par clip (index de liste : doit rester un int)
+    # On télécharge jusqu'à 12 candidates : l'IA peut en écarter (texte, logo,
+    # flou). Le montage final réutilise seulement les passages qu'elle certifie.
+    nb_clips = max(8, min(12, -(-int(max(duree_visee, DUREE_MIN_VIDEO_SECONDES)) // 5)))
     random.shuffle(candidats)
     return candidats[:nb_clips]
 
@@ -1225,7 +1236,6 @@ async def construire_video(
         if resolution == "1080" and not CONFIG.autoriser_export_1080:
             resolution = "720"
         largeur, hauteur = (1080, 1920) if resolution == "1080" else (720, 1280)
-        duree_par_clip = duree_totale / len(liens_broll)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
             bruts = []
             for i, lien in enumerate(liens_broll):
@@ -1233,17 +1243,88 @@ async def construire_video(
                 await _telecharger_fichier(session, lien, chemin)
                 bruts.append(chemin)
 
-        normalises = []
-        for i, brut in enumerate(bruts):
-            cible = dossier / f"norm_{i}.mp4"
-            await _normaliser_clip(brut, cible, duree_par_clip, largeur=largeur, hauteur=hauteur)
+        # Chaque candidate est réellement regardée par Gemini. Une analyse en échec,
+        # du texte, un watermark ou une qualité insuffisante exclut la source.
+        config_ia = _configuration_montage("qualite")
+        rapporteur_ia = Rapporteur(lambda **_valeurs: None, lambda: False, lambda: 540.0)
+        texte_ia = " ".join(str(cue.get("texte", "")) for cue in cues).strip()
+        segments_ia = [{
+            "id": 0, "texte": texte_ia or "illustration exacte du sujet demandé",
+            "hook": False, "duree_cible": 5.0,
+        }]
+        passages_valides: list[tuple[Path, float]] = []
+        for brut in bruts:
+            try:
+                infos = await sonder_video(brut, timeout=min(25, CONFIG.delai_ffmpeg))
+                scenes, avertissement = await analyser_video(
+                    brut, float(infos["duration"]), segments_ia,
+                    config_ia, rapporteur_ia, _appel_gemini_brut,
+                )
+            except (ErreurMontage, ErreurApp) as exc:
+                logger.warning("B-roll %s refusé par la validation IA : %s", brut.name, exc)
+                continue
+            if avertissement:
+                continue
+            for scene in scenes:
+                disponible = float(scene.get("fin", 0)) - float(scene.get("debut", 0))
+                qualite = str(scene.get("qualite", "")).lower()
+                texte_interdit = bool(scene.get("texte_visible")) and not bool(
+                    scene.get("texte_sous_titres")
+                )
+                scores = {
+                    int(item.get("id", -1)): float(item.get("score", 0) or 0)
+                    for item in scene.get("pertinence_script", [])
+                }
+                pertinence = scores.get(0, float(scene.get("score_pertinence", 0) or 0))
+                if (
+                    disponible >= 5.0
+                    and pertinence >= 0.45
+                    and not texte_interdit
+                    and not scene.get("personne_visible")
+                    and not scene.get("watermark")
+                    and not scene.get("logo_visible")
+                    and not scene.get("autre_element_superpose")
+                    and float(scene.get("nettete", 0) or 0) >= 0.65
+                    and qualite in {"bonne", "excellent", "excellente", "professionnelle"}
+                ):
+                    debut_scene = max(0.0, float(scene["debut"]))
+                    fin_scene = float(scene["fin"])
+                    position = debut_scene
+                    while position + 5.0 <= fin_scene + 1e-6:
+                        passages_valides.append((brut, position))
+                        position += 5.0
+
+        if not passages_valides:
+            raise ErreurApp(
+                "L'IA n'a trouvé aucune source Pexels professionnelle sans texte ni watermark. "
+                "Essaie un thème visuel plus précis."
+            )
+
+        # Plans de 5 s maximum, répétés en alternance si nécessaire, jusqu'à 61 s.
+        normalises: list[Path] = []
+        restant = max(DUREE_MIN_VIDEO_SECONDES, float(duree_totale))
+        index = 0
+        while restant > 0.001:
+            brut, debut = passages_valides[index % len(passages_valides)]
+            duree = min(5.0, restant)
+            cible = dossier / f"norm_{index}.mp4"
+            await _normaliser_clip(
+                brut, cible, duree, debut=debut, largeur=largeur, hauteur=hauteur
+            )
             normalises.append(cible)
+            restant -= duree
+            index += 1
 
         assemble = await _assembler_clips(normalises, dossier)
-        return await _incruster_sous_titres(
-            assemble, cues, style, dossier, largeur=largeur, hauteur=hauteur, crf=crf,
+        sortie = await _incruster_sous_titres(
+            assemble, cues, style, dossier, largeur=largeur, hauteur=hauteur, crf=21,
             voix_off=voix_off,
         )
+        infos_sortie = await sonder_video(sortie, timeout=min(25, CONFIG.delai_ffmpeg))
+        if float(infos_sortie["duration"]) + 0.05 < DUREE_MIN_VIDEO_SECONDES:
+            sortie.unlink(missing_ok=True)
+            raise ErreurApp("La vidéo exportée fait moins de 1 min 1 s ; export refusé.")
+        return sortie
     finally:
         shutil.rmtree(dossier, ignore_errors=True)
 
@@ -2809,7 +2890,7 @@ class RequeteVideo(BaseModel):
     corps: str = Field(min_length=1, max_length=12000)
     mot_cle_broll: str = Field(min_length=1, max_length=200)
     style: str = Field(default="classique", max_length=32)
-    mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
+    mode: str = Field(default="qualite", pattern="^(rapide|qualite)$")
     voix_off: str = Field(default="", max_length=64)
     idempotency_key: str = Field(default="", max_length=80)
 
@@ -2822,7 +2903,7 @@ class RequeteMontage(BaseModel):
     lien_reference_style: str = Field(default="", max_length=2048)
     style: str = Field(default="classique", max_length=32)
     resolution: str = Field(default="720", pattern="^(720|1080)$")
-    mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
+    mode: str = Field(default="qualite", pattern="^(rapide|qualite)$")
     intensite_transitions: int = Field(default=2, ge=0, le=3)
     voix_off: str = Field(default="", max_length=64)
     estimated_seconds: int = Field(default=0, ge=0, le=7200)
@@ -2834,7 +2915,7 @@ class RequeteRst(BaseModel):
     """Mode RsT : un seul lien TikTok de départ suffit."""
     titre: str = Field(default="", max_length=120)
     lien: str = Field(min_length=1, max_length=2048)
-    mode: str = Field(default="rapide", pattern="^(rapide|qualite)$")
+    mode: str = Field(default="qualite", pattern="^(rapide|qualite)$")
     intensite_transitions: int = Field(default=2, ge=0, le=3)
     # Pipeline TOP N : 3 ou 5 noms extraits de la vidéo de départ, rien d'autre.
     nombre_noms: int = Field(default=RST_NOMS_DEFAUT)
@@ -2989,14 +3070,17 @@ async def _produire_video(
     if contexte:
         contexte.update(statut="selecting", progress=8, detail="Recherche du B-roll vertical")
     cues = _decouper_en_cues(requete.hook, requete.corps)
-    duree_totale = cues[-1]["fin"] if cues else float(CONFIG.duree_cible)
+    duree_totale = max(
+        DUREE_MIN_VIDEO_SECONDES,
+        cues[-1]["fin"] if cues else float(CONFIG.duree_cible),
+    )
     liens_broll = await chercher_broll(requete.mot_cle_broll, duree_totale)
     if contexte:
         contexte.update(statut="editing", progress=45, detail="Téléchargement et montage du B-roll")
-    resolution = "1080" if (requete.mode == "qualite" and CONFIG.autoriser_export_1080) else "720"
+    resolution = "1080" if CONFIG.autoriser_export_1080 else "720"
     chemin = await construire_video(
         liens_broll, cues, duree_totale, requete.style,
-        resolution=resolution, crf=21 if requete.mode == "qualite" else 23,
+        resolution=resolution, crf=21,
         voix_off=voix_off,
     )
     await envoyer_script_et_video(requete.hook, requete.corps, chemin)
@@ -3008,9 +3092,12 @@ async def _produire_montage(
 ) -> dict[str, Any]:
     _valider_requete_montage(requete)
     voix_off = _resoudre_voix_off(session_id, requete.voix_off)
+    # Sans référence explicite, la première source devient automatiquement la
+    # référence de montage : cadence, coupes, transitions, zooms et sous-titres.
+    lien_reference = requete.lien_reference_style.strip() or requete.liens_videos[0]
     resultat = await construire_montage_professionnel(
         liens=requete.liens_videos,
-        lien_reference=requete.lien_reference_style.strip(),
+        lien_reference=lien_reference,
         hook=requete.hook.strip(),
         corps=requete.corps.strip(),
         resolution=requete.resolution,
@@ -3216,6 +3303,18 @@ async def configuration_publique() -> dict[str, Any]:
         "job_timeout_seconds": CONFIG.delai_job,
         "analysis_fps": 6,
         "analysis_resolution": "360p",
+        "minimum_video_seconds": DUREE_MIN_VIDEO_SECONDES,
+        "ai_source_validation": {
+            "required": True,
+            "embedded_subtitles_allowed": True,
+            "people_allowed": False,
+            "other_text_or_overlays_allowed": False,
+            "logo_allowed": False,
+            "watermark_allowed": False,
+            "minimum_sharpness": 0.65,
+            "exact_subject_match_required": True,
+        },
+        "default_mode": "qualite",
         "default_export": "720x1280@24",
         "allow_1080": CONFIG.autoriser_export_1080,
         "rst": {

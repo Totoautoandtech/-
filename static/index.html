@@ -101,7 +101,7 @@
                 <h2>Lien → vidéo</h2>
                 <span class="chip">01</span>
               </div>
-              <p class="lead">Colle le lien d’un article, d’une page ou d’une vidéo TikTok. L’application prépare un script éditable, puis génère une vidéo verticale sous-titrée.</p>
+              <p class="lead">Colle le lien d’un article, d’une page ou d’une vidéo TikTok. La sortie dure au moins <strong>1 min 1 s</strong> et chaque B-roll est validé par l’IA : qualité professionnelle, sans personne, logo ni watermark (sous-titres TikTok autorisés).</p>
 
               <div class="field-row">
                 <div class="field grow">
@@ -159,7 +159,7 @@
                 <h2>RsT</h2>
                 <span class="chip">02</span>
               </div>
-              <p class="lead">Colle <strong>jusqu’à 6 liens TikTok de départ</strong>, un par ligne. Chaque lien lance son propre travail : RsT analyse la vidéo, prépare le script, puis en extrait <strong>3 ou 5 noms</strong>. Chaque nom lance sa propre recherche TikTok, puis RsT retient les meilleures sources et crée automatiquement le montage final en <strong>plans de 5 s maximum</strong>. Seules les vidéos réellement trouvées sont affichées.</p>
+              <p class="lead">Colle <strong>jusqu’à 6 liens TikTok de départ</strong>, un par ligne. Chaque sortie dure au moins <strong>1 min 1 s</strong>. RsT analyse la vidéo, extrait <strong>3 ou 5 noms</strong>, puis l’IA ne conserve que des plans professionnels sans personne, logo ni watermark (sous-titres TikTok autorisés). Le rythme, les coupes, les zooms et les transitions reproduisent la grammaire de la source, en <strong>plans de 5 s maximum</strong>.</p>
 
               <div class="field">
                 <div class="field-label-row">
@@ -226,7 +226,7 @@
                 <h2>Montage multi-source</h2>
                 <span class="chip">03</span>
               </div>
-              <p class="lead">Colle manuellement jusqu’à 20 liens TikTok. Chaque source est réellement vérifiée : état d’accès, durée et erreurs, avant le montage.</p>
+              <p class="lead">Colle manuellement jusqu’à 20 liens TikTok. Chaque vidéo est regardée par l’IA ; seuls les plans professionnels sans personne, logo ni watermark (sous-titres TikTok autorisés) sont montés. La sortie dure au moins <strong>1 min 1 s</strong>.</p>
 
               <div class="seg sub" id="montage-tabs" role="tablist">
                 <button class="seg-item active" data-mtab="script" role="tab">Script</button>
@@ -284,13 +284,13 @@
               <!-- Référence -->
               <div class="mtab" data-mtab="reference">
                 <div class="field">
-                  <label for="mon-style-ref">Vidéo TikTok de référence de style · facultatif</label>
+                  <label for="mon-style-ref">Vidéo TikTok de référence de montage · facultatif</label>
                   <div class="input-group">
                     <input id="mon-style-ref" type="text" inputmode="url" placeholder="https://www.tiktok.com/@…/video/…">
                     <button class="btn ghost" id="ref-coller" type="button">Coller</button>
                   </div>
                 </div>
-                <p class="hint">Seuls le rythme, les coupes et le style des sous-titres sont étudiés — jamais les images, le son, le logo ni le watermark.</p>
+                <p class="hint">Le rythme, la cadence, les coupes, transitions, zooms et sous-titres sont reproduits aussi fidèlement que possible. Si ce champ reste vide, la première source sert automatiquement de référence. Ses images, son son, son texte, son logo et son watermark ne sont jamais copiés.</p>
                 <div class="actions">
                   <button class="btn ghost" id="btn-reference"><span>Récupérer le script de la référence</span><span aria-hidden="true">→</span></button>
                 </div>
