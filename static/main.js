@@ -790,6 +790,28 @@
     if (trainingProfiles.some((profile) => profile.id === current)) select.value = current;
   }
 
+  function profilNonEntraine(profile) {
+    if (!profile) return false;
+    const details = profile.donnees || {};
+    return !Number(details.sources_exemples_analysees || 0)
+      && !Number(profile.sources_automatiquement_ajoutees || profile.source_count || 0)
+      && !Number(details.confiance_moyenne || 0);
+  }
+
+  function notifierProfilSst() {
+    const profile = trainingProfiles.find((item) => item.id === $('sst-profil').value);
+    if (!profile) return;
+    if (profilNonEntraine(profile)) {
+      setStatus($('statut-sst'),
+        'Ce profil est enregistré mais pas encore entraîné (0 source, 0 exemple analysé, confiance 0 %). Ajoute des exemples dans Entraînement IA puis clique sur « Analyser avec l’IA et alimenter ».',
+        'error');
+    } else {
+      setStatus($('statut-sst'),
+        `Profil « ${profile.nom_sujet || 'Sujet'} » sélectionné : les candidates seront aussi comparées à sa signature visuelle.`,
+        'success');
+    }
+  }
+
   function renderTrainingProfiles() {
     const list = $('training-profile-list');
     if (!list) return;
@@ -809,8 +831,16 @@
       card.append(head);
       card.append(el('p', 'training-profile-meta', aliases.length ? `Alias : ${aliases.join(' · ')}` : 'Aucun alias'));
       const details = profile.donnees || {};
+      const exemplesAnalyses = Number(details.sources_exemples_analysees || 0);
+      const confiance = Math.round(Number(details.confiance_moyenne || 0) * 100);
       card.append(el('p', 'training-profile-meta',
-        `${(details.sources_exemples_analysees || 0)} exemple(s) analysé(s) · confiance moyenne ${Math.round(Number(details.confiance_moyenne || 0) * 100)}%`));
+        `${exemplesAnalyses} exemple(s) analysé(s) · confiance moyenne ${confiance}%`));
+      // 0 source, 0 exemple analysé, confiance 0 % : le profil est seulement
+      // enregistré, pas encore entraîné — l'interface doit le dire clairement.
+      if (!exemplesAnalyses && !Number(profile.sources_automatiquement_ajoutees || profile.source_count || 0) && !confiance) {
+        card.append(el('p', 'training-profile-note',
+          'Profil seulement enregistré, pas encore entraîné : ajoute des bons et mauvais exemples TikTok puis clique sur « Analyser avec l’IA et alimenter ».'));
+      }
       const actions = el('div', 'training-profile-actions');
       actions.append(boutonAction('Utiliser dans SsT', () => {
         showView('creer');
@@ -1331,6 +1361,7 @@
       $('sst-lien').value = texte.split(/\r?\n/)[0].trim();
     }));
     $('sst-open-training').addEventListener('click', () => showView('entrainement'));
+    $('sst-profil').addEventListener('change', notifierProfilSst);
     $('btn-sst').addEventListener('click', () => guards.sst.run(async () => {
       const lien = $('sst-lien').value.trim();
       const names = collectSstNames();

@@ -3088,6 +3088,13 @@ async def analyser_profil_entrainement(profil: dict[str, Any]) -> dict[str, Any]
                 )
                 automatiques.append(candidat)
                 existantes.add(candidat["video_id"])
+            else:
+                # Le refus reste visible sur la candidate elle-même : la raison exacte
+                # est conservée avec l'analyse complète dans l'historique du profil.
+                candidat.update(
+                    valide=False, validation_status="rejected",
+                    raison_refus=str(analyse.get("raison_refus") or "validation visuelle non concluante"),
+                )
             # Les refus ne sont pas ajoutés aux sources utilisables, mais leur analyse
             # reste dans l'historique afin de préserver les données du profil.
             profil["donnees"].setdefault("candidates_analysees", []).append({
@@ -3166,7 +3173,14 @@ def _selectionner_sources_sst(candidats: list[dict[str, Any]], noms: list[str], 
     for candidat in ordonnes:
         candidat["selected"] = False
         candidat["validation_status"] = "awaiting_visual_ai"
-        duree = float(candidat.get("duration") or 0)
+        try:
+            duree = float(candidat.get("duration") or 0)
+        except (TypeError, ValueError):  # durée absente ou invalide : jamais retenue
+            duree = 0.0
+        if duree <= 0:
+            candidat["rejet"] = "durée inconnue ou invalide"
+            candidat["validation_status"] = "rejected_before_ai"
+            continue
         if duree < DUREE_MIN_SOURCE_RST:
             candidat["rejet"] = f"durée {duree:.0f} s trop courte"
             candidat["validation_status"] = "rejected_before_ai"
@@ -3182,6 +3196,7 @@ def _selectionner_sources_sst(candidats: list[dict[str, Any]], noms: list[str], 
             vus_noms.add(cle)
         else:
             candidat["rejet"] = "quota équilibré atteint"
+            candidat["validation_status"] = "rejected_before_ai"
     # Si une recherche n'a aucun résultat, remplir avec les noms qui ont encore des vidéos.
     for candidat in ordonnes:
         if len(retenues) >= limite:
@@ -3201,6 +3216,14 @@ async def _produire_sst(requete: "RequeteSst", contexte: "ContexteJob", session_
         if profil is None:
             raise ErreurApp("Le profil d'entraînement sélectionné n'existe plus dans cette session.")
     contexte.update(statut="analysing", progress=4, detail="Lecture de la vidéo source SsT", noms_saisis=noms, profil_id=requete.profil_id)
+    # Trace honnête de la recherche : chaque échec TikWM et public est conservé pour
+    # expliquer un résultat vide sans rien inventer — même principe que RsT.
+    echecs_tikwm: list[str] = []
+    echecs_publiques: list[str] = []
+
+    def deja_trace(echecs: list[str], nom: str) -> bool:
+        return any(echec.startswith(f"« {nom} »") for echec in echecs)
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=90, connect=15)) as session:
         donnees = await _donnees_tikwm(session, "/", {"url": lien, "hd": "1"})
         source = str(donnees.get("title") or "").strip()
@@ -3213,32 +3236,123 @@ async def _produire_sst(requete: "RequeteSst", contexte: "ContexteJob", session_
         recherches: list[str] = []
         quota_par_nom = max(5, CONFIG.rst_candidats_max // len(noms))
         identifiant_source = str(donnees.get("id") or donnees.get("video_id") or "")
+        # Constaté en production (Render) : TikWM /feed/search peut répondre 403 ou
+        # vide depuis certaines IP de serveur alors que l'endpoint unitaire /api/
+        # fonctionne encore. SsT utilise donc la même chaîne de secours publique que
+        # RsT : moteurs publics, relais publics, archive web, miroir — sans clé.
+        etat_sources = EtatSourcesDecouverte()
+        tikwm_recherche_bloquee = False
+
+        def accumuler(video: Any, origine: str, nom: str) -> bool:
+            """Ajoute une vidéo réellement renvoyée par TikWM, sauf doublon d'identifiant."""
+            candidat = _normaliser_candidat_rst(video, origine, nom)
+            if not candidat or candidat["video_id"] == identifiant_source:
+                return False
+            # Doublon TikTok : même identifiant vidéo déjà enregistré, jamais deux fois.
+            if candidat["video_id"] in candidats:
+                return False
+            # Rien n'est annoncé « retenu » avant la validation visuelle Gemini.
+            candidat["selected"] = False
+            candidat["validation_status"] = "awaiting_visual_ai"
+            candidats[candidat["video_id"]] = candidat
+            return True
+
+        async def revalider_lien_public(entree: dict, nom: str) -> bool:
+            """Revalide un lien découvert via TikWM /api/ : identifiant, auteur, titre
+            et durée restent réels — aucune métadonnée n'est jamais inventée."""
+            try:
+                await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
+                donnees_v = await _donnees_tikwm(session, "/", {"url": entree["url"], "hd": "1"})
+            except Exception as exc:  # noqa: BLE001 — ce lien public n'est pas exploitable
+                echecs_tikwm.append(f"« {nom} » : revalidation TikWM /api/ de {entree.get('url')} — {exc}")
+                return False
+            return accumuler(donnees_v, str(entree.get("origin") or f"découverte publique « {nom} »"), nom)
+
+        # Chaque nom saisi déclenche sa propre recherche : aucun nom n'est remplacé,
+        # complété ou cherché « à la place » par un sujet général.
         for rang, nom in enumerate(noms, 1):
             recherches.append(nom)
+            progression = 20 + int(22 * rang / len(noms))
             contexte.update(
-                statut="searching", progress=20 + int(22 * rang / len(noms)),
+                statut="searching", progress=progression,
                 detail=f"Recherche indépendante {rang}/{len(noms)} : « {nom} »",
-                recherches=recherches, noms_saisis=noms,
+                search_queries=recherches, recherches=recherches, noms_saisis=noms,
             )
-            try:
-                resultats = await _donnees_tikwm(session, "/feed/search", {"keywords": nom, "count": str(quota_par_nom)})
-            except Exception as exc:  # une recherche isolée ne remplace pas un nom
-                logger.info("Recherche SsT indisponible pour %s : %s", nom, exc)
-                continue
-            for video in resultats.get("videos") or []:
-                candidat = _normaliser_candidat_rst(video, f"recherche SsT « {nom} »", nom)
-                if not candidat or candidat["video_id"] == identifiant_source:
-                    continue
-                candidats.setdefault(candidat["video_id"], candidat)
+            nouvelles = 0
+            if tikwm_recherche_bloquee:
+                echecs_tikwm.append(f"« {nom} » : TikWM /feed/search déjà bloqué (403) pour cette IP")
+            else:
+                try:
+                    await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
+                    resultats = await _donnees_tikwm(session, "/feed/search", {"keywords": nom, "count": str(quota_par_nom)})
+                    for video in resultats.get("videos") or []:
+                        if accumuler(video, f"recherche SsT « {nom} »", nom):
+                            nouvelles += 1
+                except ErreurTikwm403:
+                    logger.warning("[SsT] TikWM /feed/search bloqué (403) : découverte publique pour « %s »", nom)
+                    tikwm_recherche_bloquee = True
+                    echecs_tikwm.append(f"« {nom} » : TikWM /feed/search bloqué (403)")
+                except Exception as exc:  # une recherche isolée ne remplace jamais un nom
+                    logger.info("Recherche SsT indisponible pour %s : %s", nom, exc)
+                    echecs_tikwm.append(f"« {nom} » : TikWM /feed/search — {exc}")
+
+            # /feed/search bloqué (403) ou sans résultat : la chaîne publique prend le
+            # relais POUR CE NOM, séparément — jamais un sujet général à sa place.
+            if nouvelles == 0:
+                contexte.update(
+                    statut="searching", progress=progression,
+                    detail=f"Recherche publique {rang}/{len(noms)} : « {nom} »",
+                    search_queries=recherches, recherches=recherches, noms_saisis=noms,
+                )
+                try:
+                    liens_publiques = await _decouvrir_publique(
+                        session, requete=nom, limite=quota_par_nom, etat=etat_sources
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    echecs_publiques.append(f"« {nom} » : sources publiques — {exc}")
+                    liens_publiques = []
+                if not liens_publiques and not deja_trace(echecs_publiques, nom):
+                    detail_bloquees = (
+                        f" (sources bloquées : {', '.join(sorted(etat_sources.bloquees))})"
+                        if etat_sources.bloquees else ""
+                    )
+                    echecs_publiques.append(
+                        f"« {nom} » : aucune source publique n'a donné de lien{detail_bloquees}"
+                    )
+                for entree in liens_publiques[:quota_par_nom]:
+                    if await revalider_lien_public(entree, nom):
+                        nouvelles += 1
+            if nouvelles == 0 and not deja_trace(echecs_tikwm + echecs_publiques, nom):
+                echecs_publiques.append(f"« {nom} » : aucun résultat après TikWM et sources publiques")
+            contexte.update(
+                statut="searching", progress=progression,
+                detail=f"{len(candidats)} vidéo(s) réellement trouvée(s)",
+                found_videos=list(candidats.values()),
+                search_queries=recherches, recherches=recherches, noms_saisis=noms,
+            )
         trouves = _repartir_par_nom(list(candidats.values()), noms)[: CONFIG.rst_candidats_max]
         contexte.update(
             statut="selecting", progress=45,
             detail=f"{len(trouves)} candidate(s) trouvée(s) — validation visuelle IA obligatoire",
-            found_videos=trouves, recherches=recherches, noms_saisis=noms,
+            found_videos=trouves, search_queries=recherches, recherches=recherches, noms_saisis=noms,
         )
         selectionnees = _selectionner_sources_sst(trouves, noms, CONFIG.rst_sources_max, float(CONFIG.duree_max_source))
         if not selectionnees:
-            raise ErreurApp("SsT n'a trouvé aucune source exploitable pour les noms saisis.")
+            # Échec expliqué : noms recherchés, recherches tentées, erreurs TikWM,
+            # erreurs des sources publiques et raisons de rejet — rien n'est inventé.
+            rejets = [
+                f"{candidate.get('author') or candidate.get('url') or 'candidate'} : "
+                f"{candidate.get('rejet') or 'raison inconnue'}"
+                for candidate in trouves if candidate.get("rejet")
+            ]
+            raise ErreurApp(
+                "SsT n'a trouvé aucune source exploitable pour les noms saisis. "
+                f"Noms recherchés : {', '.join(noms)}. "
+                f"Recherches tentées : {', '.join(recherches) if recherches else 'aucune'}. "
+                f"Erreurs TikWM : {' ; '.join(echecs_tikwm[:8]) if echecs_tikwm else 'aucune'}. "
+                f"Erreurs des sources publiques : {' ; '.join(echecs_publiques[:8]) if echecs_publiques else 'aucune'}. "
+                f"Raisons de rejet : {' ; '.join(rejets[:8]) if rejets else 'aucune candidate trouvée'}."
+            )
         configuration = _configuration_montage(requete.mode, RST_DUREE_MAX_PLAN, True)
         resultat = await construire_montage_professionnel(
             liens=[candidate["url"] for candidate in selectionnees],

@@ -19,11 +19,21 @@ def nettoyer_etat():
         task.cancel()
     app.JOBS.clear(); app.JOB_TASKS.clear(); app.JOB_INDEX.clear()
     app.SESSIONS_INTEGRATIONS.clear()
+    _purger_profils_tests()
     yield
     for task in list(app.JOB_TASKS.values()):
         task.cancel()
     app.JOBS.clear(); app.JOB_TASKS.clear(); app.JOB_INDEX.clear()
     app.SESSIONS_INTEGRATIONS.clear()
+    _purger_profils_tests()
+
+
+def _purger_profils_tests():
+    """Retire les fichiers de profils d'entraînement créés par les tests."""
+    for fichier in app.DOSSIER_PROFILS_ENTRAINEMENT.glob("*.json"):
+        fichier.unlink(missing_ok=True)
+    for fichier in app.DOSSIER_PROFILS_ENTRAINEMENT.glob("*.tmp"):
+        fichier.unlink(missing_ok=True)
 
 
 @pytest.fixture
@@ -1973,3 +1983,543 @@ def test_diagnostic_sources_rst_rapporte_l_etat_reel_depuis_le_serveur(client, m
     assert tikwm["/"]["statut"] == "ok" and tikwm["/"]["videos"] == 1
     assert tikwm["/user/posts"]["statut"] == "bloque (403)"
     assert tikwm["/feed/search"]["statut"] == "ok" and tikwm["/feed/search"]["videos"] == 0
+
+
+# ======================================================================================
+# SsT : TOP 3 / TOP 5 manuel — recherche indépendante par nom, secours public
+# ======================================================================================
+
+
+def test_sst_exige_exactement_3_ou_5_noms_differents():
+    """TOP 3 = exactement 3 noms différents ; TOP 5 = exactement 5 — ni vide ni doublon."""
+    valide = ["Alpha One", "Beta S", "Gamma X"]
+    assert app._noms_sst_valides(valide, 3) == valide
+    cinq = ["Alpha One", "Beta S", "Gamma X", "Delta R", "Epsilon T"]
+    assert app._noms_sst_valides(cinq, 5) == cinq
+
+    with pytest.raises(app.ErreurApp, match="uniquement TOP 3 ou TOP 5"):
+        app._noms_sst_valides(valide, 4)
+    with pytest.raises(app.ErreurApp, match="exactement 3 noms différents"):
+        app._noms_sst_valides(["Alpha One", "Beta S"], 3)
+    with pytest.raises(app.ErreurApp, match="exactement 5 noms différents"):
+        app._noms_sst_valides(["Alpha One", "Beta S", "Gamma X", "Delta R"], 5)
+    with pytest.raises(app.ErreurApp, match="exactement 3 noms différents"):
+        app._noms_sst_valides(["Alpha One", "", "Gamma X"], 3)
+    with pytest.raises(app.ErreurApp, match="tous différents"):
+        app._noms_sst_valides(["Alpha One", "alpha one", "Gamma X"], 3)
+    with pytest.raises(app.ErreurApp, match="tous différents"):
+        app._noms_sst_valides(["Alpha One", "Beta S", "beta S"], 3)
+
+
+def test_sst_endpoint_refuse_noms_vides_ou_dupliques(client):
+    """La validation Pydantic rejette un nom vide ou dupliqué avant tout traitement."""
+    cas = [
+        {"nombre_noms": 3, "noms": ["Alpha One", "", "Gamma X"]},
+        {"nombre_noms": 3, "noms": ["Alpha One", "alpha one", "Gamma X"]},
+        {"nombre_noms": 3, "noms": ["Alpha One", "Beta S"]},
+        {"nombre_noms": 5, "noms": ["Alpha One", "Beta S", "Gamma X", "Delta R"]},
+        {"nombre_noms": 4, "noms": ["Alpha One", "Beta S", "Gamma X", "Delta R"]},
+    ]
+    for corps in cas:
+        reponse = client.post("/api/jobs/sst", json={
+            "lien": "https://www.tiktok.com/@chaine/video/9000000000000000001", **corps,
+        })
+        assert reponse.status_code == 422, (corps, reponse.text)
+    assert not app.JOBS  # aucun travail créé : la validation a tout bloqué
+
+
+def _brancher_tikwm_sst(monkeypatch, *, source_id, catalogue, bloquer_recherche=False):
+    """Doublure TikWM : la vidéo source passe par /api/, les vidéos du catalogue aussi,
+    et /feed/search peut être bloqué (403) comme constaté depuis certaines IP serveur."""
+    appels: list[tuple[str, dict]] = []
+
+    async def donnees_tikwm(_session, chemin, params):
+        appels.append((chemin, dict(params)))
+        if chemin == "/":
+            url = str(params.get("url", ""))
+            if source_id in url:
+                return {
+                    "id": source_id, "title": "Classement de véhicules électriques 2026 #auto",
+                    "duration": 21, "author": {"unique_id": "chaineauto", "nickname": "Chaîne Auto"},
+                }
+            for vid, (pseudo, titre, duree) in catalogue.items():
+                if vid in url:
+                    return {"id": vid, "title": titre, "duration": duree,
+                            "author": {"unique_id": pseudo, "nickname": pseudo}}
+            raise app.ErreurApp(f"Vidéo inconnue : {url}")
+        if chemin == "/feed/search":
+            if bloquer_recherche:
+                raise app.ErreurTikwm403("TikWM inaccessible (403)")
+            return {"videos": []}
+        raise AssertionError(f"Chemin TikWM inattendu : {chemin}")
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    return appels
+
+
+def test_sst_bascule_sur_la_decouverte_publique_si_tikwm_recherche_repond_403(client, monkeypatch):
+    """/feed/search répond 403 (blocage IP type Render) : SsT utilise la chaîne publique
+    pour chaque nom séparément, revalide chaque lien via TikWM /api/, et ne retient une
+    source qu'après la validation visuelle du montage."""
+    catalogue = {
+        "9000000000000000011": ("critique1", "Essai Alpha One : le bilan complet", 18),
+        "9000000000000000012": ("critique2", "Beta S en test : nos mesures", 16),
+        "9000000000000000013": ("critique3", "Gamma X premier contact", 22),
+    }
+    appels_tikwm = _brancher_tikwm_sst(
+        monkeypatch, source_id="9000000000000000001",
+        catalogue=catalogue, bloquer_recherche=True,
+    )
+    requetes_publiques: list[dict] = []
+
+    async def decouvrir_publique(_session, *, auteur="", requete="", limite=20, etat=None):
+        requetes_publiques.append({"auteur": auteur, "requete": requete, "limite": limite})
+        par_nom = {
+            "Alpha One": [{"url": "https://www.tiktok.com/@critique1/video/9000000000000000011",
+                           "origin": "DuckDuckGo : recherche « Alpha One »"}],
+            "Beta S": [{"url": "https://www.tiktok.com/@critique2/video/9000000000000000012",
+                        "origin": "DuckDuckGo : recherche « Beta S »"}],
+            "Gamma X": [{"url": "https://www.tiktok.com/@critique3/video/9000000000000000013",
+                         "origin": "SearXNG via relais : recherche « Gamma X »"}],
+        }
+        return par_nom.get(requete, [])
+
+    monkeypatch.setattr(app, "_decouvrir_publique", decouvrir_publique)
+
+    montage_kwargs: dict = {}
+
+    async def montage_fake(**kwargs):
+        montage_kwargs.update(kwargs)
+        return {"url": "/videos/sst-publique.mp4", "path": app.DOSSIER_VIDEOS / "sst-publique.mp4",
+                "sources": [], "source_errors": []}
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    noms = ["Alpha One", "Beta S", "Gamma X"]
+    reponse = client.post("/api/jobs/sst", json={
+        "lien": "https://www.tiktok.com/@chaineauto/video/9000000000000000001",
+        "nombre_noms": 3, "noms": noms,
+    })
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+
+    # La chaîne publique a été interrogée séparément pour chaque nom saisi, sans
+    # jamais remplacer un nom par un sujet général.
+    assert [r["requete"] for r in requetes_publiques] == noms
+    assert all(not r["auteur"] for r in requetes_publiques)
+
+    # Chaque lien public a été revalidé par TikWM /api/ (source incluse).
+    validations = [params for chemin, params in appels_tikwm if chemin == "/"]
+    assert len(validations) == 1 + len(noms)
+    assert {v["url"] for v in validations} == {
+        "https://www.tiktok.com/@chaineauto/video/9000000000000000001",
+        "https://www.tiktok.com/@critique1/video/9000000000000000011",
+        "https://www.tiktok.com/@critique2/video/9000000000000000012",
+        "https://www.tiktok.com/@critique3/video/9000000000000000013",
+    }
+    # Après le premier 403, /feed/search n'est plus réessayé pour les noms suivants.
+    assert len([c for c, _ in appels_tikwm if c == "/feed/search"]) == 1
+
+    # Les noms saisis sont utilisés tels quels, un par un.
+    assert job["noms_saisis"] == noms
+    assert job["search_queries"] == noms
+
+    trouvees = job["found_videos"]
+    assert len(trouvees) == 3
+    assert {v["video_id"] for v in trouvees} == set(catalogue)
+    assert {v["nom"] for v in trouvees} == set(noms)
+    # Métadonnées réelles issues de TikWM /api/, origines publiques conservées.
+    assert {v["origin"] for v in trouvees} == {
+        "DuckDuckGo : recherche « Alpha One »",
+        "DuckDuckGo : recherche « Beta S »",
+        "SearXNG via relais : recherche « Gamma X »",
+    }
+    assert {v["duration"] for v in trouvees} == {18.0, 16.0, 22.0}
+    # La vidéo source n'est jamais une candidate : elle n'est que référence.
+    assert all(v["video_id"] != "9000000000000000001" for v in trouvees)
+    # Une source n'est « retenue » (selected) qu'après la validation visuelle du montage.
+    assert [v["selected"] for v in trouvees] == [True, True, True]
+    assert all(v["validation_status"] == "validated" for v in trouvees)
+    assert job["source_video_used_only_as_reference"] is True
+    # La vidéo source n'est que référence de montage, jamais source de contenu.
+    assert job["source_video_reference"] == "https://www.tiktok.com/@chaineauto/video/9000000000000000001"
+    assert montage_kwargs["lien_reference"] == "https://www.tiktok.com/@chaineauto/video/9000000000000000001"
+    assert montage_kwargs["reference_optionnelle"] is False
+
+
+def test_sst_chaque_nom_est_recherche_independamment_et_les_doublons_sont_supprimes(client, monkeypatch):
+    """Voie nominale : /feed/search répond. Chaque nom a sa propre recherche, et une
+    vidéo renvoyée pour deux noms n'apparaît qu'une seule fois (doublon par identifiant)."""
+    videos_alpha = [
+        {"id": "9000000000000000021", "title": "Alpha One : essai complet", "duration": 19,
+         "author": {"unique_id": "critiqueA", "nickname": "Critique A"}},
+        # Même identifiant vidéo renvoyé pour « Beta S » : doublon TikTok à écarter.
+        {"id": "9000000000000000022", "title": "Alpha One vs Beta S", "duration": 17,
+         "author": {"unique_id": "critiqueB", "nickname": "Critique B"}},
+    ]
+    videos_beta = [
+        {"id": "9000000000000000022", "title": "Alpha One vs Beta S", "duration": 17,
+         "author": {"unique_id": "critiqueB", "nickname": "Critique B"}},
+        {"id": "9000000000000000023", "title": "Beta S : nos mesures", "duration": 15,
+         "author": {"unique_id": "critiqueC", "nickname": "Critique C"}},
+    ]
+    videos_gamma = [
+        {"id": "9000000000000000024", "title": "Gamma X premier contact", "duration": 13,
+         "author": {"unique_id": "critiqueD", "nickname": "Critique D"}},
+    ]
+    requetes: list[str] = []
+
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            if "9000000000000000001" in str(params.get("url", "")):
+                return {"id": "9000000000000000001", "title": "Classement 2026 #auto",
+                        "duration": 20, "author": {"unique_id": "chaineauto"}}
+            raise app.ErreurApp(f"Vidéo inconnue : {params.get('url')}")
+        if chemin == "/feed/search":
+            requetes.append(str(params.get("keywords")))
+            return {"videos": {
+                "Alpha One": videos_alpha, "Beta S": videos_beta, "Gamma X": videos_gamma,
+            }.get(str(params.get("keywords")), [])}
+        raise AssertionError(f"Chemin TikWM inattendu : {chemin}")
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def decouvrir_interdite(**_kwargs):
+        raise AssertionError("La chaîne publique ne doit pas être utilisée quand /feed/search répond.")
+
+    monkeypatch.setattr(app, "_decouvrir_publique", decouvrir_interdite)
+
+    montage_kwargs: dict = {}
+
+    async def montage_fake(**kwargs):
+        montage_kwargs.update(kwargs)
+        return {"url": "/videos/sst-direct.mp4", "path": app.DOSSIER_VIDEOS / "sst-direct.mp4",
+                "sources": [], "source_errors": []}
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    noms = ["Alpha One", "Beta S", "Gamma X"]
+    reponse = client.post("/api/jobs/sst", json={
+        "lien": "https://www.tiktok.com/@chaineauto/video/9000000000000000001",
+        "nombre_noms": 3, "noms": noms,
+    })
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+
+    # Une recherche TikWM par nom, dans l'ordre saisi — jamais de remplacement.
+    assert requetes == noms
+    assert job["search_queries"] == noms
+
+    trouvees = job["found_videos"]
+    # 4 vidéos uniques : le doublon 9000000000000000022 n'apparaît qu'une fois.
+    assert len(trouvees) == 4
+    identifiants = [v["video_id"] for v in trouvees]
+    assert len(set(identifiants)) == len(identifiants)
+    assert set(identifiants) == {
+        "9000000000000000021", "9000000000000000022", "9000000000000000023", "9000000000000000024",
+    }
+    # Le doublon garde l'origine de sa première découverte (recherche « Alpha One »).
+    doublon = next(v for v in trouvees if v["video_id"] == "9000000000000000022")
+    assert doublon["origin"] == "recherche SsT « Alpha One »"
+    assert doublon["nom"] == "Alpha One"
+
+    # La sélection équilibrée couvre les trois noms, puis complète le quota.
+    liens_montage = montage_kwargs["liens"]
+    assert len(liens_montage) == 4
+    # Le lien de référence de style reste la vidéo source, jamais une candidate.
+    assert montage_kwargs["lien_reference"] == "https://www.tiktok.com/@chaineauto/video/9000000000000000001"
+
+
+def test_sst_message_d_erreur_detaille_les_recherches_echouees(client, monkeypatch):
+    """Quand rien n'est trouvé, l'échec liste les noms, les recherches tentées, les
+    erreurs TikWM, les erreurs des sources publiques et les raisons de rejet."""
+    _brancher_tikwm_sst(
+        monkeypatch, source_id="9000000000000000001", catalogue={},
+        bloquer_recherche=True,
+    )
+
+    async def decouvrir_publique(_session, *, auteur="", requete="", limite=20, etat=None):
+        # Aucun moteur public ne donne de lien pour ces noms depuis cette IP.
+        return []
+
+    monkeypatch.setattr(app, "_decouvrir_publique", decouvrir_publique)
+
+    noms = ["Alpha One", "Beta S", "Gamma X"]
+    reponse = client.post("/api/jobs/sst", json={
+        "lien": "https://www.tiktok.com/@chaineauto/video/9000000000000000001",
+        "nombre_noms": 3, "noms": noms,
+    })
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "failed"
+    erreur = job["error"]
+
+    assert "SsT n'a trouvé aucune source exploitable" in erreur
+    for nom in noms:
+        assert nom in erreur
+    assert f"Recherches tentées : {', '.join(noms)}" in erreur
+    assert "Erreurs TikWM" in erreur and "bloqué (403)" in erreur
+    assert "Erreurs des sources publiques" in erreur
+    assert "aucune source publique n'a donné de lien" in erreur
+    assert "Raisons de rejet" in erreur
+    assert "aucune candidate trouvée" in erreur
+
+
+def test_sst_candidats_de_duree_inconnue_ou_invalide_ne_sont_pas_retenues():
+    """Une candidate sans durée valide est rejetée avant l'IA, avec la raison exacte."""
+    noms = ["Alpha One", "Beta S", "Gamma X"]
+    candidats = [
+        {"url": "https://www.tiktok.com/@a/video/1", "video_id": "1", "author": "a",
+         "duration": 0.0, "nom": "Alpha One", "origin": "recherche SsT « Alpha One »"},
+        {"url": "https://www.tiktok.com/@b/video/2", "video_id": "2", "author": "b",
+         "duration": None, "nom": "Beta S", "origin": "recherche SsT « Beta S »"},
+        {"url": "https://www.tiktok.com/@c/video/3", "video_id": "3", "author": "c",
+         "duration": "invalide", "nom": "Gamma X", "origin": "recherche SsT « Gamma X »"},
+        {"url": "https://www.tiktok.com/@d/video/4", "video_id": "4", "author": "d",
+         "duration": 12.0, "nom": "Alpha One", "origin": "recherche SsT « Alpha One »"},
+    ]
+    retenues = app._selectionner_sources_sst(candidats, noms, limite=20, duree_max=600.0)
+    assert [c["video_id"] for c in retenues] == ["4"]
+    rejets = {c["video_id"]: c["rejet"] for c in candidats if c.get("rejet")}
+    assert rejets["1"] == "durée inconnue ou invalide"
+    assert rejets["2"] == "durée inconnue ou invalide"
+    assert rejets["3"] == "durée inconnue ou invalide"
+    assert all(not c["selected"] for c in candidats)
+
+
+def test_sst_aucune_candidature_n_est_retenue_avant_la_validation_visuelle():
+    """La sélection équilibrée marque « awaiting_visual_ai » et jamais selected=True."""
+    noms = ["Alpha One", "Beta S", "Gamma X"]
+    candidats = [
+        {"url": f"https://www.tiktok.com/@a{i}/video/9{i}", "video_id": f"9{i}",
+         "author": f"a{i}", "duration": 15.0, "nom": nom, "origin": f"recherche SsT « {nom} »"}
+        for i, nom in enumerate(noms)
+    ]
+    retenues = app._selectionner_sources_sst(list(candidats), noms, limite=20, duree_max=600.0)
+    assert len(retenues) == 3
+    for candidat in candidats:
+        assert candidat["selected"] is False
+        assert candidat["validation_status"] == "awaiting_visual_ai"
+        assert not candidat.get("rejet")
+
+
+def test_sst_les_noms_ne_sont_jamais_remplaces_ni_completes_par_l_ia(monkeypatch):
+    """L'IA n'ajoute, ne remplace et ne complète jamais les noms : le repli déterministe
+    et le complément manquant n'utilisent que les noms fournis par l'utilisateur."""
+    noms = ["Alpha One", "Beta S", "Gamma X"]
+
+    async def gemini_indisponible(_parts, **_kwargs):
+        raise app.ErreurApp("GEMINI_API_KEYS n'est pas configuré sur le serveur.")
+
+    monkeypatch.setattr(app, "_appel_gemini_brut", gemini_indisponible)
+    script = asyncio.run(app.adapter_script_sst("Un classement de véhicules électriques.", noms))
+    for nom in noms:
+        assert nom.casefold() in f"{script['hook']} {script['corps']}".casefold()
+
+    # L'IA répond en oubliant un nom : le complément n'utilise QUE les noms fournis.
+    reponse_ia = json.dumps({"hook": "TOP 3 spécial", "corps": "Découvrez Alpha One et Beta S.", "mot_cle_broll": "essai"})
+
+    async def gemini_oublieuse(_parts, **_kwargs):
+        return reponse_ia
+
+    monkeypatch.setattr(app, "_appel_gemini_brut", gemini_oublieuse)
+    script = asyncio.run(app.adapter_script_sst("Un classement de véhicules électriques.", noms))
+    assert "Gamma X" in script["corps"]  # complété avec le nom fourni, jamais un autre
+    assert "Alpha One" in script["corps"] and "Beta S" in script["corps"]
+    assert script["hook"] == "TOP 3 spécial"
+
+
+# ======================================================================================
+# ENTRAÎNEMENT IA : profils visuels — persistance serveur, isolation, enrichissement
+# ======================================================================================
+
+
+def test_profil_cree_persiste_dans_le_fichier_prive_de_la_session(client):
+    """Un profil créé est écrit dans le JSON privé 0600 de la session serveur."""
+    reponse = client.post("/api/profils-entrainement", json={
+        "nom_sujet": "Alpha One",
+        "aliases": ["alpha", "A1"],
+        "good_examples": ["https://www.tiktok.com/@critique1/video/9000000000000000011"],
+        "bad_examples": ["https://www.tiktok.com/@critique2/video/9000000000000000012"],
+    })
+    assert reponse.status_code == 200, reponse.text
+    profil = reponse.json()["profile"]
+    assert profil["nom_sujet"] == "Alpha One"
+    assert profil["aliases"] == ["alpha", "A1"]
+    assert profil["source_count"] == 0
+    assert profil["sources_automatiquement_ajoutees"] == 0
+
+    session_id = client.cookies.get("creator_session")
+    chemin = app._fichier_profils_session(session_id)
+    assert chemin.exists()
+    assert (chemin.stat().st_mode & 0o777) == 0o600
+    profils = json.loads(chemin.read_text(encoding="utf-8"))
+    assert len(profils) == 1 and profils[0]["id"] == profil["id"]
+    assert profils[0]["bons_exemples"] == ["https://www.tiktok.com/@critique1/video/9000000000000000011"]
+
+    # Le listage renvoie le même profil pour cette session.
+    liste = client.get("/api/profils-entrainement").json()
+    assert [p["id"] for p in liste["profiles"]] == [profil["id"]]
+
+
+def test_deux_sessions_ne_voient_pas_les_profils_l_une_de_l_autre():
+    """Chaque cookie de session possède son fichier JSON privé : aucune fuite croisée."""
+    with TestClient(app.app) as premiere, TestClient(app.app) as seconde:
+        r1 = premiere.post("/api/profils-entrainement", json={"nom_sujet": "Sujet session 1"})
+        r2 = seconde.post("/api/profils-entrainement", json={"nom_sujet": "Sujet session 2"})
+        assert r1.status_code == r2.status_code == 200
+
+        assert [p["nom_sujet"] for p in premiere.get("/api/profils-entrainement").json()["profiles"]] == ["Sujet session 1"]
+        assert [p["nom_sujet"] for p in seconde.get("/api/profils-entrainement").json()["profiles"]] == ["Sujet session 2"]
+
+        # Deux fichiers distincts, un par empreinte de session.
+        chemin_1 = app._fichier_profils_session(premiere.cookies.get("creator_session"))
+        chemin_2 = app._fichier_profils_session(seconde.cookies.get("creator_session"))
+        assert chemin_1 != chemin_2 and chemin_1.exists() and chemin_2.exists()
+
+        id_premier = r1.json()["profile"]["id"]
+        # La session 2 ne peut ni modifier ni supprimer le profil de la session 1.
+        assert seconde.put(f"/api/profils-entrainement/{id_premier}", json={"nom_sujet": "vol"}).status_code == 404
+        assert seconde.delete(f"/api/profils-entrainement/{id_premier}").status_code == 404
+        assert chemin_1.exists()
+        assert any(p["id"] == id_premier for p in json.loads(chemin_1.read_text(encoding="utf-8")))
+
+
+def test_synchronisation_et_suppression_du_profil_dans_les_deux_emplacements(client):
+    """La synchro navigateur/serveur fusionne par date, la suppression vide le fichier."""
+    profil_local = {
+        "id": "profil-local-1", "nom_sujet": "Alpha One",
+        "aliases": ["A1"], "bons_exemples": [], "mauvais_exemples": [],
+        "updated_at": 1000.0,
+    }
+    synchro = client.post("/api/profils-entrainement/synchroniser", json={"profiles": [profil_local]})
+    assert synchro.status_code == 200, synchro.text
+    assert [p["id"] for p in synchro.json()["profiles"]] == ["profil-local-1"]
+
+    session_id = client.cookies.get("creator_session")
+    chemin = app._fichier_profils_session(session_id)
+    assert "profil-local-1" in chemin.read_text(encoding="utf-8")
+
+    # Le navigateur (plus récent) l'emporte ; le serveur garde le profil existant.
+    mis_a_jour = {**profil_local, "nom_sujet": "Alpha One renommé", "updated_at": 2000.0}
+    client.post("/api/profils-entrainement/synchroniser", json={"profiles": [mis_a_jour]})
+    assert "Alpha One renommé" in chemin.read_text(encoding="utf-8")
+
+    suppression = client.delete("/api/profils-entrainement/profil-local-1")
+    assert suppression.status_code == 200
+    assert json.loads(chemin.read_text(encoding="utf-8")) == []
+    assert client.delete("/api/profils-entrainement/profil-local-1").status_code == 404
+
+
+def test_analyser_profil_conserve_exemples_signatures_timestamps_et_refus(client, monkeypatch):
+    """« Analyser avec l'IA et alimenter » conserve toutes les données : exemples analysés
+    (timestamps compris), signatures positive et négative, raisons de rejet des candidates
+    écartées, et seules les candidates réellement validées deviennent des sources."""
+    creation = client.post("/api/profils-entrainement", json={
+        "nom_sujet": "Alpha One",
+        "aliases": ["A1"],
+        "good_examples": ["https://www.tiktok.com/@critique1/video/9000000000000000011"],
+        "bad_examples": ["https://www.tiktok.com/@critique2/video/9000000000000000012"],
+    })
+    assert creation.status_code == 200, creation.text
+    profil_id = creation.json()["profile"]["id"]
+
+    analyses_appelees: list[str] = []
+
+    async def analyser_exemple(_session, url, profil, *, est_bon=True):
+        analyses_appelees.append(url)
+        if "000011" in url and est_bon:
+            return {
+                "url": url, "est_bon_exemple": True, "valide": True, "raison_refus": "",
+                "sujet_visible": "Alpha One", "sujet_correspond": True, "confiance": 0.92,
+                "personnes": [], "watermarks": [], "logos_ajoutes": [], "textes": [],
+                "sous_titres_tiktok": ["sous-titre intégré"], "qualite": "bonne", "nettete": 0.8,
+                "passages_propres": [{"debut": 1.5, "fin": 5.0, "raison": "plan produit net"}],
+                "signature_positive": "Sujet exact Alpha One, plans produits nets",
+                "signature_negative": "",
+                "duration": 21.0,
+            }
+        if "000012" in url and not est_bon:
+            return {
+                "url": url, "est_bon_exemple": False, "valide": False,
+                "raison_refus": "personne visible", "confiance": 0.3,
+                "passages_propres": [], "signature_negative": "personne visible",
+                "duration": 19.0,
+            }
+        # Candidate automatique : validée ou rejetée selon l'URL.
+        valide = "000031" in url
+        return {
+            "url": url, "est_bon_exemple": True, "valide": valide,
+            "raison_refus": "" if valide else "watermark détecté",
+            "sujet_visible": "Alpha One" if valide else "autre sujet",
+            "sujet_correspond": valide, "confiance": 0.9 if valide else 0.2,
+            "personnes": [], "watermarks": [] if valide else ["logo"],
+            "logos_ajoutes": [], "textes": [], "passages_propres":
+                [{"debut": 0.0, "fin": 4.5, "raison": "net"}] if valide else [],
+            "signature_positive": "Alpha One confirmé" if valide else "",
+            "signature_negative": "" if valide else "watermark détecté",
+            "duration": 17.0,
+        }
+
+    monkeypatch.setattr(app, "analyser_exemple_entrainement", analyser_exemple)
+
+    async def candidates_profil(_session, profil, limite=10):
+        return [
+            {"url": "https://www.tiktok.com/@x/video/9000000000000000031",
+             "video_id": "9000000000000000031", "author": "x", "title": "Alpha One essai",
+             "duration": 17.0, "origin": "entraînement « Alpha One »", "nom": "Alpha One"},
+            {"url": "https://www.tiktok.com/@y/video/9000000000000000032",
+             "video_id": "9000000000000000032", "author": "y", "title": "hors sujet",
+             "duration": 12.0, "origin": "entraînement « Alpha One »", "nom": "Alpha One"},
+        ]
+
+    monkeypatch.setattr(app, "_candidates_profil", candidates_profil)
+
+    analyse = client.post(f"/api/profils-entrainement/{profil_id}/analyser", json={})
+    assert analyse.status_code == 200, analyse.text
+    profil = analyse.json()["profile"]
+
+    # Les exemples bons et mauvais ont été analysés, plus les deux candidates.
+    assert len(analyses_appelees) == 4
+    donnees = profil["donnees"]
+    assert donnees["sources_exemples_analysees"] == 2
+    assert len(donnees["exemples_analyses"]) == 2
+    exemple_bon = next(e for e in donnees["exemples_analyses"] if "000011" in e["url"])
+    assert exemple_bon["passages_propres"] == [{"debut": 1.5, "fin": 5.0, "raison": "plan produit net"}]
+    exemple_mauvais = next(e for e in donnees["exemples_analyses"] if "000012" in e["url"])
+    assert exemple_mauvais["raison_refus"] == "personne visible"
+
+    # Signatures positive et négative construites sur les analyses réelles.
+    assert donnees["signature_positive"] == ["Sujet exact Alpha One, plans produits nets"]
+    assert "personne visible" in donnees["signature_negative"]
+
+    # Seule la candidate validée devient une source ; la rejetée garde sa raison.
+    assert len(profil["sources_validees"]) == 1
+    assert profil["sources_validees"][0]["video_id"] == "9000000000000000031"
+    assert profil["sources_automatiquement_ajoutees"] == 1
+    candidates_analysees = donnees["candidates_analysees"]
+    rejetee = next(c for c in candidates_analysees if c["video_id"] == "9000000000000000032")
+    assert rejetee["raison_refus"] == "watermark détecté"
+    assert rejetee["validation_status"] == "rejected"
+
+    # Tout est persisté dans le fichier privé de la session.
+    session_id = client.cookies.get("creator_session")
+    persiste = json.loads(app._fichier_profils_session(session_id).read_text(encoding="utf-8"))
+    assert persiste[0]["donnees"]["signature_positive"] == ["Sujet exact Alpha One, plans produits nets"]
+    assert len(persiste[0]["sources_validees"]) == 1
+
+
+def test_profil_non_entraiine_est_seulement_enregistre(client):
+    """Un profil à 0 source, 0 exemple analysé et 0 % de confiance est simplement
+    enregistré : l'API expose ces compteurs sans rien inventer."""
+    creation = client.post("/api/profils-entrainement", json={
+        "nom_sujet": "Alpha One", "aliases": [], "bons_exemples": [], "mauvais_exemples": [],
+    })
+    assert creation.status_code == 200, creation.text
+    profil = creation.json()["profile"]
+    assert profil["source_count"] == 0
+    assert profil["sources_automatiquement_ajoutees"] == 0
+    assert profil["donnees"] == {}
+    assert not profil["sources_validees"]
