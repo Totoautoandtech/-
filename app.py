@@ -3991,8 +3991,9 @@ async def _produire_montage(
 ) -> dict[str, Any]:
     _valider_requete_montage(requete)
     voix_off = _resoudre_voix_off(session_id, requete.voix_off)
-    # Sans référence explicite, la première source devient automatiquement la
-    # référence de montage : cadence, coupes, transitions, zooms et sous-titres.
+    # Sans référence explicite, la première source fournit aussi la grammaire de style.
+    # Elle reste une source de contenu puisqu'elle figure explicitement dans `liens_videos`;
+    # une référence distincte n'est jamais ajoutée à cette liste ni à l'export FFmpeg.
     lien_reference = requete.lien_reference_style.strip() or requete.liens_videos[0]
     resultat = await construire_montage_professionnel(
         liens=requete.liens_videos,
