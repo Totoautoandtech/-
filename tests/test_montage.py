@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,38 @@ def _config(tmp_path: Path) -> montage.ConfigurationMontage:
 
 def _reporter():
     return montage.Rapporteur(lambda **_: None, lambda: False, lambda: 300.0)
+
+
+def test_extrait_controle_arrondit_dimensions_pour_yuv420p(tmp_path, monkeypatch):
+    """Un portrait 405×720 devient pair avant l'encodage libx264/yuv420p."""
+    source = tmp_path / "portrait_405x720.mp4"
+    source.write_bytes(b"source simulee")
+    appels = []
+
+    async def executer_simule(commande, **options):
+        appels.append((commande, options))
+        Path(commande[-1]).write_bytes(b"extrait simule")
+        return b"", b""
+
+    monkeypatch.setattr(montage, "executer_commande", executer_simule)
+    destination = tmp_path / "extrait_verification.mp4"
+    asyncio.run(montage.creer_extrait_verification(
+        source, destination, 0.0, 2.0, _config(tmp_path), _reporter()
+    ))
+
+    assert destination.read_bytes() == b"extrait simule"
+    assert len(appels) == 1
+    commande, options = appels[0]
+    filtre = commande[commande.index("-vf") + 1]
+    assert ":force_original_aspect_ratio=decrease," in filtre
+    assert "scale='trunc(iw/2)*2':'trunc(ih/2)*2',fps=8" in filtre
+    assert filtre.index("force_original_aspect_ratio=decrease") < filtre.index("trunc(iw/2)*2") < filtre.index("fps=8")
+    assert commande[commande.index("-pix_fmt") + 1] == "yuv420p"
+    # Pour le cas de production 405×720, le second scale donne 404×720.
+    largeur, hauteur = 405 // 2 * 2, 720 // 2 * 2
+    assert (largeur, hauteur) == (404, 720)
+    assert largeur % 2 == hauteur % 2 == 0
+    assert options["etape"] == "extraction de la fenêtre exacte du plan pour contrôle qualité"
 
 
 def test_reponse_gemini_invalide_utilise_repli_et_nettoie_apercu(tmp_path, monkeypatch):
@@ -435,6 +468,168 @@ def _verdict_valide() -> str:
     })
 
 
+def test_export_final_utilise_les_sources_selectionnees_pas_la_reference(tmp_path, monkeypatch):
+    """Pipeline isolé : la référence n'est analysée que pour le style et ne rentre
+    jamais dans les entrées FFmpeg de l'export final. Chaque plan garde URL/timestamps.
+    """
+    config = replace(
+        _config(tmp_path), exiger_validation_ia=True, exiger_pertinence_visuelle=True
+    )
+    url_reference = "https://www.tiktok.com/@mere/video/9000"
+    urls_sources = [
+        "https://www.tiktok.com/@source_a/video/1001",
+        "https://www.tiktok.com/@source_b/video/1002",
+    ]
+    contenus = {
+        url_reference: b"VIDEO_MERE_REFERENCE",
+        urls_sources[0]: b"VIDEO_SOURCE_A",
+        urls_sources[1]: b"VIDEO_SOURCE_B",
+    }
+    appels_resolveur = []
+    chemins_telecharges = {}
+    analyses_sources = []
+    octets_controles = []
+    entrees_export = []
+    reference_analysee = []
+
+    async def resolveur(_session, url):
+        appels_resolveur.append(url)
+        return f"flux-simule:{url}"
+
+    async def telechargeur(_session, direct, destination):
+        url = direct.removeprefix("flux-simule:")
+        destination.write_bytes(contenus[url])
+        chemins_telecharges[destination.name] = (destination, url)
+
+    async def sonder_simule(source, timeout=25.0):
+        chemin = Path(source) if not str(source).startswith("flux-simule:") else None
+        duree = 64.0 if chemin and chemin.parent.resolve() == config.dossier_videos.resolve() else 120.0
+        return {
+            "duration": duree, "width": 405, "height": 720, "fps": 30.0,
+            "codec": "h264", "size": chemin.stat().st_size if chemin and chemin.is_file() else 100,
+        }
+
+    async def analyser_source(source, duree, segments, *_args):
+        chemin = Path(source)
+        contenu = chemin.read_bytes()
+        analyses_sources.append((chemin.name, contenu))
+        assert contenu in {contenus[url] for url in urls_sources}
+        return [{
+            "debut": 0.0, "fin": duree, "sujet": "média source simulé",
+            "action_mouvement": "plan net", "qualite": "bonne", "nettete": 0.95,
+            "cadrage": "vertical", "texte_visible": False, "texte_sous_titres": False,
+            "personne_visible": False, "watermark": False, "logo_visible": False,
+            "autre_element_superpose": False,
+            "pertinence_script": [{"id": segment["id"], "score": 0.95} for segment in segments],
+            "rythme": "dynamique", "transition_recommandee": "cut",
+            "score_pertinence": 0.95,
+        }], None
+
+    async def analyser_reference(source, *_args):
+        chemin = Path(source)
+        reference_analysee.append((chemin.name, chemin.read_bytes()))
+        return montage.STYLE_DEFAUT.model_copy(deep=True), None
+
+    async def executer_simule(commande, *, etape, timeout, sortie_attendue=None):
+        if etape == "extraction de la fenêtre exacte du plan pour contrôle qualité":
+            chemin_source = Path(commande[commande.index("-i") + 1])
+            octets_controles.append((chemin_source.name, chemin_source.read_bytes()))
+            Path(commande[-1]).write_bytes(b"EXTRAIT:" + chemin_source.read_bytes())
+        elif etape == "export FFmpeg final":
+            entrees_export.extend(
+                (Path(commande[index + 1]), Path(commande[index + 1]).read_bytes())
+                for index, argument in enumerate(commande[:-1]) if argument == "-i"
+            )
+            Path(commande[-1]).write_bytes(b"EXPORT FINAL SIMULE")
+        else:
+            raise AssertionError(f"Commande FFmpeg inattendue : {etape}")
+        return b"", b""
+
+    async def gemini_controle(_parts, **_kwargs):
+        return _verdict_valide()
+
+    monkeypatch.setattr(montage, "sonder_video", sonder_simule)
+    monkeypatch.setattr(montage, "analyser_video", analyser_source)
+    monkeypatch.setattr(montage, "analyser_style_reference", analyser_reference)
+    monkeypatch.setattr(montage, "executer_commande", executer_simule)
+
+    resultat = asyncio.run(montage.construire_montage_professionnel(
+        liens=urls_sources,
+        lien_reference=url_reference,
+        reference_optionnelle=True,
+        hook="Accroche de démonstration",
+        corps="Une phrase de démonstration pour le montage.",
+        resolution="720",
+        style_sous_titres="classique",
+        config=config,
+        rapporteur=_reporter(),
+        resolveur=resolveur,
+        telechargeur=telechargeur,
+        appel_gemini=gemini_controle,
+    ))
+
+    assert set(appels_resolveur) == {url_reference, *urls_sources}
+    assert chemins_telecharges["reference_style.mp4"][1] == url_reference
+    assert chemins_telecharges["source_0.mp4"][1] == urls_sources[0]
+    assert chemins_telecharges["source_1.mp4"][1] == urls_sources[1]
+    assert reference_analysee == [("reference_style.mp4", contenus[url_reference])]
+    assert {contenu for _, contenu in analyses_sources} == {contenus[url] for url in urls_sources}
+    assert analyses_sources and all(
+        "MERE" not in contenu.decode("ascii") for _, contenu in analyses_sources
+    )
+    assert octets_controles and all(
+        contenu in {contenus[url] for url in urls_sources} for _, contenu in octets_controles
+    )
+    assert {chemin.name for chemin, _ in entrees_export} == {"source_0.mp4", "source_1.mp4"}
+    assert all(chemin.name != "reference_style.mp4" for chemin, _ in entrees_export)
+    assert all(contenu in {contenus[url] for url in urls_sources} for _, contenu in entrees_export)
+
+    provenance = resultat["plan_verification"]
+    assert provenance and all(verdict["conforme"] for verdict in provenance)
+    assert {verdict["url"] for verdict in provenance} == set(urls_sources)
+    assert all(verdict["url"] != url_reference for verdict in provenance)
+    assert all(verdict["fin"] == pytest.approx(verdict["debut"] + verdict["duree"]) for verdict in provenance)
+
+
+def test_rejet_ia_strict_echoue_avec_url_et_raison_sans_export(tmp_path, monkeypatch):
+    """Aucune source visuellement validée : message détaillé, jamais de repli vidéo."""
+    config = replace(_config(tmp_path), exiger_validation_ia=True, exiger_pertinence_visuelle=True)
+    url = "https://www.tiktok.com/@source_refusee/video/2222"
+
+    async def resolveur(_session, lien):
+        return f"flux-simule:{lien}"
+
+    async def telechargeur(_session, _direct, destination):
+        destination.write_bytes(b"source refusee")
+
+    async def sonder_simule(_source, timeout=25.0):
+        return {"duration": 120.0, "width": 720, "height": 1280, "fps": 30.0,
+                "codec": "h264", "size": 100}
+
+    async def analyse_refusee(*_args):
+        raise montage.ErreurMontage("Validation IA invalide : réponse JSON illisible")
+
+    async def export_interdit(*_args, **_kwargs):
+        raise AssertionError("aucun export ne doit commencer après le rejet strict")
+
+    monkeypatch.setattr(montage, "sonder_video", sonder_simule)
+    monkeypatch.setattr(montage, "analyser_video", analyse_refusee)
+    monkeypatch.setattr(montage, "executer_commande", export_interdit)
+
+    with pytest.raises(montage.ErreurMontage) as erreur:
+        asyncio.run(montage.construire_montage_professionnel(
+            liens=[url], lien_reference="", hook="Accroche", corps="Une phrase.",
+            resolution="720", style_sous_titres="classique", config=config,
+            rapporteur=_reporter(), resolveur=resolveur, telechargeur=telechargeur,
+            appel_gemini=lambda *_args, **_kwargs: None,
+        ))
+
+    message = str(erreur.value)
+    assert "aucun montage n'a été exporté" in message
+    assert url in message
+    assert "Validation IA invalide : réponse JSON illisible" in message
+
+
 def _verdict_refuse() -> str:
     return json.dumps({
         "conforme": False, "personnes_visibles": True, "watermark": False,
@@ -515,6 +710,22 @@ def test_le_controle_qualite_final_ecarte_les_plans_refuses_et_revalide(tmp_path
     # Chaque verdict porte l'URL et les timestamps exacts de la fenêtre réellement montée.
     assert all(verdict["url"].startswith("https://www.tiktok.com/@demo/") for verdict in verdicts)
     assert all(verdict["fin"] > verdict["debut"] for verdict in verdicts)
+
+
+def test_un_plan_sans_url_de_provenance_ne_passe_pas_le_controle(tmp_path):
+    source = tmp_path / "source_sans_url.mp4"
+    source.write_bytes(b"video")
+    clip = {"id": 0, "source": "source_0", "debut": 1.0, "duree": 2.0}
+
+    async def gemini_ne_doit_pas_etre_appele(*_args, **_kwargs):
+        raise AssertionError("la provenance absente doit exclure le plan avant Gemini")
+
+    verdict = asyncio.run(montage.verifier_conformite_extrait(
+        clip, source, "", _config(tmp_path), _reporter(), gemini_ne_doit_pas_etre_appele,
+    ))
+    assert verdict["conforme"] is False
+    assert verdict["url"] == ""
+    assert "URL source inconnue" in verdict["raisons"][0]
 
 
 def test_un_controle_impossible_ecarte_le_plan_au_lieu_de_le_laisser_passer(tmp_path, monkeypatch):

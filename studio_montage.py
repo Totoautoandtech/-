@@ -990,7 +990,11 @@ def selectionner_plan(
         transition_duree = min(0.55, transition_duree, max(0.02, duree / 3))
 
         plan.append({
-            **segment, "source": source, "debut": round(debut, 3),
+            **segment,
+            "source": source,
+            # Garde une provenance explicite avec le plan, en plus des métadonnées source.
+            "source_url": str(metadonnees[source].get("url") or ""),
+            "debut": round(debut, 3),
             # Garde-fou final : aucun plan ne franchit le plafond demandé.
             "duree": round(min(plafond, max(DUREE_MIN_PLAN, duree)), 3),
             "transition": transition,
@@ -1035,6 +1039,21 @@ def _detail_rejets(rejets: list[dict[str, Any]], limite: int = 6) -> str:
     return " | ".join(lignes) if lignes else "aucun détail disponible"
 
 
+def _detail_erreurs_sources(erreurs: list[dict[str, Any]], limite: int = 6) -> str:
+    """Expose les motifs source réellement observés quand la sélection stricte échoue."""
+    lignes: list[str] = []
+    for entree in erreurs[:limite]:
+        url = str(entree.get("url") or f"source {int(entree.get('index', -1)) + 1}")
+        raison = " ".join(str(entree.get("error") or "source rejetée").split())
+        if len(raison) > 240:
+            raison = raison[:237].rstrip() + "…"
+        lignes.append(f"{url} : {raison}")
+    reste = len(erreurs) - limite
+    if reste > 0:
+        lignes.append(f"… et {reste} autre(s) source(s)")
+    return " | ".join(lignes)
+
+
 async def creer_extrait_verification(
     source: Path,
     destination: Path,
@@ -1048,9 +1067,12 @@ async def creer_extrait_verification(
     L'aperçu d'analyse (360p / 6 fps) sert au repérage des scènes ; la relecture doit
     juger la fenêtre réellement montée, donc dans une définition plus large.
     """
+    # Le redimensionnement avec préservation du ratio peut laisser une dimension impaire
+    # (par exemple 405×720 en portrait) ; libx264 en yuv420p exige deux dimensions paires.
     filtre = (
         "scale='if(gt(iw,ih),720,405)':'if(gt(iw,ih),405,720)'"
-        ":force_original_aspect_ratio=decrease,fps=8"
+        ":force_original_aspect_ratio=decrease,"
+        "scale='trunc(iw/2)*2':'trunc(ih/2)*2',fps=8"
     )
     commande = [
         "ffmpeg", "-y", "-ss", f"{max(0.0, float(debut)):.3f}", "-i", str(source),
@@ -1089,12 +1111,13 @@ async def verifier_conformite_extrait(
     il ne le laisse jamais passer.
     """
     source = str(clip.get("source", ""))
+    url_source = str(url or "").strip()
     debut = max(0.0, float(clip.get("debut", 0.0)))
     duree = max(DUREE_MIN_PLAN, float(clip.get("duree", 0.0)))
     verdict: dict[str, Any] = {
         "index": int(clip.get("id", 0)),
         "source": source,
-        "url": str(url or source),
+        "url": url_source,
         "debut": round(debut, 3),
         "fin": round(debut + duree, 3),
         "duree": round(duree, 3),
@@ -1103,6 +1126,9 @@ async def verifier_conformite_extrait(
         "conforme": False,
         "raisons": [],
     }
+    if not url_source:
+        verdict["raisons"] = ["URL source inconnue : provenance du plan impossible"]
+        return verdict
     if chemin is None or not chemin.is_file():
         verdict["raisons"] = ["source téléchargée introuvable : contrôle qualité impossible"]
         return verdict
@@ -1232,7 +1258,7 @@ async def controler_qualite_plan(
                 f"Contrôle qualité strict du plan {position}/{len(plan)} (tour {tour})",
             )
             verdicts.append(await verifier_conformite_extrait(
-                clip, sources.get(source), str(metadonnees.get(source, {}).get("url") or source),
+                clip, sources.get(source), str(metadonnees.get(source, {}).get("url") or ""),
                 config, rapporteur, appel_gemini, tour,
             ))
         rejets = [verdict for verdict in verdicts if not verdict["conforme"]]
@@ -1406,6 +1432,19 @@ async def exporter_plan(
     dossier: Path,
     voix_off: Optional[Path] = None,
 ) -> Path:
+    if not plan:
+        raise ErreurMontage("Aucun plan validé à exporter ; aucun fichier vidéo n'a été produit.")
+    for position, clip in enumerate(plan, start=1):
+        source = str(clip.get("source") or "")
+        chemin = sources.get(source)
+        if not source or chemin is None or not chemin.is_file():
+            raise ErreurMontage(
+                f"Plan {position} sans fichier source retenu accessible ; export interrompu sans repli."
+            )
+        if not str(clip.get("source_url") or "").strip():
+            raise ErreurMontage(
+                f"Plan {position} sans URL de provenance ; export interrompu pour préserver la traçabilité."
+            )
     if resolution == "1080" and not config.autoriser_1080:
         raise ErreurMontage("L’export 1080 × 1920 est désactivé sur cette instance pour protéger ses ressources.")
     largeur, hauteur = (1080, 1920) if resolution == "1080" else (config.largeur, config.hauteur)
@@ -1413,8 +1452,10 @@ async def exporter_plan(
     rapporteur.update("subtitling", 86, "Sous-titres ASS synchronisés préparés")
 
     commande = ["ffmpeg", "-y"]
+    # `sources` ne contient que les fichiers liés aux URL de montage retenues ;
+    # `reference_style.mp4` reste isolée pour l'analyse de grammaire visuelle.
     for clip in plan:
-        chemin = sources[clip["source"]]
+        chemin = sources[str(clip["source"])]
         commande += ["-ss", f"{clip['debut']:.3f}", "-t", f"{clip['duree']:.3f}", "-i", str(chemin)]
 
     filtres: list[str] = []
@@ -1525,6 +1566,8 @@ async def construire_montage_professionnel(
     )
 
     with dossier_temporaire(config.dossier_travail) as dossier:
+        # Seuls les liens fournis dans `liens` alimentent cette table et l'export.
+        # La vidéo de référence est stockée à part, sous `reference_path`.
         sources: dict[str, Path] = {}
         metadonnees: dict[str, dict[str, Any]] = {}
         rapports: list[dict[str, Any]] = []
@@ -1641,8 +1684,19 @@ async def construire_montage_professionnel(
                     else:
                         raise
 
+        if reference_path is not None:
+            chemin_reference = reference_path.resolve()
+            if any(chemin.resolve() == chemin_reference for chemin in sources.values()):
+                raise ErreurMontage(
+                    "La vidéo de référence de style a été confondue avec un fichier source ; "
+                    "l'export est interrompu sans réutiliser cette vidéo."
+                )
         if not sources:
-            raise ErreurMontage("Tous les téléchargements ont échoué ; consulte les erreurs par source.")
+            details = _detail_erreurs_sources(erreurs_sources)
+            raise ErreurMontage(
+                "Aucun téléchargement de source n'a abouti ; aucun montage n'a été exporté. "
+                + (f"Raisons : {details}" if details else "Aucune source accessible.")
+            )
 
         # Le sémaphore est borné à deux, configurable à un sur Render gratuit.
         analyses: dict[str, list[dict[str, Any]]] = {}
@@ -1705,11 +1759,21 @@ async def construire_montage_professionnel(
             if config.exiger_pertinence_visuelle
             else "Sélection et alternance des meilleurs plans",
         )
-        plan = selectionner_plan(
-            segments, analyses, metadonnees, style_reference, intensite_transitions,
-            config.duree_max_plan,
-            exiger_pertinence_visuelle=config.exiger_pertinence_visuelle,
-        )
+        try:
+            plan = selectionner_plan(
+                segments, analyses, metadonnees, style_reference, intensite_transitions,
+                config.duree_max_plan,
+                exiger_pertinence_visuelle=config.exiger_pertinence_visuelle,
+            )
+        except ErreurMontage as exc:
+            if not config.exiger_validation_ia:
+                raise
+            details = _detail_erreurs_sources(erreurs_sources)
+            details_sources = f" Raisons sources : {details}." if details else ""
+            raise ErreurMontage(
+                "Aucun plan source n'a satisfait les contrôles stricts ; aucun montage n'a été exporté."
+                f"{details_sources} Détail de sélection : {exc}"
+            ) from exc
         # CONTRÔLE QUALITÉ FINAL : chaque plan retenu est relu UNE DEUXIÈME FOIS par
         # Gemini sur un extrait de sa fenêtre exacte. Un plan non confirmé est écarté
         # avec sa scène et la sélection est relancée — jamais monté.
@@ -1721,7 +1785,9 @@ async def construire_montage_professionnel(
             "editing", 82,
             f"Plan prêt : {len(plan)} plans, accroche rapide puis scènes principales de 5 s",
             edit_plan=[{
-                "source": p["source"], "start": p["debut"], "duration": p["duree"],
+                "source": p["source"], "url": p["source_url"],
+                "start": p["debut"], "end": round(p["debut"] + p["duree"], 3),
+                "duration": p["duree"],
                 "transition": p["transition"], "hook": p["hook"],
             } for p in plan],
         )
