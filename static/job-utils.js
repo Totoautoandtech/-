@@ -8,6 +8,9 @@
   const BATCH_DRAFTS_KEY = 'vesper.batchDrafts.v1';
   // Mode RsT multiple : un job indépendant par lien, suivis même après actualisation.
   const RST_JOBS_KEY = 'vesper.rstJobs.v1';
+  // Seuil de confirmation de risque (fenêtre de 30 min côté serveur). /api/config
+  // expose la valeur serveur ; ce repli évite un décalage avant son chargement.
+  const SEUIL_ESTIMATION_RISQUE = 1140;
   const TRAINING_PROFILES_KEY = 'vesper.trainingProfiles.v1';
   const RST_LIENS_MAX = 6;
 
@@ -122,7 +125,7 @@
 
   return {
     ACTIVE_JOB_KEY, BATCH_DRAFTS_KEY, isTransientStatus, backoffDelay, sleep, normalizeTikTokLink,
-    RST_JOBS_KEY, RST_LIENS_MAX,
+    RST_JOBS_KEY, RST_LIENS_MAX, SEUIL_ESTIMATION_RISQUE,
     parseLinks, parseRstLinks, saveActiveJob, loadActiveJob, clearActiveJob,
     saveBatchDrafts, loadBatchDrafts, clearBatchDrafts,
     saveRstJobs, loadRstJobs, clearRstJobs,

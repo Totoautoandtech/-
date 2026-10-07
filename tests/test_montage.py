@@ -1,8 +1,11 @@
 import asyncio
+import json
+import re
 import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 import studio_montage as montage
 
@@ -37,7 +40,7 @@ def test_rejette_lien_invalide():
 def _config(tmp_path: Path) -> montage.ConfigurationMontage:
     work = tmp_path / "travail"
     videos = tmp_path / "videos"
-    work.mkdir(); videos.mkdir()
+    work.mkdir(exist_ok=True); videos.mkdir(exist_ok=True)
     return montage.ConfigurationMontage(dossier_travail=work, dossier_videos=videos)
 
 
@@ -126,7 +129,8 @@ def test_plan_accroche_rapide_puis_plans_cinq_secondes():
         analyses[nom] = [{
             "debut": 1.0, "fin": 8.0, "sujet": "test", "action_mouvement": "dynamique",
             "qualite": "bonne", "nettete": 0.9, "cadrage": "vertical", "texte_visible": False,
-            "watermark": False,
+            "texte_sous_titres": False, "personne_visible": False, "watermark": False,
+            "logo_visible": False, "autre_element_superpose": False,
             "pertinence_script": [{"id": s["id"], "score": 0.9} for s in segments],
             "rythme": "dynamique", "transition_recommandee": "cut", "score_pertinence": 0.9,
         }]
@@ -150,7 +154,8 @@ def test_intensite_transitions_0_ne_garde_que_les_coupes():
         analyses[nom] = [{
             "debut": 1.0, "fin": 8.0, "sujet": "test", "action_mouvement": "dynamique",
             "qualite": "bonne", "nettete": 0.9, "cadrage": "vertical", "texte_visible": False,
-            "watermark": False,
+            "texte_sous_titres": False, "personne_visible": False, "watermark": False,
+            "logo_visible": False, "autre_element_superpose": False,
             "pertinence_script": [{"id": s["id"], "score": 0.9} for s in segments],
             "rythme": "dynamique", "transition_recommandee": "fade", "score_pertinence": 0.9,
         }]
@@ -171,7 +176,8 @@ def test_intensite_transitions_forte_allonge_les_transitions():
     scene = [{
         "debut": 0.0, "fin": 30.0, "sujet": "test", "action_mouvement": "dynamique",
         "qualite": "bonne", "nettete": 0.9, "cadrage": "vertical", "texte_visible": False,
-        "watermark": False,
+        "texte_sous_titres": False, "personne_visible": False, "watermark": False,
+        "logo_visible": False, "autre_element_superpose": False,
         "pertinence_script": [{"id": s["id"], "score": 0.9} for s in segments],
         "rythme": "dynamique", "transition_recommandee": "fade", "score_pertinence": 0.9,
     }]
@@ -203,7 +209,11 @@ def test_arguments_audio_avec_voix_off_mappe_une_piste_aac():
 
 
 def _analyses_longues(segments, nombre=3, duree=30.0):
-    """Sources longues et parfaitement pertinentes : rien ne bride la durée des plans."""
+    """Sources longues et parfaitement pertinentes : rien ne bride la durée des plans.
+
+    Les cinq drapeaux d'interdiction sont explicites : le contrôle est fail-closed,
+    une clé absente vaut « élément présent » et la scène serait écartée.
+    """
     analyses, metadata = {}, {}
     for index in range(nombre):
         nom = f"source_{index}"
@@ -211,7 +221,8 @@ def _analyses_longues(segments, nombre=3, duree=30.0):
         analyses[nom] = [{
             "debut": 0.0, "fin": duree, "sujet": "test", "action_mouvement": "dynamique",
             "qualite": "bonne", "nettete": 0.9, "cadrage": "vertical", "texte_visible": False,
-            "watermark": False,
+            "texte_sous_titres": False, "personne_visible": False, "watermark": False,
+            "logo_visible": False, "autre_element_superpose": False,
             "pertinence_script": [{"id": s["id"], "score": 0.9} for s in segments],
             "rythme": "dynamique", "transition_recommandee": "cut", "score_pertinence": 0.9,
         }]
@@ -320,7 +331,8 @@ def _scene(segments, sujet, action, score):
     return {
         "debut": 0.0, "fin": 20.0, "sujet": sujet, "action_mouvement": action,
         "qualite": "bonne", "nettete": 0.95, "cadrage": "vertical", "texte_visible": False,
-        "watermark": False,
+        "texte_sous_titres": False, "personne_visible": False, "watermark": False,
+        "logo_visible": False, "autre_element_superpose": False,
         "pertinence_script": [{"id": s["id"], "score": score} for s in segments],
         "rythme": "dynamique", "transition_recommandee": "cut", "score_pertinence": score,
     }
@@ -376,3 +388,189 @@ def test_mode_strict_garde_les_plans_vraiment_pertinents():
     # candidate, simplement moins bien classée).
     plan_souplet = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
     assert plan_souplet and all(p["duree"] <= montage.DUREE_MAX_PLAN_DEFAUT for p in plan_souplet)
+
+# ======================================================================================
+# CONTRÔLE QUALITÉ FINAL — relecture de chaque plan retenu sur sa fenêtre exacte
+# ======================================================================================
+
+
+def _sources_controle(racine, segments, nombre=3, scenes=3, duree_scene=10.0):
+    """Sources à scènes multiples : il reste toujours une alternative à un plan écarté,
+    ce qui permet de vérifier que la sélection est réellement relancée."""
+    analyses: dict = {}
+    metadata: dict = {}
+    sources: dict = {}
+    for index in range(nombre):
+        nom = f"source_{index}"
+        chemin = racine / f"{nom}.mp4"
+        chemin.write_bytes(b"video")
+        sources[nom] = chemin
+        metadata[nom] = {
+            "duration": scenes * duree_scene,
+            "url": f"https://www.tiktok.com/@demo/video/{7000 + index}",
+        }
+        analyses[nom] = [
+            {
+                "debut": float(position * duree_scene),
+                "fin": float((position + 1) * duree_scene),
+                "sujet": "test", "action_mouvement": "dynamique", "qualite": "bonne",
+                "nettete": 0.9, "cadrage": "vertical", "texte_visible": False,
+                "texte_sous_titres": False, "personne_visible": False, "watermark": False,
+                "logo_visible": False, "autre_element_superpose": False,
+                "pertinence_script": [{"id": s["id"], "score": 0.9} for s in segments],
+                "rythme": "dynamique", "transition_recommandee": "cut",
+                "score_pertinence": 0.9,
+            }
+            for position in range(scenes)
+        ]
+    return analyses, metadata, sources
+
+
+def _verdict_valide() -> str:
+    return json.dumps({
+        "conforme": True, "personnes_visibles": False, "watermark": False,
+        "logo_ajoute": False, "autre_element_superpose": False,
+        "texte_non_sous_titre": False, "flou_ou_illisible": False,
+        "hors_sujet": False, "raisons": [],
+    })
+
+
+def _verdict_refuse() -> str:
+    return json.dumps({
+        "conforme": False, "personnes_visibles": True, "watermark": False,
+        "logo_ajoute": False, "autre_element_superpose": False,
+        "texte_non_sous_titre": False, "flou_ou_illisible": False,
+        "hors_sujet": False, "raisons": ["une main est visible dans le cadre"],
+    })
+
+
+def _installer_extrait(monkeypatch):
+    """L'extrait FFmpeg est simulé : ce test vérifie la décision de montage, pas le
+    pipeline vidéo."""
+    async def faux_extrait(_source, destination, _debut, _duree, _config, _rapporteur):
+        destination.write_bytes(b"extrait")
+        return destination
+
+    monkeypatch.setattr(montage, "creer_extrait_verification", faux_extrait)
+
+
+def test_un_drapeau_omis_vaut_element_present_et_ecarte_la_scene():
+    """Fail-closed : un drapeau d'interdiction absent vaut « élément présent ».
+
+    Sans ce garde-fou, une analyse oublie un drapeau et laisse passer un plan avec une
+    personne, un watermark ou un logo — exactement ce qui est refusé ici.
+    """
+    scene = {
+        "debut": 0.0, "fin": 10.0, "sujet": "test", "action_mouvement": "dynamique",
+        "qualite": "bonne", "nettete": 0.9, "cadrage": "vertical", "texte_visible": False,
+        "texte_sous_titres": False, "personne_visible": False, "watermark": False,
+        "logo_visible": False, "autre_element_superpose": False,
+        "pertinence_script": [{"id": 0, "score": 0.9}], "rythme": "dynamique",
+        "transition_recommandee": "cut", "score_pertinence": 0.9,
+    }
+    assert montage._scene_professionnelle_sans_texte(scene)
+    for cle in ("personne_visible", "watermark", "logo_visible", "autre_element_superpose"):
+        amputee = {k: v for k, v in scene.items() if k != cle}
+        assert not montage._scene_professionnelle_sans_texte(amputee), cle
+        # Même exigence au niveau du schéma : le drapeau omis invalide la réponse.
+        with pytest.raises(ValidationError):
+            montage.SceneAnalyse.model_validate(amputee)
+
+
+def test_le_controle_qualite_final_ecarte_les_plans_refuses_et_revalide(tmp_path, monkeypatch):
+    """Un plan non confirmé est écarté AVEC sa scène, la sélection est relancée, et
+    seuls les plans revalidés au second tour sortent du contrôle."""
+    _installer_extrait(monkeypatch)
+    segments = montage.creer_segments_script(
+        "Accroche percutante", "Une phrase complète. Une autre phrase tout aussi complète."
+    )
+    analyses, metadata, sources = _sources_controle(tmp_path, segments)
+    debut_vus: list[float] = []
+
+    async def appel_gemini(parts, **_kwargs):
+        # Le contrôleur reçoit le texte du prompt : il y lit les timestamps exacts.
+        debut = float(re.search(r"début ([0-9.]+) s", parts[1]["text"]).group(1))
+        debut_vus.append(debut)
+        return _verdict_refuse() if debut < 5.0 else _verdict_valide()
+
+    plan_initial = montage.selectionner_plan(
+        segments, analyses, metadata, montage.STYLE_DEFAUT
+    )
+    assert plan_initial
+    plan, verdicts = asyncio.run(montage.controler_qualite_plan(
+        plan_initial, segments, analyses, metadata, montage.STYLE_DEFAUT, sources,
+        _config(tmp_path), _reporter(), appel_gemini, 2,
+    ))
+
+    # Le refus a bien provoqué une relecture complète : plus d'appels que de plans.
+    assert len(debut_vus) > len(plan)
+    assert len(debut_vus) >= len(plan_initial)
+    assert all(verdict["conforme"] for verdict in verdicts)
+    assert {verdict["tour"] for verdict in verdicts} == {2}
+    assert len(verdicts) == len(plan)
+    # Aucun plan refusé n'a pu revenir : sa fenêtre a été retirée de l'analyse.
+    assert min(debut_vus) < 5.0
+    assert all(clip["debut"] >= 5.0 for clip in plan)
+    assert all(verdict["debut"] >= 5.0 for verdict in verdicts)
+    # Chaque verdict porte l'URL et les timestamps exacts de la fenêtre réellement montée.
+    assert all(verdict["url"].startswith("https://www.tiktok.com/@demo/") for verdict in verdicts)
+    assert all(verdict["fin"] > verdict["debut"] for verdict in verdicts)
+
+
+def test_un_controle_impossible_ecarte_le_plan_au_lieu_de_le_laisser_passer(tmp_path, monkeypatch):
+    """Réponse illisible ou source introuvable : le plan est écarté, jamais monté."""
+    _installer_extrait(monkeypatch)
+    segments = montage.creer_segments_script("Accroche", "Une phrase complète.")
+    analyses, metadata, sources = _sources_controle(tmp_path, segments, nombre=1, scenes=1)
+    plan_initial = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
+    config = _config(tmp_path)
+
+    async def gemini_illisible(_parts, **_kwargs):
+        return "ceci n'est pas du JSON"
+
+    verdict = asyncio.run(montage.verifier_conformite_extrait(
+        plan_initial[0], sources["source_0"], metadata["source_0"]["url"],
+        config, _reporter(), gemini_illisible,
+    ))
+    assert verdict["conforme"] is False
+    assert verdict["raisons"] and "illisible" in verdict["raisons"][0]
+    assert verdict["url"] == metadata["source_0"]["url"]
+
+    # Une source téléchargée introuvable : le contrôle est impossible, donc non conforme.
+    verdict_absent = asyncio.run(montage.verifier_conformite_extrait(
+        plan_initial[0], None, metadata["source_0"]["url"],
+        config, _reporter(), gemini_illisible,
+    ))
+    assert verdict_absent["conforme"] is False
+    assert "impossible" in verdict_absent["raisons"][0]
+
+
+def test_echec_du_controle_qualite_est_detaille_avec_url_et_timestamps(tmp_path, monkeypatch):
+    """Un plan toujours refusé fait échouer le travail avec le détail de chaque refus :
+    URL, timestamps exacts et raison — jamais une vidéo non conforme."""
+    _installer_extrait(monkeypatch)
+    segments = montage.creer_segments_script("Accroche", "Une phrase complète.")
+    analyses, metadata, sources = _sources_controle(tmp_path, segments, nombre=2, scenes=2)
+    plan_initial = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
+
+    async def gemini_toujours_refuse(_parts, **_kwargs):
+        return json.dumps({
+            "conforme": False, "personnes_visibles": False, "watermark": True,
+            "logo_ajoute": False, "autre_element_superpose": False,
+            "texte_non_sous_titre": False, "flou_ou_illisible": False,
+            "hors_sujet": False, "raisons": ["filigrane incrusté"],
+        })
+
+    # Un seul tour : la sélection est relancée puis le budget de tours est épuisé.
+    with pytest.raises(montage.ErreurMontage) as excinfo:
+        asyncio.run(montage.controler_qualite_plan(
+            plan_initial, segments, analyses, metadata, montage.STYLE_DEFAUT, sources,
+            _config(tmp_path), _reporter(), gemini_toujours_refuse, 2, tours_max=1,
+        ))
+    message = str(excinfo.value)
+    assert montage.TOURS_MAX_CONTROLE_QUALITE == 3
+    assert "non satisfait après 1 tours" in message
+    # URL, timestamps et raison : l'utilisateur peut agir sur le refus.
+    assert "https://www.tiktok.com/@demo/video/" in message
+    assert " s → " in message
+    assert "filigrane incrusté" in message

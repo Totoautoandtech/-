@@ -58,7 +58,11 @@ from studio_montage import (
     DUREE_MAX_PLAN_DEFAUT,
     ConfigurationMontage,
     ErreurMontage,
+    PLAFOND_ESTIMATION_MONTAGE,
     Rapporteur,
+    SECONDES_CONTROLE_QUALITE_PLAN,
+    SEUIL_ESTIMATION_RISQUE,
+    TOURS_MAX_CONTROLE_QUALITE,
     TravailAnnule,
     analyser_video,
     construire_montage_professionnel,
@@ -239,7 +243,7 @@ class Config:
             google_client_secret=_env("GOOGLE_CLIENT_SECRET"),
             url_publique=_env("APP_BASE_URL") or _env("RENDER_EXTERNAL_URL"),
             duree_max_source=entier("DUREE_MAX_SOURCE_SECONDES", 180, 15, 600),
-            delai_job=entier("JOB_TIMEOUT_SECONDES", 570, 60, 900),
+            delai_job=entier("JOB_TIMEOUT_SECONDES", 1800, 60, 3600),
             delai_ffmpeg=entier("FFMPEG_TIMEOUT_SECONDES", 240, 30, 540),
             delai_gemini=entier("GEMINI_TIMEOUT_SECONDES", 120, 15, 240),
             delai_tikwm=entier("TIKWM_TIMEOUT_SECONDES", 30, 5, 90),
@@ -2382,8 +2386,8 @@ def _selectionner_sources_rst(
 
 
 def _reduire_selon_estimation(
-    sources: list[dict], config: ConfigurationMontage, plafond: int = 540,
-    duree_reference: float = 0.0,
+    sources: list[dict], config: ConfigurationMontage,
+    plafond: int = PLAFOND_ESTIMATION_MONTAGE, duree_reference: float = 0.0,
 ) -> list[dict]:
     """Retire les dernières sources tant que l'estimation dépasse le plafond prudent.
 
@@ -2691,7 +2695,7 @@ async def _produire_rst(
         trouves, CONFIG.rst_sources_max, float(CONFIG.duree_max_source)
     )
     plafond_reel = max(
-        90, min(540, int(contexte.restant()) - int(LIVRAISON_RESERVE) - 45)
+        90, min(PLAFOND_ESTIMATION_MONTAGE, int(contexte.restant()) - int(LIVRAISON_RESERVE) - 45)
     )
     try:
         duree_reference = float(seed_infos.get("duration") or 0)
@@ -2798,6 +2802,11 @@ Schéma exact :
 "raison_refus":""}}
 Règles non négociables : une personne, même partielle, un pseudo, sticker, watermark,
 logo ajouté ou texte autre qu'un vrai sous-titre TikTok rend le passage invalide.
+Règle du doute ABSOLUE : au moindre doute, un élément d'interdiction vaut « présent » et le
+passage est refusé — le doute exclut, il ne sauve jamais. Remplis toujours tous les champs :
+un champ absent sera traité comme une interdiction présente. Un texte n'est un vrai
+sous-titre TikTok que s'il transcrit les paroles dites ; un titre, une légende, une phrase
+écrite ou une typographie décorative doivent être refusés.
 L'emblème physique normal du produit ou véhicule filmé n'est pas un logo ajouté.
 Identifie visuellement le sujet exact et le modèle, ne te fie ni à la popularité ni à la légende.
 Les signatures déjà apprises, si elles existent, sont des contraintes supplémentaires : positive = {signature_positive}, négative = {signature_negative}.
@@ -3354,6 +3363,35 @@ async def _produire_sst(requete: "RequeteSst", contexte: "ContexteJob", session_
                 f"Raisons de rejet : {' ; '.join(rejets[:8]) if rejets else 'aucune candidate trouvée'}."
             )
         configuration = _configuration_montage(requete.mode, RST_DUREE_MAX_PLAN, True)
+        # SsT applique la même réduction que RsT : la vidéo source sert de référence,
+        # son coût est donc compté dans l’estimation. La répartition équitable par nom
+        # établie plus haut est conservée telle quelle : on retire les dernières
+        # candidates, on ne rééquilibre jamais en défavorisant un nom saisi.
+        try:
+            duree_reference = float(donnees.get("duration") or 0)
+        except (TypeError, ValueError):
+            duree_reference = 0.0
+        plafond_reel = max(
+            90,
+            min(PLAFOND_ESTIMATION_MONTAGE, int(contexte.restant()) - int(LIVRAISON_RESERVE) - 45),
+        )
+        selectionnees = _reduire_selon_estimation(
+            selectionnees, configuration, plafond_reel, duree_reference=duree_reference
+        )
+        if not selectionnees:
+            raise ErreurApp(
+                "SsT n'a pas pu retenir une source dans la limite de temps du rendu. "
+                f"Noms recherchés : {', '.join(noms)}. Relance avec une source plus courte."
+            )
+        contexte.update(
+            statut="selecting", progress=47,
+            detail=(
+                f"Budget restant : {max(0, int(contexte.restant()))} s — "
+                f"{len(selectionnees)} source(s) après réduction sous la limite de temps"
+            ),
+            found_videos=trouves, search_queries=recherches, recherches=recherches,
+            noms_saisis=noms, plafond_reel=plafond_reel,
+        )
         resultat = await construire_montage_professionnel(
             liens=[candidate["url"] for candidate in selectionnees],
             lien_reference=lien,
@@ -3373,7 +3411,12 @@ async def _produire_sst(requete: "RequeteSst", contexte: "ContexteJob", session_
         if candidate in selectionnees and (not urls_validees or candidate["url"] in urls_validees):
             candidate.update(selected=True, validation_status="validated")
         elif candidate.get("validation_status") == "awaiting_visual_ai":
-            candidate.update(selected=False, validation_status="rejected_by_visual_ai", rejet="validation visuelle IA non concluante")
+            candidate.update(
+                selected=False, validation_status="rejected_by_visual_ai",
+                # Une raison déjà tracée reste la vraie : durée hors limites, limite de
+                # temps Render… Le statut IA ne doit jamais écraser un motif honnête.
+                rejet=candidate.get("rejet") or "validation visuelle IA non concluante",
+            )
     resultat.update(
         script=script, found_videos=trouves, noms_saisis=noms, noms=noms,
         nombre_noms=len(noms), search_queries=recherches, profile_id=requete.profil_id,
@@ -3849,7 +3892,8 @@ async def _executer_job(job_id: str, fabrique, session_id: str) -> None:
             error=(
                 f"Le travail a dépassé la limite globale de {CONFIG.delai_job // 60} min "
                 f"{CONFIG.delai_job % 60:02d} pendant « {contexte.derniere_etape} ». "
-                "Réduis le nombre ou la durée des sources."
+                "Augmente JOB_TIMEOUT_SECONDES sur l'hébergeur (jusqu'à 3600 s) "
+                "ou réduis le nombre ou la durée des sources."
             ),
         )
     except (ErreurApp, ErreurMontage) as exc:
@@ -3973,6 +4017,17 @@ async def configuration_publique() -> dict[str, Any]:
         "analysis_fps": 6,
         "analysis_resolution": "360p",
         "minimum_video_seconds": DUREE_MIN_VIDEO_SECONDES,
+        # Fenêtre de temps partagée par l'estimation, les plafonds RsT/SsT et la
+        # confirmation de risque demandée au navigateur.
+        "plafond_estimation": PLAFOND_ESTIMATION_MONTAGE,
+        "seuil_estimation_risque": SEUIL_ESTIMATION_RISQUE,
+        # Contrôle qualité final : relecture obligatoire de chaque plan retenu.
+        "controle_qualite_final": {
+            "obligatoire": True,
+            "tours_max": TOURS_MAX_CONTROLE_QUALITE,
+            "secondes_par_plan": SECONDES_CONTROLE_QUALITE_PLAN,
+            "echec_ferme": True,
+        },
         "ai_source_validation": {
             "required": True,
             "embedded_subtitles_allowed": True,
@@ -4470,10 +4525,12 @@ async def lancer_job_montage(requete: RequeteMontage, request: Request):
         _valider_requete_montage(requete)
     except (ErreurApp, ErreurMontage) as exc:
         raise HTTPException(400, str(exc)) from exc
-    if requete.estimated_seconds > 540 and not requete.accepter_risque:
+    if requete.estimated_seconds > SEUIL_ESTIMATION_RISQUE and not requete.accepter_risque:
         raise HTTPException(
             409,
-            "Le diagnostic prévoit plus de 9 minutes. Confirme le risque ou réduis les sources avant le lancement.",
+            "Le diagnostic prévoit plus de "
+            f"{SEUIL_ESTIMATION_RISQUE // 60} minutes. Confirme le risque ou réduis les "
+            "sources avant le lancement.",
         )
     session_id, nouveau = _session_id(request)
     job_id, reused = _demarrer_job(
@@ -4528,10 +4585,11 @@ async def lancer_lot_montages(requete: RequeteLotMontages, request: Request):
                 400,
                 f"Projet « {projet.titre or 'sans titre'} » invalide : {exc}",
             ) from exc
-        if projet.estimated_seconds > 540 and not projet.accepter_risque:
+        if projet.estimated_seconds > SEUIL_ESTIMATION_RISQUE and not projet.accepter_risque:
             raise HTTPException(
                 409,
-                f"Le projet « {projet.titre or 'sans titre'} » est estimé à plus de 9 minutes. "
+                f"Le projet « {projet.titre or 'sans titre'} » est estimé à plus de "
+                f"{SEUIL_ESTIMATION_RISQUE // 60} minutes. "
                 "Confirme le risque avant de lancer le lot.",
             )
 

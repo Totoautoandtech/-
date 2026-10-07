@@ -1,6 +1,8 @@
 import ast
 import base64
+import dataclasses
 import json
+import math
 import os
 import asyncio
 import time
@@ -55,7 +57,7 @@ def test_configuration_docker_et_render_contient_les_garde_fous():
     assert "ffmpeg" in dockerfile and "fonts-dejavu-core" in dockerfile and "fonts-liberation" in dockerfile
     assert "--host 0.0.0.0" in dockerfile
     assert "healthCheckPath: /api/sante" in render
-    assert 'JOB_TIMEOUT_SECONDES' in render and 'value: "570"' in render
+    assert 'JOB_TIMEOUT_SECONDES' in render and 'value: "1800"' in render
 
 
 def test_smoke_accueil_sante_et_statiques(client):
@@ -301,7 +303,7 @@ def test_limite_estimee_demande_confirmation(client):
     response = client.post("/api/jobs/montage", json={
         "hook": "Accroche", "corps": "Corps.",
         "liens_videos": ["https://www.tiktok.com/@test/video/123"],
-        "estimated_seconds": 600, "accepter_risque": False,
+        "estimated_seconds": 1300, "accepter_risque": False,
     })
     assert response.status_code == 409
     assert "Confirme" in response.json()["detail"]
@@ -426,8 +428,9 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
     assert all(v["video_id"] != "111" for v in trouves)
     assert all(v["url"].startswith("https://www.tiktok.com/@") for v in trouves)
     retenues = [v for v in trouves if v["selected"]]
-    assert 4 <= len(retenues) <= 12
-    assert job["plafond_reel"] <= 540
+    # Fenêtre de 30 min : le plafond prudent n'est plus 9 min 30 mais 19 min.
+    assert job["plafond_reel"] <= app.PLAFOND_ESTIMATION_MONTAGE
+    assert 4 <= len(retenues) <= app.CONFIG.rst_sources_max
     ecartees_temps = [
         v for v in trouves
         if not v["selected"] and "limite de temps Render" in v.get("rejet", "")
@@ -2523,3 +2526,224 @@ def test_profil_non_entraiine_est_seulement_enregistre(client):
     assert profil["sources_automatiquement_ajoutees"] == 0
     assert profil["donnees"] == {}
     assert not profil["sources_validees"]
+
+
+# ======================================================================================
+# LIMITE GLOBALE À 30 MIN + CONTRÔLE QUALITÉ FINAL STRICT DE CHAQUE PLAN
+# ======================================================================================
+
+
+def test_limite_globale_a_trente_minutes_bornee_entre_soixante_et_trois_mille_six_cent(
+    monkeypatch,
+):
+    """JOB_TIMEOUT_SECONDES : défaut 1800, bornes 60..3600, repli sur le défaut.
+
+    La fenêtre est passée de 9 min 30 à 30 min parce que le contrôle qualité final relit
+    chaque plan : la borne haute reste 3600 s pour ne jamais dépasser l'heure de Render.
+    """
+    monkeypatch.delenv("JOB_TIMEOUT_SECONDES", raising=False)
+    assert app.Config.charger().delai_job == 1800
+
+    monkeypatch.setenv("JOB_TIMEOUT_SECONDES", "3600")
+    assert app.Config.charger().delai_job == 3600
+    monkeypatch.setenv("JOB_TIMEOUT_SECONDES", "9999")  # borné, jamais au-dessus d'une heure
+    assert app.Config.charger().delai_job == 3600
+    monkeypatch.setenv("JOB_TIMEOUT_SECONDES", "5")
+    assert app.Config.charger().delai_job == 60
+    monkeypatch.setenv("JOB_TIMEOUT_SECONDES", "pas un nombre")
+    assert app.Config.charger().delai_job == 1800
+
+    # La limite globale et son message d'expiration sont publiés tels quels.
+    monkeypatch.delenv("JOB_TIMEOUT_SECONDES", raising=False)
+    # Une seconde : le délai reste un entier, comme le formate le message d'expiration.
+    monkeypatch.setattr(app, "CONFIG", dataclasses.replace(app.CONFIG, delai_job=1))
+    job = {"status": "running", "progress": 0}
+    app.JOBS["job-expiration"] = job
+
+    async def jamais_fini(_contexte):
+        await asyncio.sleep(30)
+        return {"url": "/videos/inatteignable.mp4"}
+
+    asyncio.run(app._executer_job("job-expiration", jamais_fini, ""))
+    assert job["status"] == "failed"
+    # Le message nomme le réglage à augmenter : l'utilisateur n'a plus à le deviner.
+    assert "JOB_TIMEOUT_SECONDES" in job["error"]
+    assert "Limite globale atteinte" in job["detail"]
+
+
+def test_l_estimation_compte_le_controle_qualite_final_et_expose_le_budget(client):
+    """L'estimation intègre la relecture de chaque plan et publie la fenêtre de temps.
+
+    `likely_within_budget` et `budget_seconds` remplacent l'ancien indicateur ; la clé
+    historique reste présente pour ne pas casser un navigateur déjà déployé.
+    """
+    assert studio_montage.PLAFOND_ESTIMATION_MONTAGE == 1140
+    assert studio_montage.SEUIL_ESTIMATION_RISQUE == 1140
+    assert studio_montage.TOURS_MAX_CONTROLE_QUALITE == 3
+
+    config = studio_montage.ConfigurationMontage(
+        dossier_travail=app.DOSSIER_TRAVAIL, dossier_videos=app.DOSSIER_VIDEOS,
+    )
+    plans = studio_montage.estimer_plans_qualite(config)
+    assert plans == 14  # 61 s de montage garanti / 4,5 s de plan typique
+    controle_qualite = plans * studio_montage.SECONDES_CONTROLE_QUALITE_PLAN
+    assert controle_qualite == 14 * 18
+
+    durees = [60.0] * 4
+    reference = 30.0
+    total = sum(min(d, config.duree_max_source) for d in durees)
+    nb_analyses = len(durees) + 1  # la vidéo de référence est analysée comme une source de plus
+    attendu = math.ceil((
+        15 + (total + reference) * 0.38 + nb_analyses * 30 + nb_analyses * 8
+        + total * 0.08 + 90 + controle_qualite
+    ) / 5) * 5
+    estimation = studio_montage.estimer_duree_traitement(durees, reference, config)
+    # Sans le contrôle qualité final, l'estimation serait sous-évaluée d'environ 4 min.
+    assert estimation["estimated_seconds"] == attendu
+    assert estimation["estimated_seconds"] > controle_qualite
+    assert estimation["likely_within_budget"] is True
+    assert estimation["budget_seconds"] == min(
+        studio_montage.PLAFOND_ESTIMATION_MONTAGE, int(config.delai_job) - 20
+    )
+    assert estimation["likely_under_10_minutes"] == estimation["likely_within_budget"]
+    assert estimation["warning"] == ""
+
+    # Une estimation au-delà du plafond est signalée avec la fenêtre réellement appliquée.
+    lourd = studio_montage.estimer_duree_traitement([180.0] * 20, 180.0, config)
+    assert lourd["estimated_seconds"] > lourd["budget_seconds"]
+    assert lourd["likely_within_budget"] is False
+    assert "19 minutes" in lourd["warning"]
+
+    # /api/config publie les mêmes seuils que le serveur applique.
+    public = client.get("/api/config").json()
+    assert public["seuil_estimation_risque"] == app.SEUIL_ESTIMATION_RISQUE
+    assert public["plafond_estimation"] == app.PLAFOND_ESTIMATION_MONTAGE
+    assert public["controle_qualite_final"]["obligatoire"] is True
+    assert public["controle_qualite_final"]["tours_max"] == 3
+
+
+def test_les_prompts_exigent_le_doute_et_la_vraie_transcription(client):
+    """Règle du doute et définition stricte du sous-titre TikTok, dans les deux prompts.
+
+    Un drapeau d'interdiction au moindre doute passe à true, et `texte_sous_titres`
+    ne vaut vrai que pour une transcription des paroles — un titre ou une légende ne
+    sont jamais des sous-titres.
+    """
+    for prompt in (studio_montage.PROMPT_ANALYSE, app.PROMPT_PROFIL_VISUEL):
+        minuscule = prompt.lower()
+        assert "doute" in minuscule
+        assert "exclut" in minuscule
+        assert "paroles" in minuscule
+
+    analyse = studio_montage.PROMPT_ANALYSE
+    assert "texte_sous_titres = false" in analyse
+    for drapeau in ("personne_visible", "logo_visible", "autre_element_superpose", "watermark"):
+        assert drapeau in analyse
+    # Les sept drapeaux doivent tous être remplis : un drapeau absent vaut « présent ».
+    assert "Remplis TOUJOURS les sept drapeaux" in analyse
+
+    verification = studio_montage.PROMPT_VERIFICATION
+    assert "début {debut:.2f} s" in verification
+    for drapeau in (
+        "personnes_visibles", "watermark", "logo_ajoute", "autre_element_superpose",
+        "texte_non_sous_titre", "flou_ou_illisible", "hors_sujet",
+    ):
+        assert drapeau in verification
+    # Un plan sans les sept drapeaux à false est refusé.
+    assert "QUE SI les sept drapeaux valent false" in verification
+
+    # Réponse incomplète : chaque drapeau d'interdiction vaut « élément présent ».
+    vide = studio_montage.ReponseVerification.model_validate({})
+    assert vide.conforme is False
+    assert vide.personnes_visibles and vide.watermark and vide.logo_ajoute
+    assert vide.autre_element_superpose and vide.texte_non_sous_titre
+    assert vide.flou_ou_illisible and vide.hors_sujet
+
+
+def test_sst_reduit_les_sources_sous_la_limite_de_temps_comme_rst(client, monkeypatch):
+    """SsT applique la même réduction que RsT, durée de la vidéo de référence comprise.
+
+    La répartition équitable par nom est conservée : on retire les dernières candidates,
+    on ne rééquilibre jamais en défavorisant un nom saisi.
+    """
+    noms = ["Alpha One", "Beta S", "Gamma X"]
+    catalogue = {
+        # Quatre vidéos de 100 s par nom : l'estimation dépasse le plafond de 19 min.
+        f"90000000000000001{index:02d}": (
+            f"critique{index}", f"{noms[index % 3]} passage {index}", 100
+        )
+        for index in range(12)
+    }
+    source_id = "9000000000000000001"
+
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            url = str(params.get("url", ""))
+            if source_id in url:
+                return {"id": source_id, "title": "Classement 2026 #auto", "duration": 21,
+                        "author": {"unique_id": "chaineauto", "nickname": "Chaîne Auto"}}
+            for identifiant, (pseudo, titre, duree) in catalogue.items():
+                if identifiant in url:
+                    return {"id": identifiant, "title": titre, "duration": duree,
+                            "author": {"unique_id": pseudo, "nickname": pseudo}}
+            raise app.ErreurApp(f"Vidéo inconnue : {url}")
+        if chemin == "/feed/search":
+            # Chaque nom saisi ne remonte que SES vidéos, comme le vrai TikWM.
+            recherche = str(params.get("keywords"))
+            return {"videos": [
+                {"id": identifiant, "title": titre, "duration": duree,
+                 "author": {"unique_id": pseudo, "nickname": pseudo}}
+                for identifiant, (pseudo, titre, duree) in catalogue.items()
+                if titre.startswith(recherche)
+            ]}
+        raise AssertionError(f"Chemin TikWM inattendu : {chemin}")
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+
+    async def decouverte_vide(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_vide)
+    montage_kwargs: dict = {}
+
+    async def montage_fake(**kwargs):
+        montage_kwargs.update(kwargs)
+        return {
+            "url": "/videos/sst-budget.mp4", "path": app.DOSSIER_VIDEOS / "sst-budget.mp4",
+            "sources": [], "source_errors": [],
+            "plan_verification": [{"url": "https://www.tiktok.com/@critique0/video/900000000000000000",
+                                   "debut": 0.0, "fin": 5.0, "conforme": True, "raisons": []}],
+        }
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    reponse = client.post("/api/jobs/sst", json={
+        "lien": "https://www.tiktok.com/@chaineauto/video/9000000000000000001",
+        "nombre_noms": 3, "noms": noms,
+    })
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+
+    # La fenêtre de 30 min donne un plafond de 19 min, pas de 9 min 30.
+    assert job["plafond_reel"] <= app.PLAFOND_ESTIMATION_MONTAGE
+    trouvees = job["found_videos"]
+    assert len(trouvees) == 12
+    ecartees = [v for v in trouvees if "limite de temps Render" in v.get("rejet", "")]
+    assert ecartees
+    # La réduction a bien amputé la liste envoyée au montage.
+    assert len(montage_kwargs["liens"]) == 12 - len(ecartees)
+    assert len(montage_kwargs["liens"]) < 12
+    # La durée de la vidéo de référence est comptée : on réduit plus qu'avec elle exclue.
+    config = app._configuration_montage("rapide", app.RST_DUREE_MAX_PLAN, True)
+    candidates = [{"duration": 100.0, "url": f"https://www.tiktok.com/@x/video/{i}"} for i in range(12)]
+    avec_reference = app._reduire_selon_estimation(
+        [dict(candidat) for candidat in candidates], config, app.PLAFOND_ESTIMATION_MONTAGE,
+        duree_reference=100.0,
+    )
+    sans_reference = app._reduire_selon_estimation(
+        [dict(candidat) for candidat in candidates], config, app.PLAFOND_ESTIMATION_MONTAGE,
+    )
+    assert len(avec_reference) == len(avec_reference) < len(sans_reference) < 12
+    # Le verdict par plan du contrôle qualité final remonte jusqu'au résultat du travail.
+    assert job["plan_verification"][0]["conforme"] is True

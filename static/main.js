@@ -1467,6 +1467,20 @@
     return parsed;
   }
 
+  // Estimation et fenêtre de temps : `likely_within_budget` remplace l'ancien
+  // `likely_under_10_minutes`, conservé côté serveur pour les anciens clients.
+  function seuilEstimationRisque() {
+    const valeur = Number(serverConfig?.seuil_estimation_risque);
+    return Number.isFinite(valeur) && valeur > 0 ? valeur : U.SEUIL_ESTIMATION_RISQUE;
+  }
+
+  function estimationDansBudget(data) {
+    if (!data) return true;
+    if (typeof data.likely_within_budget === 'boolean') return data.likely_within_budget;
+    if (typeof data.likely_under_10_minutes === 'boolean') return data.likely_under_10_minutes;
+    return Number(data.estimated_seconds || 0) <= Number(data.budget_seconds || seuilEstimationRisque());
+  }
+
   function renderDiagnostic(data) {
     diagnosticData = data;
     $('diagnostic').classList.remove('hidden');
@@ -1474,7 +1488,7 @@
       `${data.valid_count} source(s) réellement accessible(s) · ${data.invalid_count} erreur(s)`;
     $('estimate').textContent =
       `${data.estimated_label} sur Render gratuit — estimation, pas une promesse.${data.warning ? ` ${data.warning}` : ''}`;
-    $('estimate').classList.toggle('warning', !data.likely_under_10_minutes);
+    $('estimate').classList.toggle('warning', !estimationDansBudget(data));
     const liste = $('diagnostic-sources');
     liste.replaceChildren();
     (data.sources || []).forEach((source) => appendSource(liste, source));
@@ -1588,13 +1602,14 @@
 
     $('btn-launch-batch').addEventListener('click', () => guards.batch.run(async () => {
       if (!batchDrafts.length) return;
-      const risqués = batchDrafts.filter((projet) => projet.estimated_seconds > 540);
+      const seuil = seuilEstimationRisque();
+      const risqués = batchDrafts.filter((projet) => projet.estimated_seconds > seuil);
       if (risqués.length && !confirm(
-        `${risqués.length} projet(s) risquent de dépasser 9 minutes chacun sur Render gratuit.\n\nLancer quand même la file ?`
+        `${risqués.length} projet(s) risquent de dépasser ${Math.floor(seuil / 60)} minutes chacun sur Render gratuit.\n\nLancer quand même la file ?`
       )) return;
       const bouton = $('btn-launch-batch');
       bouton.disabled = true;
-      const projets = batchDrafts.map((projet) => ({ ...projet, accepter_risque: projet.estimated_seconds > 540 }));
+      const projets = batchDrafts.map((projet) => ({ ...projet, accepter_risque: projet.estimated_seconds > seuil }));
       try {
         const resultat = await requestJSON('/api/jobs/montage/batch', {
           body: { projets, idempotency_key: uuid() },
@@ -1631,7 +1646,7 @@
         return;
       }
       let risqueAccepte = false;
-      if (!diagnosticData.likely_under_10_minutes) {
+      if (!estimationDansBudget(diagnosticData)) {
         risqueAccepte = confirm(`${diagnosticData.warning}\n\nLancer malgré le risque d’interruption à la limite globale ?`);
         if (!risqueAccepte) return;
       }
