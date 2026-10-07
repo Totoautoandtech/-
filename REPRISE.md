@@ -303,14 +303,18 @@ Correctif à conserver :
 - `studio_montage.estimer_duree_traitement()` compte désormais, par source,
   **30 s d'analyse Gemini + 8 s de transfert/latence** au lieu de 10 s ;
 - `_produire_rst()` calcule un `plafond_reel` à partir du budget restant du job
-  (`max(90, min(540, restant - LIVRAISON_RESERVE - 45))`) puis le transmet à
-  `_reduire_selon_estimation()` avant le montage ;
+  (`max(90, min(PLAFOND_ESTIMATION_MONTAGE, restant - LIVRAISON_RESERVE - 45))`)
+  puis le transmet à `_reduire_selon_estimation()` avant le montage. Depuis la
+  fenêtre passée à 30 min, ce plafond vaut 1140 s et non plus 540 s ;
+- `_produire_sst()` applique désormais **la même réduction**, durée de la vidéo de
+  référence comptée, en conservant la répartition équitable par nom ;
 - l'interface reçoit un détail explicite du type
-  `Budget restant : N s — X source(s) retenue(s)` ; sur Render Free, X doit
-  typiquement tomber autour de 9-10 sources plutôt que 16+ ;
-- le test RsT de bout en bout vérifie que la sélection reste entre 4 et 12
-  sources et que les candidates écartées portent la raison
-  `retirée pour rester sous la limite de temps Render`.
+  `Budget restant : N s — X source(s) retenue(s)` ; avec 30 min, X peut
+  légitimement dépasser 10 sources ;
+- le test RsT de bout en bout vérifie que le plafond réel reste sous
+  `PLAFOND_ESTIMATION_MONTAGE`, que les candidates écartées portent la raison
+  `retirée pour rester sous la limite de temps Render`, et que le statut visuel
+  n'écrase jamais une raison de rejet déjà tracée.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt -r requirements.txt

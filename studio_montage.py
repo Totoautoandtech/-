@@ -46,7 +46,8 @@ class ConfigurationMontage:
     duree_max_plan: float = 5.0
     delai_ffmpeg: float = 240.0
     delai_gemini: float = 120.0
-    delai_job: float = 570.0
+    # Limite globale du travail : 30 min par défaut, alignée sur JOB_TIMEOUT_SECONDES.
+    delai_job: float = 1800.0
     taille_max_apercu: int = 12 * 1024 * 1024
     budget_disque_sources: int = 700 * 1024 * 1024
     analyses_concurrentes: int = 1
@@ -294,6 +295,40 @@ async def diagnostiquer_montage(
     }
 
 
+# Fenêtre de temps du pipeline. La limite globale est passée de 9 min 30 à 30 min
+# (JOB_TIMEOUT_SECONDES sur Render) : l'estimation, les plafonds RsT/SsT et la
+# confirmation de risque suivent tous la même fenêtre.
+PLAFOND_ESTIMATION_MONTAGE = 1140  # 19 min : plafond prudent d'un montage
+SEUIL_ESTIMATION_RISQUE = 1140  # au-delà, le lancement exige une confirmation
+
+# CONTRÔLE QUALITÉ FINAL : chaque plan retenu est relu UNE SECONDE FOIS par Gemini sur
+# un extrait de sa fenêtre exacte. Ce contrôle est obligatoire — un plan non confirmé
+# n'est jamais monté. ~18 s d'appel par plan, extrait FFmpeg compris.
+SECONDES_CONTROLE_QUALITE_PLAN = 18.0
+# Durée typique d'un plan de corps : c'est le « plancher plein » appliqué par
+# selectionner_plan, pas le plafond absolu. Elle sert à compter les plans à vérifier.
+DUREE_PLAN_QUALITE = 4.5
+# Tours de sélection et de relecture maximum avant l'échec final, détaillé.
+TOURS_MAX_CONTROLE_QUALITE = 3
+# Borne haute d'un appel de relecture : le coût typique est ~18 s, ce plafond évite
+# qu'un appel bloqué par la saturation Gemini consomme toute la fenêtre du job.
+DELAI_CONTROLE_QUALITE_PLAN = 75.0
+# Un extrait de vérification couvre quelques secondes : la limite mémoire est basse.
+TAILLE_MAX_EXTRAIT_VERIFICATION = 4 * 1024 * 1024
+
+
+def estimer_plans_qualite(config: ConfigurationMontage) -> int:
+    """Nombre de plans à recontrôler, estimé sur la durée minimale garantie.
+
+    Un plan est produit par segment de script, donc le compte suit la durée du montage
+    final — pas le nombre de sources. On retient donc la durée plancher du montage et
+    la durée typique d'un plan de corps.
+    """
+    duree_plan = max(1.0, min(float(config.duree_max_plan), DUREE_PLAN_QUALITE))
+    duree_montage = max(1.0, float(config.duree_min_video))
+    return max(1, int(math.ceil(duree_montage / duree_plan)))
+
+
 def estimer_duree_traitement(
     durees: list[float], duree_reference: float, config: ConfigurationMontage
 ) -> dict[str, Any]:
@@ -305,6 +340,8 @@ def estimer_duree_traitement(
     # Sur Render Free, une analyse Gemini complète peut prendre ~60 s quand l'API
     # sature (réessais 2/4/8/16 s). On réserve donc 30 s d'analyse + 8 s de
     # transfert/latence par source au lieu de sous-estimer à 10 s par analyse.
+    # Le contrôle qualité final s'ajoute : il relit chaque plan retenu une seconde fois.
+    controle_qualite = estimer_plans_qualite(config) * SECONDES_CONTROLE_QUALITE_PLAN
     secondes = (
         15
         + total_analyse * 0.38
@@ -312,16 +349,20 @@ def estimer_duree_traitement(
         + nb_analyses * 8
         + total * 0.08
         + 30 * 3.0
+        + controle_qualite
     )
     secondes = int(math.ceil(secondes / 5.0) * 5)
-    plafond_prudent = min(540, max(60, int(config.delai_job - 20)))
-    sous_dix = secondes <= plafond_prudent
+    budget = min(PLAFOND_ESTIMATION_MONTAGE, max(60, int(config.delai_job) - 20))
+    dans_budget = secondes <= budget
     return {
         "estimated_seconds": secondes,
         "estimated_label": f"environ {max(1, math.ceil(secondes / 60))} min",
-        "likely_under_10_minutes": sous_dix,
-        "warning": "" if sous_dix else (
-            "Ce montage risque de dépasser 10 minutes sur Render gratuit. "
+        "likely_within_budget": dans_budget,
+        "budget_seconds": budget,
+        # Conservé tel quel pour les clients existants et le navigateur déjà déployé.
+        "likely_under_10_minutes": dans_budget,
+        "warning": "" if dans_budget else (
+            f"Ce montage risque de dépasser {budget // 60} minutes sur Render gratuit. "
             "Raccourcis ou réduis les sources ; la limite serveur interrompra le travail proprement."
         ),
     }
@@ -348,12 +389,15 @@ class SceneAnalyse(BaseModel):
     nettete: float = Field(ge=0, le=1)
     cadrage: str = Field(min_length=1, max_length=200)
     texte_visible: bool
-    # Le texte TikTok est accepté uniquement s'il s'agit de vrais sous-titres.
-    texte_sous_titres: bool = False
-    personne_visible: bool = False
+    # Drapeaux d'interdiction : ils sont OBLIGATOIRES. Un drapeau omis invalide la
+    # réponse entière — c'est le comportement fail-closed attendu : mieux vaut rejeter
+    # toute l'analyse qu'accepter une scène dont l'overlay n'a pas été contrôlé.
+    # Le texte TikTok n'est accepté que s'il s'agit de vrais sous-titres.
+    texte_sous_titres: bool
+    personne_visible: bool
     watermark: bool
-    logo_visible: bool = False
-    autre_element_superpose: bool = False
+    logo_visible: bool
+    autre_element_superpose: bool
     pertinence_script: list[PertinenceScript]
     rythme: str = Field(min_length=1, max_length=100)
     transition_recommandee: str = Field(min_length=1, max_length=100)
@@ -363,6 +407,67 @@ class SceneAnalyse(BaseModel):
 class ReponseAnalyse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     scenes: list[SceneAnalyse] = Field(max_length=120)
+
+
+# --------------------------------------------------------------------------------------
+# CONTRÔLE QUALITÉ FINAL — relecture de chaque plan retenu sur sa fenêtre exacte
+# --------------------------------------------------------------------------------------
+
+PROMPT_VERIFICATION = """Tu es le contrôleur qualité FINAL d'un montage TikTok.
+Tu reçois un extrait EXACT de la fenêtre qui va réellement être montée dans la vidéo
+(début {debut:.2f} s, fin {fin:.2f} s).
+Texte du script que ce plan doit illustrer : {segment}
+Retourne UNIQUEMENT cet objet JSON strict :
+{{"conforme":false,"personnes_visibles":false,"watermark":false,"logo_ajoute":false,
+"autre_element_superpose":false,"texte_non_sous_titre":false,"flou_ou_illisible":false,
+"hors_sujet":false,"raisons":[]}}
+Un plan n'est conforme QUE SI les sept drapeaux valent false. Écris les raisons en français,
+courtes et concrètes.
+RÈGLE DU DOUTE ABSOLUE : au moindre doute, le drapeau passe à true. Le doute exclut le plan.
+- personnes_visibles : une personne, même partiellement cadrée, une main, un visage, un
+  reflet ou une silhouette suffisent.
+- watermark : filigrane, bandeau, "@…" ou pseudo d'auteur incrusté par la plateforme.
+- logo_ajoute : logo ajouté ou incrusté à l'image. L'emblème physique normal du produit
+  ou du véhicule filmé n'en est pas un.
+- autre_element_superpose : sticker, emoji, bouton, badge, chrono, bordure ou décoration.
+- texte_non_sous_titre : tout texte qui n'est PAS la transcription des paroles dites dans
+  l'extrait. Les vrais sous-titres TikTok qui recopient les paroles sont AUTORISÉS ; un
+  titre, une légende, une phrase écrite ou une typographie décorative ne le sont pas.
+- flou_ou_illisible : image floue, trop sombre, pixellisée ou sans sujet identifiable.
+- hors_sujet : le plan ne montre pas exactement le sujet annoncé par le texte du script.
+  La beauté, le cadrage et l'esthétique ne remplacent jamais la correspondance.
+N'invente rien, n'ajoute aucune clé et ne commente pas en dehors du JSON."""
+
+
+class ReponseVerification(BaseModel):
+    """Verdict du contrôle qualité final — échecs fermés par construction.
+
+    Tous les drapeaux d'interdiction valent « élément présent » par défaut et
+    `conforme` vaut « non conforme » par défaut : une réponse incomplète, contradictoire
+    ou illisible ne peut donc jamais faire passer un plan.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    conforme: bool = False
+    personnes_visibles: bool = True
+    watermark: bool = True
+    logo_ajoute: bool = True
+    autre_element_superpose: bool = True
+    texte_non_sous_titre: bool = True
+    flou_ou_illisible: bool = True
+    hors_sujet: bool = True
+    raisons: list[str] = Field(default_factory=list, max_length=12)
+
+
+MOTIFS_VERIFICATION: tuple[tuple[str, str], ...] = (
+    ("personnes_visibles", "une personne, une main, un visage ou un reflet est visible"),
+    ("watermark", "un watermark, un bandeau ou un pseudo d'auteur est incrusté"),
+    ("logo_ajoute", "un logo ajouté ou incrusté à l'image est visible"),
+    ("autre_element_superpose", "un sticker, un pseudo, un bouton ou une décoration est superposé"),
+    ("texte_non_sous_titre", "du texte qui n'est pas un vrai sous-titre TikTok est visible"),
+    ("flou_ou_illisible", "l'image est trop floue, trop sombre ou sans sujet identifiable"),
+    ("hors_sujet", "le plan ne montre pas le sujet exact demandé par le script"),
+)
 
 
 class StyleReference(BaseModel):
@@ -409,6 +514,16 @@ Parties du script : {segments}
 Retourne UNIQUEMENT cet objet JSON strict :
 {{"scenes":[{{"debut":0.0,"fin":5.0,"sujet":"...","action_mouvement":"...","qualite":"bonne|moyenne|faible","nettete":0.8,"cadrage":"...","texte_visible":false,"texte_sous_titres":false,"personne_visible":false,"watermark":false,"logo_visible":false,"autre_element_superpose":false,"pertinence_script":[{{"id":0,"score":0.8}}],"rythme":"dynamique|modéré|statique","transition_recommandee":"cut|fade|slide|zoom","score_pertinence":0.8}}]}}
 Contraintes : temps réels dans [0,{duree:.2f}], scènes intéressantes seulement, actions complètes si possible, score 0..1. Décris le sujet, l'action, la qualité/netteté et le cadrage. Distingue précisément : texte_visible = tout texte, texte_sous_titres = uniquement une transcription de paroles, personne_visible = une personne même partielle, watermark, logo_visible = logo ajouté/incrusté à l'image (pas l'emblème physique normal du produit filmé), autre_element_superpose = stickers, pseudos, boutons ou décorations. Indique la pertinence POUR CHAQUE partie concernée, le rythme et la transition. N'invente rien et n'ajoute aucune clé.
+RÈGLE DU DOUTE (non négociable, elle prime sur tout le reste) : au moindre doute sur un
+drapeau d'interdiction, mets-le à true. Le doute EXCLUT la scène, il ne la sauve jamais.
+- texte_sous_titres n'est vrai que si le texte visible est une VRAIE transcription des paroles
+  dites dans la scène. Un titre, une légende, une phrase écrite, un slogan ou une typographie
+  décorative ne sont pas des sous-titres : dans ce doute, texte_sous_titres = false.
+- personne_visible : le moindre fragment suffit — main, visage, silhouette, reflet ou une partie du corps.
+- logo_visible : le moindre logo ajouté ou incrusté suffit ; dans le doute, true.
+- autre_element_superpose : le moindre sticker, pseudo, bouton, badge, chrono ou décoration suffit.
+- watermark : le moindre filigrane, bandeau ou pseudo incrusté par la plateforme suffit.
+Remplis TOUJOURS les sept drapeaux : un drapeau absent sera traité comme « élément présent ».
 PERTINENCE VISUELLE ET IDENTITÉ STRICTES (critères les plus importants) :
 - Identifie exactement le modèle, produit, personne, lieu ou objet demandé. Si le script donne un modèle ou un identifiant exact, toute variante ou image générique est hors sujet et reçoit 0.15 MAXIMUM.
 - N'accepte aucune personne visible sur les plans d'objet/voiture/produit, même si elle ne cache qu'une petite partie du sujet.
@@ -673,20 +788,34 @@ def garantir_duree_minimale_segments(
     return resultat
 
 
+def _interdit_present(scene: dict[str, Any], cle: str) -> bool:
+    """Fail-closed : un drapeau d'interdiction ABSENT vaut « élément présent ».
+
+    Les scènes proviennent de Gemini ou d'un repli ; une clé manquante signifie
+    qu'aucun contrôle n'a été rendu sur elle. Dans le doute, l'élément est là.
+    """
+    return bool(scene.get(cle, True))
+
+
 def _scene_professionnelle_sans_texte(scene: dict[str, Any]) -> bool:
-    """Scène nette sans personne/overlay ; seuls les sous-titres TikTok sont tolérés."""
+    """Scène nette sans personne/overlay ; seuls les sous-titres TikTok sont tolérés.
+
+    Fail-closed : un drapeau d'interdiction absent vaut « élément présent », donc la
+    scène est écartée. Seuls les sous-titres TikTok — vraie transcription des paroles —
+    autorisent un texte visible.
+    """
     qualite = str(scene.get("qualite", "")).strip().lower()
     try:
         nettete = float(scene.get("nettete", 0.0))
     except (TypeError, ValueError):
         nettete = 0.0
-    texte_interdit = bool(scene.get("texte_visible")) and not bool(scene.get("texte_sous_titres"))
+    texte_interdit = bool(scene.get("texte_visible")) and not bool(scene.get("texte_sous_titres", False))
     return (
         not texte_interdit
-        and not bool(scene.get("personne_visible"))
-        and not bool(scene.get("watermark"))
-        and not bool(scene.get("logo_visible"))
-        and not bool(scene.get("autre_element_superpose"))
+        and not _interdit_present(scene, "personne_visible")
+        and not _interdit_present(scene, "watermark")
+        and not _interdit_present(scene, "logo_visible")
+        and not _interdit_present(scene, "autre_element_superpose")
         and qualite in {"bonne", "excellent", "excellente", "professionnelle"}
         and nettete >= 0.65
     )
@@ -870,6 +999,270 @@ def selectionner_plan(
         precedente = source
         transition_precedente = transition
     return plan
+
+
+# --------------------------------------------------------------------------------------
+# Contrôle qualité final : chaque plan retenu est relu une seconde fois par Gemini
+# --------------------------------------------------------------------------------------
+
+
+def _texte_attendu_plan(clip: dict[str, Any]) -> str:
+    """Texte du segment que ce plan doit illustrer.
+
+    Un plan de prolongation n'a pas de sous-titre : `texte_analyse` porte alors le
+    contexte visuel de la vidéo, sinon le contrôleur n'a rien contre quoi juger.
+    """
+    for cle in ("texte_analyse", "texte"):
+        valeur = " ".join(str(clip.get(cle) or "").split())
+        if valeur:
+            return valeur[:400]
+    return "(plan de prolongation : le plan doit montrer le sujet du montage, rien d'autre)"
+
+
+def _detail_rejets(rejets: list[dict[str, Any]], limite: int = 6) -> str:
+    """Échec final détaillé : URL, timestamps exacts et raison de chaque refus."""
+    lignes: list[str] = []
+    for verdict in rejets[:limite]:
+        url = str(verdict.get("url") or verdict.get("source") or "source inconnue")
+        raisons = " ; ".join(verdict.get("raisons") or []) or "non confirmé"
+        lignes.append(
+            f"{url} [{float(verdict.get('debut', 0)):.2f} s → "
+            f"{float(verdict.get('fin', 0)):.2f} s] : {raisons}"
+        )
+    reste = len(rejets) - limite
+    if reste > 0:
+        lignes.append(f"… et {reste} autre(s) plan(s) écarté(s)")
+    return " | ".join(lignes) if lignes else "aucun détail disponible"
+
+
+async def creer_extrait_verification(
+    source: Path,
+    destination: Path,
+    debut: float,
+    duree: float,
+    config: ConfigurationMontage,
+    rapporteur: Rapporteur,
+) -> Path:
+    """Extrait la fenêtre EXACTE du plan, en définition propre à la décision finale.
+
+    L'aperçu d'analyse (360p / 6 fps) sert au repérage des scènes ; la relecture doit
+    juger la fenêtre réellement montée, donc dans une définition plus large.
+    """
+    filtre = (
+        "scale='if(gt(iw,ih),720,405)':'if(gt(iw,ih),405,720)'"
+        ":force_original_aspect_ratio=decrease,fps=8"
+    )
+    commande = [
+        "ffmpeg", "-y", "-ss", f"{max(0.0, float(debut)):.3f}", "-i", str(source),
+        "-t", f"{max(DUREE_MIN_PLAN, float(duree)):.3f}", "-vf", filtre, "-an",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-maxrate", "800k", "-bufsize", "1600k", "-pix_fmt", "yuv420p",
+        "-threads", str(config.threads_ffmpeg), str(destination),
+    ]
+    await executer_commande(
+        commande, etape="extraction de la fenêtre exacte du plan pour contrôle qualité",
+        timeout=rapporteur.timeout(config.delai_ffmpeg), sortie_attendue=destination,
+    )
+    taille = destination.stat().st_size if destination.is_file() else 0
+    if taille <= 0:
+        destination.unlink(missing_ok=True)
+        raise ErreurMontage("L’extrait de vérification est vide : contrôle qualité impossible.")
+    if taille > TAILLE_MAX_EXTRAIT_VERIFICATION:
+        destination.unlink(missing_ok=True)
+        raise ErreurMontage("L’extrait de vérification dépasse la limite mémoire.")
+    return destination
+
+
+async def verifier_conformite_extrait(
+    clip: dict[str, Any],
+    chemin: Optional[Path],
+    url: str,
+    config: ConfigurationMontage,
+    rapporteur: Rapporteur,
+    appel_gemini: AppelGemini,
+    tour: int = 1,
+) -> dict[str, Any]:
+    """Relit UNE DEUXIÈME FOIS un plan sur un extrait de sa fenêtre exacte.
+
+    Verdict échoué par construction : réponse illisible, incomplète, contradictoire ou
+    appel impossible valent tous « non conforme ». Un contrôle impossible écarte le plan,
+    il ne le laisse jamais passer.
+    """
+    source = str(clip.get("source", ""))
+    debut = max(0.0, float(clip.get("debut", 0.0)))
+    duree = max(DUREE_MIN_PLAN, float(clip.get("duree", 0.0)))
+    verdict: dict[str, Any] = {
+        "index": int(clip.get("id", 0)),
+        "source": source,
+        "url": str(url or source),
+        "debut": round(debut, 3),
+        "fin": round(debut + duree, 3),
+        "duree": round(duree, 3),
+        "hook": bool(clip.get("hook")),
+        "tour": int(tour),
+        "conforme": False,
+        "raisons": [],
+    }
+    if chemin is None or not chemin.is_file():
+        verdict["raisons"] = ["source téléchargée introuvable : contrôle qualité impossible"]
+        return verdict
+
+    extrait = chemin.with_name(f"{chemin.stem}_verif_{int(round(debut * 1000))}.mp4")
+    try:
+        try:
+            await creer_extrait_verification(chemin, extrait, debut, duree, config, rapporteur)
+        except (TravailAnnule, asyncio.CancelledError):
+            raise
+        except ErreurMontage as exc:
+            # Une limite globale épuisée doit remonter telle quelle ; un extrait
+            # simplement inutilisable écarte le plan sans casser tout le montage.
+            if "Limite globale dépassée" in str(exc):
+                raise
+            verdict["raisons"] = [f"extrait de vérification impossible : {exc}"]
+            return verdict
+        except Exception as exc:  # noqa: BLE001
+            verdict["raisons"] = [
+                f"extrait de vérification impossible : {exc or type(exc).__name__}"
+            ]
+            return verdict
+
+        contenu = await asyncio.to_thread(extrait.read_bytes)
+        video_b64 = base64.b64encode(contenu).decode("ascii")
+        del contenu
+        prompt = PROMPT_VERIFICATION.format(
+            segment=_texte_attendu_plan(clip), debut=debut, fin=debut + duree
+        )
+        try:
+            brut = await asyncio.wait_for(
+                appel_gemini(
+                    [
+                        {"inline_data": {"mime_type": "video/mp4", "data": video_b64}},
+                        {"text": prompt},
+                    ],
+                    temperature=0.0, json_mode=True,
+                ),
+                timeout=rapporteur.timeout(
+                    min(float(config.delai_gemini), DELAI_CONTROLE_QUALITE_PLAN)
+                ),
+            )
+        except asyncio.TimeoutError:
+            verdict["raisons"] = ["Gemini n’a pas répondu à temps : contrôle qualité impossible"]
+            return verdict
+        del video_b64
+        try:
+            objet = json.loads(brut.strip().removeprefix("```json").removesuffix("```").strip())
+            analyse = ReponseVerification.model_validate(objet).model_dump()
+        except Exception as exc:  # noqa: BLE001 — illisible = non conforme
+            verdict["raisons"] = [
+                f"contrôle qualité final illisible : {exc or type(exc).__name__}"
+            ]
+            return verdict
+    except (TravailAnnule, asyncio.CancelledError):
+        raise
+    finally:
+        extrait.unlink(missing_ok=True)
+
+    raisons = [
+        motif for cle, motif in MOTIFS_VERIFICATION if analyse.get(cle)
+    ]
+    raisons.extend(str(r).strip() for r in analyse.get("raisons") or [] if str(r).strip())
+    verdict["raisons"] = raisons
+    verdict["conforme"] = bool(analyse.get("conforme")) and not raisons
+    return verdict
+
+
+def _retirer_scenes_du_plan(
+    analyses: dict[str, list[dict[str, Any]]],
+    source: str,
+    debut: float,
+    fin: float,
+    marge: float = 0.35,
+) -> int:
+    """Retire de l'analyse les scènes qui ont produit le plan écarté.
+
+    Sans cela, la sélection relancée proposerait exactement le même plan et le travail
+    bouclerait. La marge couvre les positions alternatives d'une même scène : seule la
+    fenêtre refusée disparaît, le reste de la source reste montéable.
+    """
+    scenes = analyses.get(source)
+    if not scenes:
+        return 0
+    debut_borne = float(debut) - float(marge)
+    fin_borne = float(fin) + float(marge)
+    restantes = [
+        scene for scene in scenes
+        if not (
+            float(scene.get("debut", 0.0)) < fin_borne
+            and float(scene.get("fin", 0.0)) > debut_borne
+        )
+    ]
+    retirees = len(scenes) - len(restantes)
+    if retirees:
+        analyses[source] = restantes
+    return retirees
+
+
+async def controler_qualite_plan(
+    plan: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    analyses: dict[str, list[dict[str, Any]]],
+    metadonnees: dict[str, dict[str, Any]],
+    style: StyleReference,
+    sources: dict[str, Path],
+    config: ConfigurationMontage,
+    rapporteur: Rapporteur,
+    appel_gemini: AppelGemini,
+    intensite_transitions: int = 2,
+    tours_max: int = TOURS_MAX_CONTROLE_QUALITE,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Relit chaque plan retenu et ne renvoie que ceux qui sont confirmés.
+
+    Un plan non confirmé est écarté AVEC sa scène, puis la sélection est relancée. Au
+    plus `tours_max` tours : passé ce cap, l'échec est détaillé (URL, timestamps,
+    raisons) plutôt qu'une vidéo non conforme.
+    """
+    derniers_rejets: list[dict[str, Any]] = []
+    for tour in range(1, max(1, int(tours_max)) + 1):
+        verdicts: list[dict[str, Any]] = []
+        for position, clip in enumerate(plan, 1):
+            rapporteur.checkpoint()
+            source = str(clip.get("source", ""))
+            rapporteur.update(
+                "validating", 76 + int(6 * (position - 1) / max(1, len(plan))),
+                f"Contrôle qualité strict du plan {position}/{len(plan)} (tour {tour})",
+            )
+            verdicts.append(await verifier_conformite_extrait(
+                clip, sources.get(source), str(metadonnees.get(source, {}).get("url") or source),
+                config, rapporteur, appel_gemini, tour,
+            ))
+        rejets = [verdict for verdict in verdicts if not verdict["conforme"]]
+        if not rejets:
+            return plan, verdicts
+        derniers_rejets = rejets
+        rapporteur.update(
+            "selecting", 76 + int(6 * tour / max(1, tours_max)),
+            f"Contrôle qualité : {len(rejets)} plan(s) écartés — nouvelle sélection",
+        )
+        for verdict in rejets:
+            _retirer_scenes_du_plan(
+                analyses, verdict["source"], verdict["debut"], verdict["fin"]
+            )
+        try:
+            plan = selectionner_plan(
+                segments, analyses, metadonnees, style, intensite_transitions,
+                config.duree_max_plan,
+                exiger_pertinence_visuelle=config.exiger_pertinence_visuelle,
+            )
+        except ErreurMontage as exc:
+            raise ErreurMontage(
+                "Le contrôle qualité final a écarté tous les plans disponibles : "
+                f"{_detail_rejets(rejets)} — {exc}"
+            ) from exc
+    raise ErreurMontage(
+        f"Contrôle qualité final non satisfait après {tours_max} tours de sélection. "
+        f"Plans écartés : {_detail_rejets(derniers_rejets)}. "
+        "Aucun plan non conforme n'est monté : relance avec d'autres sources."
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -1317,6 +1710,13 @@ async def construire_montage_professionnel(
             config.duree_max_plan,
             exiger_pertinence_visuelle=config.exiger_pertinence_visuelle,
         )
+        # CONTRÔLE QUALITÉ FINAL : chaque plan retenu est relu UNE DEUXIÈME FOIS par
+        # Gemini sur un extrait de sa fenêtre exacte. Un plan non confirmé est écarté
+        # avec sa scène et la sélection est relancée — jamais monté.
+        plan, plan_verification = await controler_qualite_plan(
+            plan, segments, analyses, metadonnees, style_reference, sources, config,
+            rapporteur, appel_gemini, intensite_transitions,
+        )
         rapporteur.update(
             "editing", 82,
             f"Plan prêt : {len(plan)} plans, accroche rapide puis scènes principales de 5 s",
@@ -1347,5 +1747,7 @@ async def construire_montage_professionnel(
             "duplicates": doublons,
             "reference_style": style_reference.model_dump(),
             "reference_warning": avertissement_reference,
+            # Verdict par plan du contrôle qualité final : conforme,timestamps, raisons.
+            "plan_verification": plan_verification,
             "elapsed_seconds": round(time.monotonic() - debut_global, 1),
         }

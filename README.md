@@ -81,15 +81,17 @@ Le mode **Montage multi-source** accepte de 1 à 20 liens TikTok (un par ligne).
 - résout chaque source puis lit durée, dimensions, cadence et codec avec FFprobe ;
 - signale chaque lien inaccessible sans condamner les autres ;
 - rappelle la durée maximale par source et estime le temps de calcul ;
-- avertit lorsqu'un Render gratuit a peu de chances de finir en moins de 10 minutes.
+- avertit lorsqu'un Render gratuit a peu de chances de finir dans la fenêtre de 30 minutes.
 
 Pendant le travail, les téléchargements sont séquentiels. Les aperçus couvrent **toute la durée autorisée** à environ 360p/6 FPS, sans audio, et sont supprimés juste après l'analyse. Une seule analyse Gemini est lancée par défaut (`2` maximum configurable). Les originaux, jamais les aperçus, alimentent un graphe FFmpeg final en 720 × 1280, 24 FPS, H.264/yuv420p. L'accroche utilise des plans de 0,6 à 1,5 s ; les scènes principales visent 4,5 à 5,5 s.
+
+**Contrôle qualité final.** Après la sélection, chaque plan retenu est relu **une deuxième fois** par Gemini sur un extrait de sa fenêtre exacte (720p, sans audio, quelques secondes). Un plan n'est monté que si sept drapeaux valent `false` : personne visible, watermark, logo ajouté, sticker/pseudo/bouton, texte qui n'est pas un vrai sous-titre TikTok, image illisible, sujet différent du script. Un plan non confirmé est écarté **avec sa scène**, et la sélection est relancée ; au bout de trois tours, le travail échoue avec le détail de chaque refus (URL, timestamps, raisons). Un contrôle impossible — réponse illisible, appel en timeout, source introuvable — écarte le plan comme un refus : mieux vaut un travail en échec qu'une vidéo non conforme. Le verdict de chaque plan est publié dans `plan_verification` du résultat.
 
 Une référence de style reproduit aussi fidèlement que possible le rythme, les coupes, les zooms et les sous-titres ASS. Sans référence explicite, la première source sert de référence. Ses images, son son, son logo, son watermark et son contenu créatif ne sont jamais recopiés.
 
 Les jobs publient les états `queued`, `validating`, `downloading`, `analysing`, `selecting`, `editing`, `subtitling`, `uploading`, `completed` ou `failed`, avec progression et détail. L'identifiant est gardé dans `localStorage` : une actualisation reprend le suivi. Les erreurs réseau/502/503/504 sont retentées avec backoff et un travail peut être annulé.
 
-Il est possible de préparer **jusqu'à six projets complets et différents** (titre, script, 1–20 sources, référence de style et réglages propres), puis de lancer le lot. Render Free les traite séquentiellement pour rester sous 512 Mo. La file et les résultats sont visibles pendant six heures dans le même navigateur ; chaque vidéo terminée est aussi envoyée vers Drive si le compte est connecté. Six travaux proches de la limite individuelle de 9 min 30 représentent environ 57 minutes de file.
+Il est possible de préparer **jusqu'à six projets complets et différents** (titre, script, 1–20 sources, référence de style et réglages propres), puis de lancer le lot. Render Free les traite séquentiellement pour rester sous 512 Mo. La file et les résultats sont visibles pendant six heures dans le même navigateur ; chaque vidéo terminée est aussi envoyée vers Drive si le compte est connecté. Six travaux proches de la limite individuelle de 30 min représentent environ 3 heures de file.
 
 ## Déploiement Render
 
@@ -117,7 +119,7 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 | `GEMINI_MODELES` | `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash` | chaîne de modèles de secours, essayés dans l'ordre en cas de 503 / 429 |
 | `DUREE_CIBLE_SECONDES` | `30` | ancienne durée indicative du script ; l'export final est toujours prolongé et vérifié à 61 s minimum |
 | `DUREE_MAX_SOURCE_SECONDES` | `180` | limite annoncée et appliquée par source/référence |
-| `JOB_TIMEOUT_SECONDES` | `570` | limite globale, soit 9 min 30 |
+| `JOB_TIMEOUT_SECONDES` | `1800` | limite globale, soit 30 min (bornée à 60..3600) |
 | `FFMPEG_TIMEOUT_SECONDES` | `240` | timeout d'une commande FFmpeg |
 | `GEMINI_TIMEOUT_SECONDES` | `120` | timeout d'un appel Gemini |
 | `TIKWM_TIMEOUT_SECONDES` | `30` | timeout TikWM |
@@ -193,9 +195,9 @@ Ordres de grandeur pour des sources **courtes (environ 15 à 30 s)**, réseau et
 | 1 | 2 à 4 min |
 | 5 | 4 à 7 min |
 | 10 | 7 à 10 min |
-| 20 | souvent 10 à 18 min, donc risque d'interruption à 9 min 30 |
+| 20 | souvent 10 à 20 min, donc risque d'interruption à 30 min |
 
-Des sources proches de 180 s, un Render froid, TikWM lent, les quotas Gemini ou un export 1080p augmentent fortement ces durées. Vingt longues vidéos ne peuvent pas être garanties sous 10 minutes sur 512 Mo et très peu de CPU. Le diagnostic affiché avant lancement est calculé à partir des durées FFprobe et reste une estimation, pas une promesse.
+Des sources proches de 180 s, un Render froid, TikWM lent, les quotas Gemini ou un export 1080p augmentent fortement ces durées. Vingt longues vidéos ne peuvent pas être garanties sous 30 minutes sur 512 Mo et très peu de CPU. Le diagnostic affiché avant lancement est calculé à partir des durées FFprobe et reste une estimation, pas une promesse. Il inclut désormais le contrôle qualité final, qui relit chaque plan retenu (~18 s par plan).
 
 ## Développement et tests
 
