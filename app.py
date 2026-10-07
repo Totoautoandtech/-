@@ -33,6 +33,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -42,6 +43,8 @@ import time
 import tempfile
 import uuid
 from dataclasses import dataclass, field
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from urllib.parse import quote, quote_plus, unquote, urlencode, urlparse
@@ -245,7 +248,7 @@ class Config:
             duree_max_source=entier("DUREE_MAX_SOURCE_SECONDES", 180, 15, 600),
             delai_job=entier("JOB_TIMEOUT_SECONDES", 1800, 60, 3600),
             delai_ffmpeg=entier("FFMPEG_TIMEOUT_SECONDES", 240, 30, 540),
-            delai_gemini=entier("GEMINI_TIMEOUT_SECONDES", 120, 15, 240),
+            delai_gemini=entier("GEMINI_TIMEOUT_SECONDES", 200, 15, 300),
             delai_tikwm=entier("TIKWM_TIMEOUT_SECONDES", 30, 5, 90),
             delai_telechargement=entier("DOWNLOAD_TIMEOUT_SECONDES", 120, 15, 300),
             analyses_concurrentes=entier("GEMINI_ANALYSES_CONCURRENTES", 1, 1, 2),
@@ -680,18 +683,100 @@ PROMPT_SCRIPT = (
 GEMINI_STATUTS_REESSAYABLES = {429, 500, 502, 503, 504}
 # Statuts qui signalent explicitement une saturation temporaire du modèle.
 GEMINI_STATUTS_SATURATION = {429, 503}
+PART_BUDGET_REPLI = 0.35
+BUDGET_COUPLE_MIN = 20.0
+PAUSE_MAX_RETRY_AFTER = 60.0
 GEMINI_TENTATIVES_PAR_MODELE = 5
 GEMINI_BACKOFF = (2, 4, 8, 16)
 GEMINI_MESSAGE_SATURE = "Gemini est momentanément saturé (503). Réessaie dans quelques minutes."
 
 
 class ErreurGemini(ErreurApp):
-    """Erreur d'appel Gemini enrichie du statut HTTP et du caractère « saturation »."""
+    """Erreur Gemini avec statut, saturation, caractère définitif et pause demandée."""
 
-    def __init__(self, message: str, statut: int = 0, saturation: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        statut: int = 0,
+        saturation: bool = False,
+        definitif: bool = False,
+        pause: float = 0.0,
+    ) -> None:
         super().__init__(message)
         self.statut = statut
         self.saturation = saturation
+        # Un refus de contenu ou une réponse vide ne changera pas avec un autre modèle.
+        self.definitif = definitif
+        self.pause = pause
+        self.retry_after_present = False
+
+
+def _empreinte_cle(cle: str) -> str:
+    """Empreinte courte non réversible : les journaux Render ne doivent jamais exposer une clé."""
+    return hashlib.sha256(cle.encode("utf-8")).hexdigest()[:6]
+
+
+def _pause_reessai(entete: Any) -> float:
+    """Parse Retry-After (secondes ou date HTTP) et borne la pause à 60 secondes."""
+    if entete is None:
+        return 0.0
+    valeur = str(entete).strip()
+    if not valeur:
+        return 0.0
+
+    try:
+        secondes = float(valeur)
+    except (TypeError, ValueError):
+        try:
+            date = parsedate_to_datetime(valeur)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            secondes = date.timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError, OSError):
+            return 0.0
+
+    if math.isnan(secondes):
+        return 0.0
+    if math.isinf(secondes):
+        return PAUSE_MAX_RETRY_AFTER if secondes > 0 else 0.0
+    return max(0.0, min(PAUSE_MAX_RETRY_AFTER, secondes))
+
+
+def _extraire_texte_gemini(data: Any) -> str:
+    """Concatène le texte de tous les candidats ou lève une erreur définitive explicite."""
+    candidats = data.get("candidates", []) if isinstance(data, dict) else []
+    if not isinstance(candidats, list):
+        candidats = []
+
+    morceaux: list[str] = []
+    raisons: list[str] = []
+    feedback = data.get("promptFeedback") if isinstance(data, dict) else None
+    if isinstance(feedback, dict) and feedback.get("blockReason"):
+        raisons.append(f"promptFeedback.blockReason={feedback['blockReason']}")
+
+    for candidat in candidats:
+        if not isinstance(candidat, dict):
+            continue
+        finish_reason = candidat.get("finishReason")
+        if finish_reason:
+            raisons.append(f"finishReason={finish_reason}")
+        contenu = candidat.get("content")
+        parties = contenu.get("parts", []) if isinstance(contenu, dict) else []
+        if not isinstance(parties, list):
+            continue
+        for partie in parties:
+            if isinstance(partie, dict) and isinstance(partie.get("text"), str):
+                morceaux.append(partie["text"])
+
+    texte = "".join(morceaux)
+    if texte.strip():
+        return texte
+
+    detail = ", ".join(dict.fromkeys(raisons)) or "aucun texte candidat"
+    raise ErreurGemini(
+        f"Réponse Gemini sans texte exploitable ({detail}).",
+        definitif=True,
+    )
 
 
 def _est_saturation_gemini(statut: int, texte: str) -> bool:
@@ -709,20 +794,42 @@ def _modeles_gemini() -> list[str]:
     return list(CONFIG.gemini_modeles) or [CONFIG.gemini_model]
 
 
+def _raison_erreur_gemini(exc: Exception, cles: list[str]) -> str:
+    if isinstance(exc, asyncio.TimeoutError):
+        raison = "délai de requête dépassé"
+    else:
+        raison = str(exc).strip() or type(exc).__name__
+    # Un corps de réponse ou une exception de transport ne doit jamais faire fuiter une clé.
+    for cle in sorted((c for c in cles if c), key=len, reverse=True):
+        raison = raison.replace(cle, f"[clé {_empreinte_cle(cle)}]")
+    return raison
+
+
 async def _appel_gemini_brut(
     parts: list[dict], *, temperature: float, system: Optional[str] = None, json_mode: bool = False
 ) -> str:
-    """Appelle Gemini avec repli automatique de modèle puis de clé.
+    """Appelle Gemini avec un budget par couple clé/modèle et un repli réellement atteignable.
 
-    Ordre d'essai : pour chaque clé (tirée au hasard), chaque modèle de la chaîne
-    `GEMINI_MODELES`, avec jusqu'à 5 tentatives par modèle et un backoff exponentiel
-    (2, 4, 8, 16 s) sur 503 / 429 / 500, toujours dans la limite du timeout Gemini.
+    Les clés sont mélangées, puis chaque couple reçoit sa part du budget total. Les erreurs
+    temporaires sont retentées jusqu'à cinq fois, sans qu'une requête lente puisse consommer
+    le budget réservé aux modèles et clés de secours.
     """
     cles = CONFIG.gemini_api_keys
     if not cles:
         raise ErreurApp("GEMINI_API_KEYS n'est pas configuré sur le serveur.")
 
     modeles = _modeles_gemini()
+    couples = [(cle, modele) for cle in random.sample(cles, len(cles)) for modele in modeles]
+    nb_couples = len(couples)
+    budget_total = max(15.0, float(CONFIG.delai_gemini))
+    reserve_repli = budget_total * PART_BUDGET_REPLI if nb_couples > 1 else 0.0
+    budget_principal = max(BUDGET_COUPLE_MIN, budget_total - reserve_repli)
+    budget_secours = (
+        max(BUDGET_COUPLE_MIN, reserve_repli / (nb_couples - 1))
+        if nb_couples > 1 else 0.0
+    )
+    duree_appel = max(BUDGET_COUPLE_MIN, budget_principal)
+
     payload: dict[str, Any] = {
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": temperature},
@@ -732,63 +839,143 @@ async def _appel_gemini_brut(
     if json_mode:
         payload["generationConfig"]["responseMimeType"] = "application/json"
 
-    debut = time.monotonic()
-
-    def restant() -> float:
-        return CONFIG.delai_gemini - (time.monotonic() - debut)
-
-    derniere: Optional[Exception] = None
+    echecs: list[str] = []
     saturation_vue = False
+    inepuisable = False
+    coupe_par_horloge = False
+    repli_atteint = False
 
+    # L'attente du sémaphore est hors budget : l'horloge démarre juste après son acquisition.
     async with GEMINI_SEMAPHORE:
+        debut = time.monotonic()
+        fin_totale = debut + budget_total
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=CONFIG.delai_gemini, connect=15)
+            timeout=aiohttp.ClientTimeout(total=None, connect=15)
         ) as session:
-            for cle in random.sample(cles, len(cles)):
-                headers = {"x-goog-api-key": cle, "Content-Type": "application/json"}
-                for modele in modeles:
-                    url = (
-                        "https://generativelanguage.googleapis.com/v1beta/models/"
-                        f"{modele}:generateContent"
-                    )
-                    for tentative in range(1, GEMINI_TENTATIVES_PAR_MODELE + 1):
-                        if restant() <= 1.0:
-                            break
-                        try:
-                            async with session.post(url, headers=headers, json=payload) as resp:
-                                texte = await resp.text()
-                                if resp.status == 200:
-                                    data = json.loads(texte)
-                                    return data["candidates"][0]["content"]["parts"][0]["text"]
-                                raise ErreurGemini(
-                                    f"Gemini a répondu {resp.status} : {texte[:200]}",
-                                    statut=resp.status,
-                                    saturation=_est_saturation_gemini(resp.status, texte),
-                                )
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as exc:  # noqa: BLE001
-                            derniere = exc
-                            statut = int(getattr(exc, "statut", 0) or 0)
-                            sature = bool(getattr(exc, "saturation", False))
-                            saturation_vue = saturation_vue or sature
-                            logger.warning(
-                                "[Gemini] %s (clé %s…) tentative %s/%s : %s",
-                                modele, cle[:6], tentative, GEMINI_TENTATIVES_PAR_MODELE, exc,
-                            )
-                            reessayable = statut == 0 or statut in GEMINI_STATUTS_REESSAYABLES
-                            if not reessayable or tentative >= GEMINI_TENTATIVES_PAR_MODELE:
-                                break
-                            pause = GEMINI_BACKOFF[min(tentative - 1, len(GEMINI_BACKOFF) - 1)]
-                            if restant() <= pause + 1.0:
-                                break
-                            await asyncio.sleep(pause)
-                    logger.warning("[Gemini] modèle %s indisponible, modèle suivant.", modele)
-                logger.warning("[Gemini] clé %s… épuisée, clé suivante.", cle[:6])
+            for rang, (cle, modele) in enumerate(couples):
+                maintenant = time.monotonic()
+                restant_total = fin_totale - maintenant
+                if restant_total <= 0.0:
+                    coupe_par_horloge = True
+                    break
 
+                budget_alloue = budget_principal if rang == 0 else budget_secours
+                budget_couple = min(budget_alloue, restant_total)
+                if budget_couple <= 0.0:
+                    coupe_par_horloge = True
+                    break
+                fin_couple = min(fin_totale, maintenant + budget_couple)
+
+                headers = {"x-goog-api-key": cle, "Content-Type": "application/json"}
+                url = (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{modele}:generateContent"
+                )
+                raison_couple: Optional[str] = None
+
+                for tentative in range(1, GEMINI_TENTATIVES_PAR_MODELE + 1):
+                    restant_couple = min(fin_couple, fin_totale) - time.monotonic()
+                    if restant_couple <= 0.0:
+                        coupe_par_horloge = True
+                        break
+                    timeout_total = min(duree_appel, restant_couple)
+                    if timeout_total <= 0.0:
+                        coupe_par_horloge = True
+                        break
+                    if rang > 0:
+                        repli_atteint = True
+
+                    timeout_requete = aiohttp.ClientTimeout(
+                        total=timeout_total,
+                        connect=min(15.0, timeout_total),
+                    )
+                    try:
+                        async with session.post(
+                            url, headers=headers, json=payload, timeout=timeout_requete
+                        ) as resp:
+                            texte = await resp.text()
+                            if resp.status == 200:
+                                data = json.loads(texte)
+                                return _extraire_texte_gemini(data)
+
+                            entetes = getattr(resp, "headers", {}) or {}
+                            retry_after = entetes.get("Retry-After")
+                            if retry_after is None:
+                                retry_after = entetes.get("retry-after")
+                            erreur = ErreurGemini(
+                                f"Gemini a répondu {resp.status} : {texte[:200]}",
+                                statut=resp.status,
+                                saturation=_est_saturation_gemini(resp.status, texte),
+                                pause=_pause_reessai(retry_after),
+                            )
+                            erreur.retry_after_present = (
+                                retry_after is not None and bool(str(retry_after).strip())
+                            )
+                            raise erreur
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        raison_couple = _raison_erreur_gemini(exc, cles)
+                        statut = int(getattr(exc, "statut", 0) or 0)
+                        sature = bool(getattr(exc, "saturation", False))
+                        saturation_vue = saturation_vue or sature
+                        logger.warning(
+                            "[Gemini] %s (empreinte clé %s), tentative %s/%s : %s",
+                            modele,
+                            _empreinte_cle(cle),
+                            tentative,
+                            GEMINI_TENTATIVES_PAR_MODELE,
+                            raison_couple,
+                        )
+
+                        if bool(getattr(exc, "definitif", False)):
+                            inepuisable = True
+                            break
+
+                        reessayable = statut == 0 or statut in GEMINI_STATUTS_REESSAYABLES
+                        if not reessayable or tentative >= GEMINI_TENTATIVES_PAR_MODELE:
+                            break
+
+                        if isinstance(exc, ErreurGemini) and exc.retry_after_present:
+                            pause = exc.pause
+                        else:
+                            pause = GEMINI_BACKOFF[
+                                min(tentative - 1, len(GEMINI_BACKOFF) - 1)
+                            ]
+                        restant_couple = min(fin_couple, fin_totale) - time.monotonic()
+                        if restant_couple <= 0.0 or pause >= restant_couple:
+                            coupe_par_horloge = True
+                            break
+                        if pause > 0.0:
+                            await asyncio.sleep(pause)
+
+                if raison_couple is not None:
+                    echecs.append(raison_couple)
+                    logger.warning(
+                        "[Gemini] couple modèle %s / empreinte clé %s épuisé.",
+                        modele,
+                        _empreinte_cle(cle),
+                    )
+                if inepuisable:
+                    break
+
+    resume = " | ".join(echecs[-4:])
+    if inepuisable:
+        raise ErreurApp(
+            "Gemini a refusé le contenu envoyé (filtre de sécurité ou réponse vide) : "
+            "ni un autre modèle ni une autre clé ne le traiteraient. "
+            f"Dernier retour : {resume}"
+        )
     if saturation_vue:
         raise ErreurApp(GEMINI_MESSAGE_SATURE)
-    raise ErreurApp(f"Toutes les clés Gemini ont échoué : {derniere}")
+    if coupe_par_horloge and not repli_atteint:
+        raise ErreurApp(
+            f"Délai Gemini dépassé ({budget_total:g}s) avant d'obtenir une réponse exploitable : "
+            "le repli n'a pas eu lieu. "
+            f"Derniers échecs : {resume}. Augmente GEMINI_TIMEOUT_SECONDES ou réessaie dans "
+            "quelques minutes."
+        )
+    raise ErreurApp(f"Toutes les clés Gemini ont échoué. Derniers échecs : {resume}")
 
 
 def _parser_json(brut: str) -> Any:

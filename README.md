@@ -121,7 +121,7 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 | `DUREE_MAX_SOURCE_SECONDES` | `180` | limite annoncée et appliquée par source/référence |
 | `JOB_TIMEOUT_SECONDES` | `1800` | limite globale, soit 30 min (bornée à 60..3600) |
 | `FFMPEG_TIMEOUT_SECONDES` | `240` | timeout d'une commande FFmpeg |
-| `GEMINI_TIMEOUT_SECONDES` | `120` | timeout d'un appel Gemini |
+| `GEMINI_TIMEOUT_SECONDES` | `200` | budget total Gemini (borné à 15..300 s), réparti entre les couples clé/modèle |
 | `TIKWM_TIMEOUT_SECONDES` | `30` | timeout TikWM |
 | `RELAIS_LECTURE_URL` | `https://r.jina.ai/` | relais de lecture public utilisé par la découverte RsT quand l'IP du serveur est bloquée (gratuit, sans clé) |
 | `DOWNLOAD_TIMEOUT_SECONDES` | `120` | timeout par téléchargement |
@@ -152,21 +152,35 @@ TikTok utilise `user.info.basic`. Google utilise `drive.file`, limité aux fichi
 
 Les sessions OAuth et jobs sont en mémoire. La file continue côté serveur sans dépendre de la page ouverte et une actualisation du navigateur est prise en charge. En revanche, Render Free ne garantit pas un processus continu pendant une heure : une mise en veille, un redémarrage ou un redéploiement efface la file en mémoire. Drive reste donc la récupération la plus fiable pour les vidéos déjà terminées ; l'interface n'annonce jamais qu'un lot est garanti tant que ces limites gratuites existent.
 
-## Résilience Gemini (erreurs 503 « high demand »)
+## Résilience Gemini (timeouts et chaîne de modèles/clés de secours)
 
-Gemini renvoie régulièrement `503 UNAVAILABLE — This model is currently experiencing high demand`
-lorsque le modèle demandé est temporairement saturé. L'application ne s'arrête plus là :
+Gemini renvoie parfois `503 UNAVAILABLE — This model is currently experiencing high demand`,
+`429 RESOURCE_EXHAUSTED` ou tarde à répondre. La chaîne de secours est maintenant réellement
+atteignable, même lorsqu'un premier couple clé/modèle ne répond pas :
 
-1. **Chaîne de modèles de secours** — `GEMINI_MODELES` liste les modèles essayés dans l'ordre
-   (défaut `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash`). Dès qu'un modèle répond
-   `503`, `UNAVAILABLE` ou `429`, l'appel bascule sur le modèle suivant, puis sur la clé suivante
-   de `GEMINI_API_KEYS`.
-2. **Retry renforcé** — pour les statuts `503`, `429` et `500`, jusqu'à **5 tentatives par modèle**
-   avec backoff exponentiel (2, 4, 8, 16 s), toujours dans la limite de `GEMINI_TIMEOUT_SECONDES`.
-   Une erreur définitive (`400`, clé invalide…) n'est pas réessayée : on passe directement au modèle
-   suivant.
-3. **Message clair** — si tous les modèles et toutes les clés sont saturés, l'interface affiche
-   exactement : « Gemini est momentanément saturé (503). Réessaie dans quelques minutes. »
+1. **Chaîne de secours** — `GEMINI_MODELES` liste les modèles essayés dans l'ordre (défaut
+   `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash`). Les modèles sont essayés pour une
+   clé tirée au hasard, puis la chaîne recommence avec les autres clés de `GEMINI_API_KEYS`.
+2. **Budget réparti par couple** — `GEMINI_TIMEOUT_SECONDES` vaut `200` par défaut (borné à
+   15..300 s). Si plusieurs couples clé/modèle existent, 65 % du budget sont alloués au premier
+   et 35 % sont réservés aux replis ; à 200 s, le premier couple garde ainsi 130 s (contre 120 s
+   auparavant) et 70 s restent disponibles pour la chaîne de secours. Chaque couple dispose d'au
+   moins 20 s lorsque le temps total restant le permet. Chaque requête porte son propre timeout,
+   et l'attente du sémaphore ne consomme pas ce budget. Une requête bloquée ne peut donc plus
+   empêcher tous les replis.
+3. **Retry-After et retries** — pour les erreurs temporaires (`429`, `500`, `502`, `503`, `504` et
+   erreurs de transport), jusqu'à **5 tentatives par couple**. Le délai `Retry-After` envoyé par
+   Google prime sur le backoff exponentiel (2, 4, 8, 16 s) et est plafonné à 60 s. Si cette pause
+   ne tient pas dans le budget du couple, le service passe au couple suivant quand le budget global
+   le permet. Les clés ne figurent jamais en clair dans les logs : seule une empreinte SHA-256 courte
+   est affichée.
+4. **Refus de contenu** — un blocage de sécurité ou une réponse Gemini vide est définitif : aucun
+   autre modèle ni aucune autre clé ne peut modifier ce résultat, et l'application l'indique sans
+   parler d'épuisement des clés.
+5. **Messages distincts** — une saturation générale conserve le message exact « Gemini est
+   momentanément saturé (503). Réessaie dans quelques minutes. » ; un budget dépassé avant tout
+   repli indique explicitement que le repli n'a pas eu lieu ; les autres erreurs détaillent les
+   quatre derniers échecs sans révéler de clé.
 
 `GET /api/config` expose la chaîne réellement active dans `gemini_modeles`.
 

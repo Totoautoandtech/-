@@ -1,6 +1,7 @@
 import ast
 import base64
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -577,15 +578,82 @@ def test_rst_aucune_video_trouvee_echoue_honnetement(client, monkeypatch):
 # ======================================================================================
 
 
+class _HorlogeGemini:
+    """Horloge virtuelle pour tester des timeouts longs sans attendre en temps réel."""
+
+    def __init__(self) -> None:
+        self.secondes = 0.0
+
+    def monotonic(self) -> float:
+        return self.secondes
+
+    def time(self) -> float:
+        return 1_800_000_000.0 + self.secondes
+
+    def avancer(self, secondes: float) -> None:
+        self.secondes += secondes
+
+
+class _ScenarioReponseGemini:
+    def __init__(
+        self,
+        statut: int = 200,
+        texte: str = "{}",
+        *,
+        headers: dict[str, str] | None = None,
+        delai: float = 0.0,
+        ne_repond_jamais: bool = False,
+        exception: Exception | None = None,
+    ) -> None:
+        self.statut = statut
+        self.texte = texte
+        self.headers = headers or {}
+        self.delai = delai
+        self.ne_repond_jamais = ne_repond_jamais
+        self.exception = exception
+
+
+_TIMEOUT_GEMINI_IMMEDIAT = object()
+_GEMINI_NE_REPOND_JAMAIS = object()
+
+
 class _FausseReponseGemini:
-    def __init__(self, statut: int, texte: str) -> None:
-        self.status = statut
-        self._texte = texte
+    def __init__(self, programme: _ScenarioReponseGemini, timeout, horloge=None) -> None:
+        self.status = programme.statut
+        self.headers = dict(programme.headers)
+        self._texte = programme.texte
+        self._timeout = timeout
+        self._horloge = horloge
+        self._delai = programme.delai
+        self._ne_repond_jamais = programme.ne_repond_jamais
+        self._exception = programme.exception
+
+    async def _attendre(self, secondes: float) -> None:
+        if secondes <= 0:
+            return
+        if self._horloge is not None:
+            self._horloge.avancer(secondes)
+        else:
+            await asyncio.sleep(secondes)
 
     async def text(self) -> str:
         return self._texte
 
     async def __aenter__(self):
+        if self._exception is not None:
+            raise self._exception
+
+        timeout_total = getattr(self._timeout, "total", None)
+        if self._ne_repond_jamais:
+            if timeout_total is None:
+                await asyncio.Future()
+            await self._attendre(timeout_total)
+            raise asyncio.TimeoutError()
+
+        if timeout_total is not None and self._delai > timeout_total:
+            await self._attendre(timeout_total)
+            raise asyncio.TimeoutError()
+        await self._attendre(self._delai)
         return self
 
     async def __aexit__(self, *_exc):
@@ -593,13 +661,21 @@ class _FausseReponseGemini:
 
 
 class _FausseSessionGemini:
-    """Remplace aiohttp.ClientSession : renvoie une réponse par modèle appelé."""
+    """Session aiohttp simulée, respectant le timeout de requête ou celui de session."""
 
     appels: list[str] = []
-    reponses_par_modele: dict[str, tuple[int, str]] = {}
+    details_appels: list[dict] = []
+    timeouts_requete: list[float | None] = []
+    timeouts_effectifs: list[float | None] = []
+    timeouts_session: list = []
+    reponses_par_modele: dict[str, tuple[int, str] | _ScenarioReponseGemini] = {}
+    reponses_par_cle_modele: dict[tuple[str, str], tuple[int, str] | _ScenarioReponseGemini] = {}
+    reponses_en_file: dict[tuple[str, str], list] = {}
+    horloge = None
 
-    def __init__(self, *_args, **_kwargs) -> None:
-        pass
+    def __init__(self, *_args, timeout=None, **_kwargs) -> None:
+        self._timeout_session = timeout
+        type(self).timeouts_session.append(timeout)
 
     async def __aenter__(self):
         return self
@@ -607,13 +683,38 @@ class _FausseSessionGemini:
     async def __aexit__(self, *_exc):
         return False
 
-    def post(self, url, headers=None, json=None):  # noqa: A002
+    def post(self, url, headers=None, json=None, timeout=None):  # noqa: A002
         modele = url.rsplit("/", 1)[-1].split(":", 1)[0]
+        cle = (headers or {}).get("x-goog-api-key", "")
         type(self).appels.append(modele)
-        statut, corps = type(self).reponses_par_modele.get(
-            modele, (503, '{"error":{"code":503,"message":"high demand"}}')
-        )
-        return _FausseReponseGemini(statut, corps)
+        type(self).details_appels.append({"modele": modele, "cle": cle})
+        type(self).timeouts_requete.append(getattr(timeout, "total", None))
+        timeout_effectif = timeout if timeout is not None else self._timeout_session
+        type(self).timeouts_effectifs.append(getattr(timeout_effectif, "total", None))
+
+        cle_modele = (cle, modele)
+        file = type(self).reponses_en_file.get(cle_modele, [])
+        if file:
+            action = file.pop(0)
+        else:
+            action = type(self).reponses_par_cle_modele.get(
+                cle_modele,
+                type(self).reponses_par_modele.get(
+                    modele, (503, '{"error":{"code":503,"message":"high demand"}}')
+                ),
+            )
+
+        if action is _TIMEOUT_GEMINI_IMMEDIAT:
+            programme = _ScenarioReponseGemini(exception=asyncio.TimeoutError())
+        elif action is _GEMINI_NE_REPOND_JAMAIS:
+            programme = _ScenarioReponseGemini(ne_repond_jamais=True)
+        elif isinstance(action, _ScenarioReponseGemini):
+            programme = action
+        else:
+            statut, corps = action[:2]
+            headers_reponse = action[2] if len(action) > 2 else {}
+            programme = _ScenarioReponseGemini(statut, corps, headers=headers_reponse)
+        return _FausseReponseGemini(programme, timeout_effectif, type(self).horloge)
 
 
 REPONSE_GEMINI_OK = '{"candidates":[{"content":{"parts":[{"text":"réponse modèle de secours"}]}}]}'
@@ -627,21 +728,123 @@ REPONSE_GEMINI_503 = (
 def gemini_simule(monkeypatch):
     """Isole les appels Gemini : pas de réseau, pas d'attente réelle."""
     _FausseSessionGemini.appels = []
+    _FausseSessionGemini.details_appels = []
+    _FausseSessionGemini.timeouts_requete = []
+    _FausseSessionGemini.timeouts_effectifs = []
+    _FausseSessionGemini.timeouts_session = []
     _FausseSessionGemini.reponses_par_modele = {}
+    _FausseSessionGemini.reponses_par_cle_modele = {}
+    _FausseSessionGemini.reponses_en_file = {}
+    _FausseSessionGemini.horloge = None
     monkeypatch.setattr(app.aiohttp, "ClientSession", _FausseSessionGemini)
     monkeypatch.setattr(app, "GEMINI_BACKOFF", (0, 0, 0, 0))
     monkeypatch.setattr(app.CONFIG, "gemini_api_keys", ["cle-de-test"])
-    monkeypatch.setattr(
-        app.CONFIG, "gemini_modeles", ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
-    )
+    monkeypatch.setattr(app.CONFIG, "gemini_modeles", ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"])
+    monkeypatch.setattr(app.CONFIG, "delai_gemini", 120)
     return _FausseSessionGemini
+
+
+def test_gemini_repli_est_atteignable_apres_timeouts_et_respecte_le_budget(gemini_simule, monkeypatch):
+    """Cinq erreurs de délai se replient ; un vrai appel bloqué ne mange pas la réserve."""
+    horloge = _HorlogeGemini()
+    monkeypatch.setattr(app, "time", horloge)
+    monkeypatch.setattr(app.random, "sample", lambda valeurs, _nombre: list(valeurs))
+    gemini_simule.horloge = horloge
+
+    # Le scénario de retries reste rapide : cinq timeouts simulés, puis réponse du modèle suivant.
+    gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash")] = [
+        _TIMEOUT_GEMINI_IMMEDIAT for _ in range(5)
+    ]
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash-lite": (200, REPONSE_GEMINI_OK),
+    }
+    texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+    assert texte == "réponse modèle de secours"
+    assert gemini_simule.appels[:5] == ["gemini-2.5-flash"] * 5
+    assert gemini_simule.appels[5] == "gemini-2.5-flash-lite"
+
+    # Rejoue la régression avec une fausse session qui utilise le timeout de session si
+    # timeout=... n'est pas fourni (ancien code), et celui de requête sinon (nouveau code).
+    gemini_simule.appels = []
+    gemini_simule.details_appels = []
+    gemini_simule.timeouts_requete = []
+    gemini_simule.timeouts_effectifs = []
+    gemini_simule.timeouts_session = []
+    gemini_simule.reponses_en_file = {}
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash": _GEMINI_NE_REPOND_JAMAIS,
+        "gemini-2.5-flash-lite": _ScenarioReponseGemini(
+            200, REPONSE_GEMINI_OK, delai=0.1
+        ),
+    }
+    app.CONFIG.gemini_api_keys = ["cle-1", "cle-2"]
+    app.CONFIG.gemini_modeles = [
+        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"
+    ]
+    app.CONFIG.delai_gemini = 40
+
+    async def ancienne_implementation():
+        debut = app.time.monotonic()
+        derniere = None
+        async with app.aiohttp.ClientSession(
+            timeout=app.aiohttp.ClientTimeout(total=app.CONFIG.delai_gemini, connect=15)
+        ) as session:
+            for cle in app.random.sample(app.CONFIG.gemini_api_keys, len(app.CONFIG.gemini_api_keys)):
+                for modele in app.CONFIG.gemini_modeles:
+                    if app.CONFIG.delai_gemini - (app.time.monotonic() - debut) <= 1.0:
+                        break
+                    url = (
+                        "https://generativelanguage.googleapis.com/v1beta/models/"
+                        f"{modele}:generateContent"
+                    )
+                    try:
+                        async with session.post(
+                            url,
+                            headers={"x-goog-api-key": cle},
+                            json={},
+                        ) as reponse:
+                            if reponse.status == 200:
+                                return await reponse.text()
+                    except asyncio.TimeoutError as exc:
+                        derniere = exc
+        raise app.ErreurApp(f"Toutes les clés Gemini ont échoué : {derniere}")
+
+    # Avant : une unique requête consomme les 40 s du timeout de session et le repli est sauté.
+    with pytest.raises(app.ErreurApp) as erreur_avant:
+        asyncio.run(ancienne_implementation())
+    assert str(erreur_avant.value).startswith("Toutes les clés Gemini ont échoué")
+    assert horloge.monotonic() == pytest.approx(40.0)
+    assert gemini_simule.appels == ["gemini-2.5-flash"]
+    assert gemini_simule.timeouts_requete == [None]
+    assert gemini_simule.timeouts_effectifs == [40.0]
+
+    # Après : le couple principal garde 65 % (26 s), le modèle lite répond à 26,1 s.
+    horloge.secondes = 0.0
+    gemini_simule.appels = []
+    gemini_simule.details_appels = []
+    gemini_simule.timeouts_requete = []
+    gemini_simule.timeouts_effectifs = []
+    gemini_simule.timeouts_session = []
+    texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+    assert texte == "réponse modèle de secours"
+    assert gemini_simule.appels == ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    assert horloge.monotonic() == pytest.approx(26.1)
+    assert horloge.monotonic() <= app.CONFIG.delai_gemini
+    assert gemini_simule.timeouts_requete == pytest.approx([26.0, 14.0])
+    assert gemini_simule.timeouts_session[-1].total is None
 
 
 def test_chaine_de_modeles_par_defaut_et_variable_denvironnement(monkeypatch):
     monkeypatch.delenv("GEMINI_MODELES", raising=False)
     monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_TIMEOUT_SECONDES", raising=False)
     defaut = app.Config.charger()
     assert defaut.gemini_modeles == ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    assert defaut.delai_gemini == 200
+    monkeypatch.setenv("GEMINI_TIMEOUT_SECONDES", "10")
+    assert app.Config.charger().delai_gemini == 15
+    monkeypatch.setenv("GEMINI_TIMEOUT_SECONDES", "500")
+    assert app.Config.charger().delai_gemini == 300
 
     monkeypatch.setenv("GEMINI_MODELES", "modele-a, modele-b ,")
     personnalise = app.Config.charger()
@@ -650,6 +853,8 @@ def test_chaine_de_modeles_par_defaut_et_variable_denvironnement(monkeypatch):
     render = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
     readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
     assert "GEMINI_MODELES" in render and "GEMINI_MODELES" in readme
+    assert '- key: GEMINI_TIMEOUT_SECONDES\n        value: "200"' in render
+    assert "| `GEMINI_TIMEOUT_SECONDES` | `200` |" in readme
 
 
 def test_gemini_503_bascule_sur_le_modele_suivant(gemini_simule):
@@ -706,6 +911,153 @@ def test_gemini_erreur_definitive_ne_declenche_pas_cinq_tentatives(gemini_simule
         asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
     assert "Toutes les clés Gemini ont échoué" in str(erreur.value)
     assert len(gemini_simule.appels) == 3
+
+
+def test_gemini_bascule_sur_une_autre_cle_apres_les_modeles_de_la_premiere(gemini_simule, monkeypatch):
+    monkeypatch.setattr(app.random, "sample", lambda valeurs, _nombre: list(valeurs))
+    app.CONFIG.gemini_api_keys = ["cle-premiere", "cle-seconde"]
+    modeles = list(app.CONFIG.gemini_modeles)
+    for modele in modeles:
+        gemini_simule.reponses_par_cle_modele[("cle-premiere", modele)] = (
+            400, '{"error":{"code":400,"message":"requête refusée"}}'
+        )
+    gemini_simule.reponses_par_cle_modele[("cle-seconde", modeles[0])] = (
+        200, REPONSE_GEMINI_OK
+    )
+
+    texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+
+    assert texte == "réponse modèle de secours"
+    assert [appel["cle"] for appel in gemini_simule.details_appels[:3]] == [
+        "cle-premiere"
+    ] * 3
+    assert gemini_simule.appels[:3] == modeles
+    assert gemini_simule.details_appels[3] == {
+        "modele": modeles[0], "cle": "cle-seconde"
+    }
+
+
+def test_gemini_alloue_un_timeout_positif_a_chaque_couple(gemini_simule, monkeypatch):
+    horloge = _HorlogeGemini()
+    monkeypatch.setattr(app, "time", horloge)
+    monkeypatch.setattr(app.random, "sample", lambda valeurs, _nombre: list(valeurs))
+    gemini_simule.horloge = horloge
+    app.CONFIG.gemini_api_keys = ["cle-1", "cle-2"]
+    app.CONFIG.delai_gemini = 200
+    for modele in app.CONFIG.gemini_modeles:
+        gemini_simule.reponses_par_modele[modele] = (
+            400, '{"error":{"code":400,"message":"erreur de test"}}'
+        )
+
+    with pytest.raises(app.ErreurApp):
+        asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+
+    # 200 s × 65 % pour le premier couple ; la réserve donne ici 20 s à chacun des cinq autres.
+    assert gemini_simule.timeouts_requete == pytest.approx([130.0, 20.0, 20.0, 20.0, 20.0, 20.0])
+    assert all(timeout is not None and timeout > 0 for timeout in gemini_simule.timeouts_requete)
+    assert len(gemini_simule.details_appels) == 6
+    assert gemini_simule.timeouts_session[-1].total is None
+
+
+def test_gemini_refus_safety_est_definitif_sans_repli(gemini_simule):
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash": (
+            200, '{"promptFeedback":{"blockReason":"SAFETY"}}'
+        ),
+    }
+
+    with pytest.raises(app.ErreurApp) as erreur:
+        asyncio.run(app._appel_gemini_brut([{"text": "contenu"}], temperature=0.5))
+
+    assert len(gemini_simule.appels) == 1
+    assert "Gemini a refusé le contenu envoyé" in str(erreur.value)
+    assert "SAFETY" in str(erreur.value)
+    assert "Toutes les clés Gemini ont échoué" not in str(erreur.value)
+
+
+def test_gemini_retry_after_prime_sur_le_backoff(gemini_simule, monkeypatch):
+    horloge = _HorlogeGemini()
+    monkeypatch.setattr(app, "time", horloge)
+    gemini_simule.horloge = horloge
+    monkeypatch.setattr(app, "GEMINI_BACKOFF", (2, 4, 8, 16))
+    pauses = []
+
+    async def sommeil_simule(secondes):
+        pauses.append(secondes)
+        horloge.avancer(secondes)
+
+    monkeypatch.setattr(app.asyncio, "sleep", sommeil_simule)
+    gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash")] = [
+        _ScenarioReponseGemini(
+            429,
+            '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}',
+            headers={"Retry-After": "7"},
+        ),
+        _ScenarioReponseGemini(200, REPONSE_GEMINI_OK),
+    ]
+
+    texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+
+    assert texte == "réponse modèle de secours"
+    assert pauses == [7.0]
+    assert gemini_simule.appels == ["gemini-2.5-flash", "gemini-2.5-flash"]
+
+
+def test_empreinte_cle_gemini_est_stable_et_ne_revele_pas_la_cle():
+    cle = "cle-gemini-ultra-secrete"
+    empreinte = app._empreinte_cle(cle)
+    assert empreinte == hashlib.sha256(cle.encode("utf-8")).hexdigest()[:6]
+    assert app._empreinte_cle(cle) == empreinte
+    assert cle not in empreinte
+
+
+def test_gemini_messages_distinguent_saturation_epuisement_et_delai(gemini_simule, monkeypatch):
+    horloge = _HorlogeGemini()
+    monkeypatch.setattr(app, "time", horloge)
+    monkeypatch.setattr(app.random, "sample", lambda valeurs, _nombre: list(valeurs))
+    gemini_simule.horloge = horloge
+
+    # Saturation : le message public reste strictement inchangé.
+    gemini_simule.reponses_par_modele = {
+        modele: (503, REPONSE_GEMINI_503) for modele in app.CONFIG.gemini_modeles
+    }
+    with pytest.raises(app.ErreurApp) as erreur_sature:
+        asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+    assert str(erreur_sature.value) == app.GEMINI_MESSAGE_SATURE
+
+    # Erreurs définitives HTTP ordinaires : c'est un épuisement, pas une saturation ni un délai.
+    gemini_simule.appels = []
+    gemini_simule.details_appels = []
+    gemini_simule.timeouts_requete = []
+    gemini_simule.timeouts_effectifs = []
+    gemini_simule.timeouts_session = []
+    gemini_simule.reponses_par_modele = {
+        modele: (400, '{"error":{"code":400,"message":"erreur de test"}}')
+        for modele in app.CONFIG.gemini_modeles
+    }
+    with pytest.raises(app.ErreurApp) as erreur_epuisee:
+        asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+    assert str(erreur_epuisee.value).startswith("Toutes les clés Gemini ont échoué.")
+    assert "Délai Gemini dépassé" not in str(erreur_epuisee.value)
+
+    # Un timeout sans couple de secours reçoit son propre message de délai.
+    app.CONFIG.gemini_modeles = ["gemini-2.5-flash"]
+    app.CONFIG.delai_gemini = 15
+    gemini_simule.appels = []
+    gemini_simule.details_appels = []
+    gemini_simule.timeouts_requete = []
+    gemini_simule.timeouts_effectifs = []
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash": _GEMINI_NE_REPOND_JAMAIS,
+    }
+    horloge.secondes = 0.0
+    with pytest.raises(app.ErreurApp) as erreur_delai:
+        asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+    assert str(erreur_delai.value).startswith("Délai Gemini dépassé (15s)")
+    assert "le repli n'a pas eu lieu" in str(erreur_delai.value)
+    assert "Toutes les clés Gemini ont échoué" not in str(erreur_delai.value)
+    assert gemini_simule.appels == ["gemini-2.5-flash"]
+    assert horloge.monotonic() == pytest.approx(15.0)
 
 
 # ======================================================================================
