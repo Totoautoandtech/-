@@ -1169,11 +1169,12 @@ def test_interface_contient_rst_multiple_et_voix_off():
     assert "job-card" in js and "found-bloc" in js
     assert "rst-liens" in js and "parseRstLinks" in js
 
-    # Thème noir & blanc minimal : polices Inter + DM Mono, plus de violet ni de cyan.
-    assert "Inter" in html and "DM+Mono" in html
-    assert '"Inter"' in css and '"DM Mono"' in css
+    # Thème clair « premium minimaliste » : typographie système uniquement (aucune
+    # ressource externe), accent bleu sobre, plus de violet ni de cyan.
+    assert "fonts.googleapis.com" not in html
+    assert "-apple-system" in css and "ui-monospace" in css
     assert "#7c5cff" not in css and "#43d9ff" not in css
-    assert "--accent: #ffffff;" in css
+    assert "--accent: #0071e3;" in css
 
 
 # ======================================================================================
