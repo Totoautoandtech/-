@@ -228,6 +228,30 @@ fournisseurs :
 `GET /api/fournisseurs-texte` expose l'état réel (ordre, clés présentes, quotas
 communiqués, dernière erreur) utilisé par la carte Paramètres.
 
+## IA vidéo : une idée → une vidéo
+
+L'onglet **IA vidéo** (vue Créer) part d'une simple idée (5 à 2000 caractères) :
+
+1. **Script** — l'idée est transformée en script court (titre, accroche, corps,
+   3 à 4 thèmes d'images) par le fournisseur de texte choisi (auto ou nommé,
+   voir section ci-dessus) ;
+2. **B-roll** — un thème = une recherche Pexels en portrait ; **chaque image
+   candidate est réellement regardée et validée visuellement par Gemini**
+   (fail-closed : texte incrusté, logo, flou, hors-sujet ou contrôle impossible
+   = image écartée, jamais montée) ;
+3. **Voix off générée (facultative)** — le script peut être lu par edge-tts
+   (gratuit, sans clé) ; non cochée, la vidéo reste muette et sous-titrée. Le
+   curseur n'est proposé que si le module edge-tts est présent sur le serveur
+   (état réel lu depuis `GET /api/sante`) ;
+4. **Montage** — sous-titres + voix off alignés, rendu vertical 720×1280 (ou
+   1080×1920 si activé), délai global de 30 minutes conservé.
+
+Le script complet (titre, accroche, corps, thèmes d'images) et la ligne
+« IA utilisée (texte) » sont conservés avec le travail. Gemini reste
+obligatoire pour la validation visuelle des plans, quelle que soit la
+sélection de texte. `POST /api/jobs/ia-video` accepte `idee`, `titre`,
+`style`, `voix_off` (booléen), `fournisseur` et `idempotency_key`.
+
 ## Voix off importée
 
 Les vidéos ne sont plus muettes : chaque section accepte un fichier **« Voix off · facultatif »**.

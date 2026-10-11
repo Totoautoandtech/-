@@ -1563,3 +1563,26 @@ select {
 .fournisseur-tete {
   font-weight: 650;
 }
+
+/* Case à cocher (IA vidéo : voix off générée) */
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  cursor: pointer;
+  font-size: 13.5px;
+}
+
+.check input {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.check input:disabled + span { color: var(--faint); }

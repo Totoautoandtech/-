@@ -3898,6 +3898,64 @@ async def adapter_script_sst(
     return {"hook": hook, "corps": corps, "mot_cle_broll": mot_cle}, resultat
 
 
+# =====================================================================================
+# IA VIDÉO : idée → script (fournisseur de texte) → B-roll Pexels validé visuellement
+# =====================================================================================
+
+PROMPT_IDEE = (
+    "Tu transformes une idée brute en script court pour une vidéo verticale d'environ "
+    "30 s, style documentaire narré : une accroche forte, puis un corps concret. "
+    "La vidéo sera illustrée exclusivement par de vraies images de stock libres de "
+    "droits (B-roll) : aucune personne de face n'est filmée, aucun texte incrusté, "
+    "aucun logo. Chaque thème de B-roll doit pouvoir se trouver par une recherche "
+    "visuelle simple.\n"
+    "Réponds UNIQUEMENT avec un objet JSON de cette forme exacte :\n"
+    "{\n"
+    "  \"titre\": \"titre court de 4 à 8 mots\",\n"
+    "  \"hook\": \"une phrase d'accroche de 8 à 15 mots\",\n"
+    "  \"corps\": \"4 à 6 phrases courtes, 60 à 100 mots au total\",\n"
+    "  \"requetes_broll\": [\"3 à 4 courts mots-clés visuels en anglais, chacun "
+    "indépendant, sans texte ni logo\"]\n"
+    "}\n"
+    "Rien d'autre que ce JSON, sans texte avant ou après."
+)
+
+
+async def generer_script_ia_video(
+    idee: str, fournisseur: str = "auto"
+) -> tuple[dict[str, Any], ResultatTexte]:
+    """Idée brute → script court + thèmes de B-roll, via le routeur de fournisseurs de texte.
+
+    Gemini n'intervient pas ici : le texte reste chez le fournisseur choisi
+    (auto ou nommé). La validation visuelle des plans de B-roll reste, elle,
+    exclusivement à Gemini, plus tard dans `construire_video`.
+    """
+    if not str(idee or "").strip():
+        raise ErreurApp("L'idée est requise pour l'IA vidéo.")
+    resultat = await appel_texte_fournisseur(
+        system=PROMPT_IDEE, user=str(idee).strip(), temperature=0.8,
+        json_mode=True, fournisseur=fournisseur,
+    )
+    donnees = _parser_json(resultat.texte)
+    if not isinstance(donnees, dict):
+        raise ErreurApp("Le script IA n'est pas un objet JSON exploitable.")
+    script = {
+        "titre": str(donnees.get("titre") or "").strip()[:120],
+        "hook": str(donnees.get("hook") or "").strip()[:4000],
+        "corps": str(donnees.get("corps") or "").strip()[:12000],
+        "requetes_broll": [
+            str(valeur).strip()[:120]
+            for valeur in (donnees.get("requetes_broll") or [])
+            if isinstance(valeur, (str, int, float)) and str(valeur).strip()
+        ][:6],
+    }
+    if not script["hook"] or not script["corps"]:
+        raise ErreurApp("Le script IA est incomplet : hook ou corps manquant.")
+    if not script["requetes_broll"]:
+        raise ErreurApp("Le script IA n'indique aucun thème visuel pour le B-roll.")
+    return script, resultat
+
+
 def _selectionner_sources_sst(candidats: list[dict[str, Any]], noms: list[str], limite: int, duree_max: float) -> list[dict[str, Any]]:
     """Sélectionne en tours équilibrés sans annoncer une source avant la validation IA."""
     ordonnes = _repartir_par_nom(candidats, noms)
@@ -4287,6 +4345,18 @@ class RequeteVideo(BaseModel):
     idempotency_key: str = Field(default="", max_length=80)
 
 
+class RequeteIaVideo(BaseModel):
+    """IA vidéo : une idée → script (fournisseur de texte) → B-roll Pexels
+    validé visuellement par Gemini → voix off edge-tts facultative."""
+
+    titre: str = Field(default="", max_length=120)
+    idee: str = Field(min_length=5, max_length=2000)
+    style: str = Field(default="classique", max_length=32)
+    voix_off: bool = False
+    fournisseur: str = Field(default="auto", max_length=16)
+    idempotency_key: str = Field(default="", max_length=80)
+
+
 class RequeteMontage(BaseModel):
     titre: str = Field(default="", max_length=120)
     hook: str = Field(min_length=1, max_length=4000)
@@ -4530,6 +4600,90 @@ async def _produire_video(
     return {"url": f"/videos/{chemin.name}", "path": chemin}
 
 
+async def _produire_ia_video(
+    requete: RequeteIaVideo, contexte: Optional[ContexteJob] = None, session_id: str = ""
+) -> dict[str, Any]:
+    """IA vidéo : idée → script via le fournisseur de texte choisi → B-roll Pexels
+    dont chaque image est regardée et validée visuellement par Gemini (fail-closed)
+    → voix off edge-tts facultative. Le texte est l'unique sortie du fournisseur
+    choisi ; Gemini n'écrit rien ici, il n'a que le droit de VÉRIFIER les images.
+    """
+    if not requete.idee.strip():
+        raise ErreurApp("L'idée est requise pour l'IA vidéo.")
+
+    if contexte:
+        contexte.update(statut="analysing", progress=5, detail="Rédaction du script depuis l'idée")
+    script, resultat_texte = await generer_script_ia_video(
+        requete.idee, fournisseur=fournisseur_valide(requete.fournisseur)
+    )
+    _noter_fournisseur_texte(contexte, resultat_texte)
+    hook, corps = script["hook"], script["corps"]
+    cues = _decouper_en_cues(hook, corps)
+    duree_totale = max(
+        DUREE_MIN_VIDEO_SECONDES,
+        cues[-1]["fin"] if cues else float(CONFIG.duree_cible),
+    )
+
+    # Voix off générée (facultative) : le script devient le texte dit par edge-tts.
+    # Si l'utilisateur l'a demandée et que la synthèse échoue, le travail échoue
+    # honnêtement : on ne livre pas une vidéo muette en silence.
+    chemin_voix: Optional[Path] = None
+    if requete.voix_off:
+        if contexte:
+            contexte.update(statut="analysing", progress=20, detail="Synthèse de la voix off (edge-tts)")
+        chemin_voix = DOSSIER_VIDEOS / f"{uuid.uuid4().hex}.mp3"
+        try:
+            await synthetiser_voix_off(f"{hook}. {corps}", chemin_voix)
+        except Exception:
+            chemin_voix.unlink(missing_ok=True)
+            raise
+        # Sinon le rendu final aligne l'audio sur l'image (apad / -shortest).
+
+    # B-roll : une recherche Pexels par thème du script. Chaque candidate sera
+    # réellement regardée par Gemini dans `construire_video` (fail-closed : une
+    # image non certifiée n'est jamais montée). Un thème sans résultat n'est pas
+    # fatal tant qu'un autre thème livre des images.
+    requetes_broll = script["requetes_broll"]
+    liens_broll: list[str] = []
+    duree_par_theme = max(6.0, duree_totale / len(requetes_broll))
+    for i, requete_broll in enumerate(requetes_broll, 1):
+        if contexte:
+            contexte.update(
+                statut="selecting",
+                progress=25 + min(10, 10 * i),
+                detail=f"B-roll {i}/{len(requetes_broll)} : recherche de « {requete_broll[:40]} »",
+            )
+        try:
+            liens_broll.extend(await chercher_broll(requete_broll, duree_par_theme))
+        except ErreurApp as exc:
+            logger.warning("[ia-video] thème B-roll %s écarté : %s", requete_broll, exc)
+    if not liens_broll:
+        raise ErreurApp(
+            "Aucune vidéo Pexels verticale n'a pu être trouvée pour les thèmes du "
+            "script. Précise l'idée (lieux, objets, gestes concrets) ou relance."
+        )
+
+    if contexte:
+        contexte.update(statut="editing", progress=45, detail="Téléchargement, validation visuelle et montage")
+    resolution = "1080" if CONFIG.autoriser_export_1080 else "720"
+    chemin = await construire_video(
+        liens_broll, cues, duree_totale, requete.style,
+        resolution=resolution, crf=21, voix_off=chemin_voix,
+    )
+    await envoyer_script_et_video(hook, corps, chemin)
+    sortie: dict[str, Any] = {
+        "url": f"/videos/{chemin.name}", "path": chemin,
+        "script_ia": {
+            "titre": script["titre"], "hook": hook, "corps": corps,
+            "requetes_broll": requetes_broll,
+        },
+    }
+    if chemin_voix is not None:
+        sortie["voix_url"] = f"/videos/{chemin_voix.name}"
+        sortie["voix_nom"] = "voix-off.mp3"
+    return sortie
+
+
 async def _produire_montage(
     requete: RequeteMontage, contexte: ContexteJob, session_id: str = ""
 ) -> dict[str, Any]:
@@ -4681,7 +4835,14 @@ def _demarrer_job(
     job_id = uuid.uuid4().hex
     maintenant = time.monotonic()
     titre = str(getattr(modele, "titre", "") or "").strip()
-    titre_defaut = "Création RsT" if type_job == "rst" else ("Création SsT" if type_job == "sst" else "Création vidéo")
+    if type_job == "rst":
+        titre_defaut = "Création RsT"
+    elif type_job == "sst":
+        titre_defaut = "Création SsT"
+    elif type_job == "ia-video":
+        titre_defaut = "Création IA vidéo"
+    else:
+        titre_defaut = "Création vidéo"
     JOBS[job_id] = {
         "job_id": job_id, "type": type_job, "owner": session_id, "status": "queued",
         "title": titre or (f"Création {batch_index + 1}" if batch_total > 1 else titre_defaut),
@@ -5295,6 +5456,21 @@ async def lancer_job_video(requete: RequeteVideo, request: Request):
     job_id, reused = _demarrer_job(
         "video", requete, session_id,
         lambda contexte: _produire_video(requete, contexte, session_id),
+    )
+    return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
+
+
+@app.post("/api/jobs/ia-video", status_code=202)
+async def lancer_job_ia_video(requete: RequeteIaVideo, request: Request):
+    """IA vidéo : une idée suffit ; script, B-roll validé et voix off suivent."""
+    try:
+        fournisseur_valide(requete.fournisseur)
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
+    session_id, nouveau = _session_id(request)
+    job_id, reused = _demarrer_job(
+        "ia-video", requete, session_id,
+        lambda contexte: _produire_ia_video(requete, contexte, session_id),
     )
     return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 

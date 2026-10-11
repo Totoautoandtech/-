@@ -3427,3 +3427,218 @@ def test_interface_presente_fournisseurs_texte_et_theme_noir():
     assert "fournisseurs-texte" in js
     # La ligne « IA utilisée » figure dans le suivi.
     assert "iaUtiliseeLigne" in js
+
+
+# ======================================================================================
+# IA VIDÉO : idée → script (fournisseur de texte) → B-roll Pexels validé par Gemini
+# ======================================================================================
+
+SCRIPT_IDEE_FOURNISSEUR = json.dumps(
+    {
+        "titre": "Nuit à l'aéroport",
+        "hook": "Hook de la vidéo IA.",
+        "corps": "Première phrase du corps. Deuxième phrase du corps.",
+        "requetes_broll": ["airport night", "runway lights", "", " "],
+    },
+    ensure_ascii=False,
+)
+
+
+def test_generer_script_ia_video_purge_les_themes_broll(
+    fournisseurs_simules, monkeypatch
+):
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "cle-groq-test")
+    _FausseSessionFournisseurs.defaut["api.groq.com"] = (
+        200, _corps_openai(SCRIPT_IDEE_FOURNISSEUR), {}
+    )
+    script, resultat = asyncio.run(app.generer_script_ia_video("Une idée.", "groq"))
+    assert script["titre"] == "Nuit à l'aéroport"
+    assert script["hook"].startswith("Hook de la vidéo IA")
+    # Les thèmes vides sont purgés : la liste n'invente rien.
+    assert script["requetes_broll"] == ["airport night", "runway lights"]
+    assert resultat.fournisseur == "groq"
+    assert _FausseSessionFournisseurs.appels == ["api.groq.com"]
+
+
+def test_generer_script_ia_video_refuse_une_reponse_inexploitable(
+    fournisseurs_simules, monkeypatch
+):
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "cle-groq-test")
+    _FausseSessionFournisseurs.defaut["api.groq.com"] = (
+        200, _corps_openai("pas du JSON"), {}
+    )
+    with pytest.raises(app.ErreurApp) as exc:
+        asyncio.run(app.generer_script_ia_video("Une idée.", "groq"))
+    assert "non exploitable" in str(exc.value)
+
+
+def test_ia_video_genere_la_video_complete_avec_voix_off(client, monkeypatch):
+    appels_broll = []
+    appels_construction = []
+    appels_synthese = []
+
+    async def broll_fake(mot_cle, duree_visee):
+        appels_broll.append((mot_cle, duree_visee))
+        return [f"https://pexels.test/{mot_cle.replace(' ', '-')}.mp4"]
+
+    async def construire_fake(*args, **kwargs):
+        appels_construction.append({"args": args, "kwargs": kwargs})
+        return app.DOSSIER_VIDEOS / "ia_video_test.mp4"
+
+    async def synthese_fake(texte, destination, budget=45.0):
+        appels_synthese.append(texte)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"ID3faux")
+        return destination.stat().st_size
+
+    async def envoi_fake(*_args):
+        return None
+
+    monkeypatch.setattr(app, "chercher_broll", broll_fake)
+    monkeypatch.setattr(app, "construire_video", construire_fake)
+    monkeypatch.setattr(app, "synthetiser_voix_off", synthese_fake)
+    monkeypatch.setattr(app, "envoyer_script_et_video", envoi_fake)
+    # Le script vient du fournisseur de texte choisi (Groq, épinglé) ; le fake
+    # respecte le contrat réel : thèmes vides purgés par generer_script_ia_video.
+    async def script_fake(_idee, fournisseur="auto"):
+        script = json.loads(SCRIPT_IDEE_FOURNISSEUR)
+        script["requetes_broll"] = ["airport night", "runway lights"]
+        return script, app.ResultatTexte(texte="{}", fournisseur="groq")
+
+    monkeypatch.setattr(app, "generer_script_ia_video", script_fake)
+
+    reponse = client.post(
+        "/api/jobs/ia-video",
+        json={
+            "idee": "les métiers de nuit dans un aéroport",
+            "voix_off": True,
+            "fournisseur": "groq",
+        },
+    )
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+    assert job["url"] == "/videos/ia_video_test.mp4"
+    # Le script complet est conservé avec le travail.
+    assert job["script_ia"]["titre"] == "Nuit à l'aéroport"
+    assert job["script_ia"]["requetes_broll"] == ["airport night", "runway lights"]
+    # Ligne « IA utilisée » : le fournisseur épinglé, sans bascule.
+    assert job["fournisseur_texte"] == "Groq"
+    assert job.get("bascules_fournisseur") in (None, [])
+    # Une recherche B-roll par thème, voix off synthétisée et montée.
+    assert [mot for mot, _ in appels_broll] == ["airport night", "runway lights"]
+    assert appels_synthese and "Hook de la vidéo IA" in appels_synthese[0]
+    assert appels_construction and appels_construction[0]["kwargs"]["voix_off"] is not None
+    assert job["voix_url"].endswith(".mp3")
+
+
+def test_ia_video_muette_sans_voix_off_demandee(client, monkeypatch):
+    async def broll_fake(_mot_cle, _duree_visee):
+        return ["https://pexels.test/plan.mp4"]
+
+    async def construire_fake(*_args, **kwargs):
+        return app.DOSSIER_VIDEOS / "ia_video_muette.mp4"
+
+    async def envoi_fake(*_args):
+        return None
+
+    async def script_fake(_idee, fournisseur="auto"):
+        return json.loads(SCRIPT_IDEE_FOURNISSEUR), app.ResultatTexte(texte="{}", fournisseur="groq")
+
+    monkeypatch.setattr(app, "chercher_broll", broll_fake)
+    monkeypatch.setattr(app, "construire_video", construire_fake)
+    monkeypatch.setattr(app, "envoyer_script_et_video", envoi_fake)
+    monkeypatch.setattr(app, "generer_script_ia_video", script_fake)
+
+    reponse = client.post(
+        "/api/jobs/ia-video", json={"idee": "les métiers de nuit dans un aéroport"}
+    )
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+    assert "voix_url" not in job
+
+
+def test_ia_video_aucun_theme_broll_le_dit_clairement(
+    client, fournisseurs_simules, monkeypatch
+):
+    """Le chemin réel : le fournisseur renvoie des thèmes vides → rejeté avant montage."""
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "cle-groq-test")
+    _FausseSessionFournisseurs.defaut["api.groq.com"] = (
+        200,
+        _corps_openai(json.dumps(
+            {"hook": "h", "corps": "c", "requetes_broll": ["", "  "]},
+            ensure_ascii=False,
+        )),
+        {},
+    )
+    montage_lance = []
+
+    async def construire_fake(*_args, **_kwargs):
+        montage_lance.append(True)
+        return app.DOSSIER_VIDEOS / "ia_video_ne_pas_etre.mp4"
+
+    monkeypatch.setattr(app, "construire_video", construire_fake)
+
+    reponse = client.post(
+        "/api/jobs/ia-video",
+        json={
+            "idee": "les métiers de nuit dans un aéroport",
+            "fournisseur": "groq",
+        },
+    )
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    # Le script n'a aucun thème exploitable : échec honnête avant tout montage.
+    assert job["status"] == "failed"
+    assert "aucun thème visuel" in (job.get("error") or "")
+    assert montage_lance == []
+
+
+def test_ia_video_sans_aucun_broll_echoue_sans_montage(client, monkeypatch):
+    async def script_fake(_idee, fournisseur="auto"):
+        return json.loads(SCRIPT_IDEE_FOURNISSEUR), app.ResultatTexte(texte="{}", fournisseur="groq")
+
+    async def broll_fails(_mot_cle, _duree_visee):
+        raise app.ErreurApp(f"Aucune vidéo Pexels verticale trouvée pour « {_mot_cle} ».")
+
+    montage_lance = []
+
+    async def construire_fake(*_args, **_kwargs):
+        montage_lance.append(True)
+        return app.DOSSIER_VIDEOS / "ia_video_ne_pas_etre.mp4"
+
+    monkeypatch.setattr(app, "generer_script_ia_video", script_fake)
+    monkeypatch.setattr(app, "chercher_broll", broll_fails)
+    monkeypatch.setattr(app, "construire_video", construire_fake)
+
+    reponse = client.post(
+        "/api/jobs/ia-video", json={"idee": "les métiers de nuit dans un aéroport"}
+    )
+    assert reponse.status_code == 202, reponse.text
+    job = _attendre_job(client, reponse.json()["job_id"])
+    assert job["status"] == "failed"
+    assert "Aucune vidéo Pexels verticale" in (job.get("error") or "")
+    assert montage_lance == []  # rien n'est monté sans image validée
+
+
+def test_ia_video_refuse_un_fournisseur_inconnu_au_lancement(client):
+    reponse = client.post(
+        "/api/jobs/ia-video",
+        json={"idee": "les métiers de nuit dans un aéroport", "fournisseur": "openai"},
+    )
+    assert reponse.status_code == 400
+    assert "Fournisseur de texte inconnu" in reponse.json()["detail"]
+
+
+def test_interface_presente_onglet_ia_video():
+    static = Path(__file__).parents[1] / "static"
+    index = (static / "index.html").read_text()
+    js = (static / "main.js").read_text()
+
+    assert 'data-tab="ia"' in index
+    assert 'data-tool="ia"' in index
+    assert "IA vidéo" in index
+    assert "ia-idee" in index and "btn-ia" in index and "ia-voixoff" in index
+    assert "launchJob('ia-video'" in js
+    assert "'ia-video': 'IA vidéo'" in js

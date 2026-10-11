@@ -63,6 +63,7 @@
 
   const typeLabels = {
     analyser: 'Analyse', video: 'Lien → vidéo', reference: 'Référence',
+    ia: 'IA vidéo', 'ia-video': 'IA vidéo',
     rst: 'RsT', sst: 'SsT', montage: 'Montage'
   };
 
@@ -502,7 +503,7 @@
 
   function chargerStyles(liste) {
     const styles = Array.isArray(liste) && liste.length ? liste : ['classique', 'jaune', 'centre'];
-    ['lien', 'montage'].forEach((type) => {
+    ['lien', 'ia', 'montage'].forEach((type) => {
       const conteneur = $(`styles-${type}`);
       conteneur.replaceChildren(...styles.map((style, index) => {
         const label = el('label', '', style);
@@ -1359,6 +1360,64 @@
     });
   }
 
+  /* ------------------------------------------------------------------
+     IA VIDÉO — une idée → script (fournisseur de texte) → B-roll validé
+  ------------------------------------------------------------------ */
+
+  function bindIaVideo() {
+    const button = $('btn-ia');
+    const statut = $('statut-ia');
+    const caseVoix = $('ia-voixoff');
+    const etatVoix = $('ia-voixoff-etat');
+    if (!button || !caseVoix || !etatVoix) return;
+
+    const reinitialiserVoix = () => {
+      etatVoix.textContent = caseVoix.checked
+        ? 'Le script rédigé sera lu par edge-tts : la vidéo partira avec sa voix off.'
+        : 'Non cochée : la vidéo reste muette (sous-titres uniquement).';
+    };
+
+    // La synthèse vocale n'est proposée que si le module edge-tts est réellement
+    // présent sur le serveur — état lu depuis l'API, rien d'inventé.
+    requestJSON('/api/sante').then((donnees) => {
+      caseVoix.disabled = !donnees.voix_off_generee_disponible;
+      if (caseVoix.disabled) caseVoix.checked = false;
+      if (!donnees.voix_off_generee_disponible) {
+        etatVoix.textContent = 'Synthèse vocale indisponible sur ce serveur (module edge-tts absent) : la vidéo restera muette.';
+      }
+    }).catch(() => {
+      caseVoix.disabled = true;
+      caseVoix.checked = false;
+      etatVoix.textContent = 'État de la synthèse vocale inconnu (API injoignable) : la vidéo restera muette.';
+    });
+    caseVoix.addEventListener('change', reinitialiserVoix);
+
+    button.addEventListener('click', async () => {
+      const idee = $('ia-idee').value.trim();
+      if (idee.length < 5) {
+        setStatus(statut, 'Décris ton idée en quelques mots (5 caractères minimum).', 'error');
+        return;
+      }
+      button.disabled = true;
+      setStatus(statut, 'Rédaction du script, recherche et validation des images…');
+      try {
+        await launchJob('ia-video', {
+          titre: idee.slice(0, 120),
+          idee,
+          voix_off: Boolean(caseVoix.checked),
+          style: (document.querySelector('input[name="style-ia"]:checked') || {}).value || 'classique',
+          fournisseur: settings.fournisseur,
+          idempotency_key: uuid()
+        }, statut);
+        setStatus(statut, 'Vidéo IA terminée.', 'success');
+      } catch (error) {
+        setStatus(statut, error.message, 'error');
+      } finally {
+        button.disabled = Boolean(activeJobId);
+      }
+    });
+  }
+
   function bindRst() {
     document.querySelectorAll('[data-noms]').forEach((bouton) => {
       bouton.addEventListener('click', () => {
@@ -1957,6 +2016,7 @@
     bindTabs();
     bindSettings();
     bindLienVideo();
+    bindIaVideo();
     bindRst();
     bindSst();
     bindTrainingProfiles();
