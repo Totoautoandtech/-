@@ -23,6 +23,9 @@ Variables d'environnement :
     GEMINI_MODEL      (défaut: gemini-2.5-flash)
     PEXELS_API_KEY    (obligatoire) clé gratuite sur pexels.com/api
     DUREE_CIBLE_SECONDES (défaut: 30)
+    GROQ_API_KEY      (facultatif) fournisseur de texte alternatif
+    MISTRAL_API_KEY   (facultatif) fournisseur de texte alternatif
+    FOURNISSEURS_TEXTE_ORDRE (défaut: gemini,groq,mistral) ordre de la sélection « auto »
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ import time
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -155,6 +158,54 @@ LIVRAISON_RESERVE = 15.0
 # Marge de sécurité : au-delà, la synthèse dépasserait le temps imparti sur Render Free.
 VOIX_OFF_TEXTE_MAX = 4000
 
+# ======================================================================================
+# FOURNISSEURS DE TEXTE : Gemini / Groq / Mistral (définis avant Config, qui les lit)
+# ======================================================================================
+#
+# Gemini reste obligatoire pour l'audio, la vidéo et la validation visuelle des plans.
+# Seules les tâches de TEXTE (scripts, extraction de noms, adaptations) passent par ce
+# routeur :
+#   - « auto » : les fournisseurs configurés sur le serveur, dans l'ordre défini par la
+#     variable FOURNISSEURS_TEXTE_ORDRE. Une erreur temporaire (quota 429, 5xx, délai)
+#     déclenche une bascule vers le fournisseur suivant — toujours journalisée, jamais
+#     silencieuse.
+#   - fournisseur nommé : il est utilisé tel quel, sans repli. S'il n'est pas configuré
+#     ou s'il est épuisé, le travail échoue avec un message explicite : on ne remplace
+#     jamais silencieusement le choix de l'utilisateur.
+#
+# Le quota n'est affiché que si l'API le communique réellement (en-têtes x-ratelimit-*).
+# Une « remise à zéro » (reset de la fenêtre de compteur) est distincte d'un simple
+# Retry-After : ce dernier n'est que la pause avant retente, le reset est l'instant où le
+# compteur recommence réellement. Rien n'est inventé si l'API ne dit rien.
+FOURNISSEURS_TEXTE = ("gemini", "groq", "mistral")
+LIBELLES_FOURNISSEURS_TEXTE = {"gemini": "Gemini", "groq": "Groq", "mistral": "Mistral"}
+MODELES_FOURNISSEURS_TEXTE = {
+    "groq": "llama-3.3-70b-versatile",
+    "mistral": "mistral-small-latest",
+}
+URLS_FOURNISSEURS_TEXTE = {
+    "groq": "https://api.groq.com/openai/v1/chat/completions",
+    "mistral": "https://api.mistral.ai/v1/chat/completions",
+}
+FOURNISSEURS_TEXTE_ORDRE_DEFAUT = "gemini,groq,mistral"
+FOURNISSEURS_TEXTE_TENTATIVES = 3
+FOURNISSEURS_TEXTE_BACKOFF = (2.0, 5.0)
+PAUSE_MAX_FOURNISSEUR = 60.0
+
+
+def _purer_ordre_fournisseurs_texte(brut: str) -> list[str]:
+    """Ordre séparé par des virgules, dédoublonné, limité aux fournisseurs connus.
+
+    Retourne une liste vide quand rien n'est reconnaissable : l'appelant retombe
+    alors sur l'ordre par défaut.
+    """
+    ordre: list[str] = []
+    for piece in str(brut or "").split(","):
+        nom = piece.strip().casefold()
+        if nom in FOURNISSEURS_TEXTE and nom not in ordre:
+            ordre.append(nom)
+    return ordre
+
 
 @dataclass
 class Config:
@@ -184,6 +235,9 @@ class Config:
     autoriser_export_1080: bool
     rst_candidats_max: int
     rst_sources_max: int
+    groq_api_key: str
+    mistral_api_key: str
+    fournisseurs_texte_ordre: list[str]
 
     @classmethod
     def charger(cls) -> "Config":
@@ -195,6 +249,19 @@ class Config:
         """
         cles = [c.strip() for c in _env("GEMINI_API_KEYS").split(",") if c.strip()]
         pexels = _env("PEXELS_API_KEY")
+
+        # Ordre des fournisseurs de texte (script, noms) : Gemini reste en tête par
+        # défaut ; Groq et Mistral ne participent que si leur clé est renseignée.
+        ordre_brut = _env("FOURNISSEURS_TEXTE_ORDRE")
+        ordre_texte = _purer_ordre_fournisseurs_texte(ordre_brut)
+        if ordre_brut and not ordre_texte:
+            logger.warning(
+                "FOURNISSEURS_TEXTE_ORDRE invalide (%s) : ordre par défaut %s utilisé.",
+                ordre_brut, FOURNISSEURS_TEXTE_ORDRE_DEFAUT,
+            )
+            ordre_texte = _purer_ordre_fournisseurs_texte(FOURNISSEURS_TEXTE_ORDRE_DEFAUT)
+        if not ordre_texte:
+            ordre_texte = _purer_ordre_fournisseurs_texte(FOURNISSEURS_TEXTE_ORDRE_DEFAUT)
 
         # Chaîne de modèles de secours : si le premier renvoie 503 (surcharge temporaire),
         # l'appel bascule automatiquement sur le suivant avant de changer de clé.
@@ -258,6 +325,9 @@ class Config:
             autoriser_export_1080=_env("AUTORISER_EXPORT_1080", "false").lower() in {"1", "true", "oui"},
             rst_candidats_max=entier("RST_CANDIDATS_MAX", 40, 10, 60),
             rst_sources_max=entier("RST_SOURCES_MAX", 20, 5, 20),
+            groq_api_key=_env("GROQ_API_KEY"),
+            mistral_api_key=_env("MISTRAL_API_KEY"),
+            fournisseurs_texte_ordre=ordre_texte,
         )
 
 
@@ -992,19 +1062,468 @@ def _parser_json(brut: str) -> Any:
         raise ErreurApp(f"Réponse IA non exploitable : {brut[:200]}") from exc
 
 
-async def generer_script(source_texte: str) -> dict[str, str]:
-    brut = await _appel_gemini_brut(
-        [{"text": source_texte}], temperature=0.8, system=PROMPT_SCRIPT, json_mode=True
+# ======================================================================================
+# ROUTEUR DE TEXTE : Gemini / Groq / Mistral (voir les règles en tête de fichier)
+# ======================================================================================
+
+
+class ErreurFournisseurTexte(ErreurApp):
+    """Échec d'un fournisseur de texte, avec sa nature temporaire ou définitive."""
+
+    def __init__(self, message: str, statut: int = 0, temporaire: bool = True) -> None:
+        super().__init__(message)
+        self.statut = statut
+        self.temporaire = temporaire
+        # Pause demandée par l'API (Retry-After) — distincte du reset de la fenêtre.
+        self.retry_after = 0.0
+
+
+@dataclass
+class EtatQuota:
+    """Ce que l'API a réellement communiqué pour un fournisseur — jamais inventé.
+
+    `reset_iso`/`reset_unix` : l'instant où la fenêtre de quota recommence (distinct
+    d'un simple Retry-After). `None` = l'API ne communique rien à ce sujet.
+    """
+
+    restant: Optional[int] = None
+    limite: Optional[int] = None
+    reset_iso: Optional[str] = None
+    reset_unix: Optional[float] = None
+    maj_unix: float = 0.0
+    derniere_erreur: str = ""
+
+
+QUOTAS_FOURNISSEURS: dict[str, EtatQuota] = {}
+
+
+def _entete_insensible(entetes: Any, *noms: str) -> Optional[str]:
+    """Lit un en-tête HTTP de façon insensible à la casse (CIMultiDict ou dict simple)."""
+    if not entetes:
+        return None
+    for nom in noms:
+        try:
+            valeur = entetes.get(nom)
+        except AttributeError:
+            valeur = None
+        if valeur:
+            return str(valeur)
+    try:
+        items = list(entetes.items())
+    except AttributeError:
+        return None
+    cherches = {nom.lower() for nom in noms}
+    for cle, valeur in items:
+        if str(cle).lower() in cherches and valeur:
+            return str(valeur)
+    return None
+
+
+def _entier_quota(valeur: Any) -> Optional[int]:
+    try:
+        return int(str(valeur).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _date_reset(valeur: Any) -> tuple[Optional[str], Optional[float]]:
+    """Parse le reset communiqué par l'API (ISO 8601 ou secondes) → (iso, unix)."""
+    texte = str(valeur or "").strip()
+    if not texte:
+        return None, None
+    if re.fullmatch(r"\d+(\.\d+)?", texte):
+        unix = time.time() + float(texte)
+    else:
+        try:
+            date = datetime.fromisoformat(texte.replace("Z", "+00:00"))
+        except ValueError:
+            return None, None
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=timezone.utc)
+        unix = date.timestamp()
+    return datetime.fromtimestamp(unix, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), unix
+
+
+def _enregistrer_quota(fournisseur: str, entetes: Any, corps: str = "") -> None:
+    """Conserve UNIQUEMENT ce que l'API communique (x-ratelimit-*) — sinon rien.
+
+    Le reset de fenêtre est enregistré séparément d'un Retry-After : attendre
+    « Retry-After: 1 » ne veut jamais dire que le quota a été remis à zéro.
+    """
+    etat = QUOTAS_FOURNISSEURS.get(fournisseur) or EtatQuota()
+    restant = _entier_quota(_entete_insensible(entetes, "x-ratelimit-remaining-requests"))
+    limite = _entier_quota(_entete_insensible(entetes, "x-ratelimit-limit-requests"))
+    reset_iso, reset_unix = _date_reset(
+        _entete_insensible(entetes, "x-ratelimit-reset-requests")
     )
-    resultat = _parser_json(brut)
-    if not isinstance(resultat, dict):
+    if reset_iso is None and corps:
+        try:
+            donnees = json.loads(corps)
+            source = donnees.get("rate_limit") if isinstance(donnees, dict) else None
+            if isinstance(source, dict):
+                reset_iso, reset_unix = _date_reset(source.get("reset"))
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    if restant is not None:
+        etat.restant = restant
+    if limite is not None:
+        etat.limite = limite
+    if reset_iso is not None:
+        etat.reset_iso, etat.reset_unix = reset_iso, reset_unix
+    etat.maj_unix = time.time()
+    QUOTAS_FOURNISSEURS[fournisseur] = etat
+
+
+def _noter_erreur_fournisseur(fournisseur: str, message: str) -> None:
+    etat = QUOTAS_FOURNISSEURS.get(fournisseur) or EtatQuota()
+    etat.derniere_erreur = str(message)[:200]
+    etat.maj_unix = time.time()
+    QUOTAS_FOURNISSEURS[fournisseur] = etat
+
+
+def _fournisseur_configure(nom: str) -> bool:
+    """La clé de ce fournisseur est-elle réellement présente côté serveur ?"""
+    if nom == "gemini":
+        return bool(CONFIG.gemini_api_keys)
+    if nom == "groq":
+        return bool(CONFIG.groq_api_key)
+    if nom == "mistral":
+        return bool(CONFIG.mistral_api_key)
+    return False
+
+
+def _ordre_fournisseurs_texte() -> list[str]:
+    return list(CONFIG.fournisseurs_texte_ordre) or list(FOURNISSEURS_TEXTE)
+
+
+def fournisseur_valide(valeur: Any) -> str:
+    """« auto » ou un fournisseur connu, sinon ErreurApp explicite."""
+    nom = str(valeur or "auto").strip().casefold()
+    if nom not in ("auto", *FOURNISSEURS_TEXTE):
+        raise ErreurApp(
+            f"Fournisseur de texte inconnu « {valeur} » : valeurs attendues auto, "
+            "gemini, groq, mistral."
+        )
+    return nom
+
+
+def _raison_erreur_fournisseur(cle: str, exc: Exception) -> str:
+    if isinstance(exc, asyncio.TimeoutError):
+        raison = "délai de requête dépassé"
+    else:
+        raison = str(exc).strip() or type(exc).__name__
+    # La clé ne doit jamais figurer en clair dans un message ou un journal.
+    if cle:
+        raison = raison.replace(cle, f"[clé {_empreinte_cle(cle)}]")
+    return raison
+
+
+def _extraire_contenu_openai(texte: str) -> str:
+    """Le contenu d'une réponse compatible OpenAI, ou une chaîne vide."""
+    try:
+        donnees = json.loads(texte)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    choix = donnees.get("choices") if isinstance(donnees, dict) else None
+    if not isinstance(choix, list) or not choix or not isinstance(choix[0], dict):
+        return ""
+    message = choix[0].get("message")
+    if not isinstance(message, dict):
+        return ""
+    return str(message.get("content") or "").strip()
+
+
+async def _appel_openai_compatible(
+    fournisseur: str,
+    messages: list[dict],
+    *,
+    temperature: float,
+    json_mode: bool,
+    budget: float,
+) -> str:
+    """Appel Groq ou Mistral (API compatible OpenAI), clé strictement côté serveur.
+
+    Jusqu'à `FOURNISSEURS_TEXTE_TENTATIVES` tentatives. La pause avant retente suit
+    l'ordre : Retry-After de l'API, puis le reset communiqué s'il n'y en a pas, puis
+    le backoff borné — un reset n'est jamais traité comme un simple Retry-After.
+    """
+    cle = CONFIG.groq_api_key if fournisseur == "groq" else CONFIG.mistral_api_key
+    libelle = LIBELLES_FOURNISSEURS_TEXTE[fournisseur]
+    url = URLS_FOURNISSEURS_TEXTE[fournisseur]
+    payload: dict[str, Any] = {
+        "model": MODELES_FOURNISSEURS_TEXTE[fournisseur],
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+
+    debut = time.monotonic()
+    echecs: list[str] = []
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=None, connect=15)
+    ) as session:
+        for tentative in range(1, FOURNISSEURS_TEXTE_TENTATIVES + 1):
+            restant = budget - (time.monotonic() - debut)
+            if restant <= 1.0:
+                break
+            timeout_total = min(120.0, restant)
+            try:
+                async with session.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {cle}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(
+                        total=timeout_total, connect=min(15.0, timeout_total)
+                    ),
+                ) as resp:
+                    texte = await resp.text()
+                    entetes = getattr(resp, "headers", {})
+                    _enregistrer_quota(fournisseur, entetes, texte)
+                    if resp.status == 200:
+                        contenu = _extraire_contenu_openai(texte)
+                        if not contenu:
+                            raise ErreurFournisseurTexte(
+                                f"{libelle} a répondu sans texte exploitable.",
+                                statut=200, temporaire=False,
+                            )
+                        return contenu
+                    if resp.status in (401, 403):
+                        variable = (
+                            "GROQ_API_KEY" if fournisseur == "groq" else "MISTRAL_API_KEY"
+                        )
+                        raise ErreurFournisseurTexte(
+                            f"{libelle} a refusé la clé ({resp.status}) : vérifie "
+                            f"{variable} sur le serveur. {texte[:160]}",
+                            statut=resp.status, temporaire=False,
+                        )
+                    temporaire = resp.status in (429, 500, 502, 503, 504)
+                    erreur = ErreurFournisseurTexte(
+                        f"{libelle} a répondu {resp.status} : {texte[:160]}",
+                        statut=resp.status, temporaire=temporaire,
+                    )
+                    erreur.retry_after = _pause_reessai(
+                        _entete_insensible(entetes, "Retry-After", "retry-after")
+                    )
+                    raise erreur
+            except asyncio.CancelledError:
+                raise
+            except ErreurFournisseurTexte as exc:
+                echecs.append(str(exc))
+                _noter_erreur_fournisseur(fournisseur, str(exc))
+                if not exc.temporaire:
+                    raise
+                if tentative >= FOURNISSEURS_TEXTE_TENTATIVES:
+                    break
+                await _pause_fournisseur(fournisseur, tentative, budget, debut, exc)
+            except Exception as exc:  # noqa: BLE001 — erreurs de transport
+                raison = _raison_erreur_fournisseur(cle, exc)
+                echecs.append(raison)
+                _noter_erreur_fournisseur(fournisseur, raison)
+                if tentative >= FOURNISSEURS_TEXTE_TENTATIVES:
+                    break
+                restant = budget - (time.monotonic() - debut)
+                if restant <= 1.0:
+                    break
+                pause = FOURNISSEURS_TEXTE_BACKOFF[
+                    min(tentative - 1, len(FOURNISSEURS_TEXTE_BACKOFF) - 1)
+                ]
+                if pause < restant:
+                    await asyncio.sleep(pause)
+    raise ErreurFournisseurTexte(
+        f"{libelle} indisponible après {FOURNISSEURS_TEXTE_TENTATIVES} tentative(s). "
+        f"Derniers échecs : {' | '.join(echecs[-3:])}",
+        statut=0, temporaire=True,
+    )
+
+
+async def _pause_fournisseur(
+    fournisseur: str, tentative: int, budget: float, debut: float,
+    exc: ErreurFournisseurTexte,
+) -> None:
+    """Pause avant retente d'un fournisseur.
+
+    Le Retry-After de l'API prime. À défaut, on attend le reset communiqué de la
+    fenêtre si elle est proche — retenter avant la remise à zéro ne sert à rien —
+    sinon le backoff borné. On n'attend jamais au-delà du reset ni du budget.
+    """
+    restant = budget - (time.monotonic() - debut)
+    if restant <= 1.0:
+        return
+    reset_unix = (QUOTAS_FOURNISSEURS.get(fournisseur) or EtatQuota()).reset_unix
+    reset_dans = (reset_unix - time.time()) if reset_unix else None
+    if exc.retry_after and exc.retry_after > 0:
+        pause: float = exc.retry_after
+    elif reset_dans is not None and reset_dans > 0:
+        pause = min(reset_dans, PAUSE_MAX_FOURNISSEUR)
+    else:
+        pause = FOURNISSEURS_TEXTE_BACKOFF[
+            min(tentative - 1, len(FOURNISSEURS_TEXTE_BACKOFF) - 1)
+        ]
+    if reset_dans is not None and reset_dans > 0:
+        pause = min(pause, reset_dans)
+    pause = max(0.0, min(pause, PAUSE_MAX_FOURNISSEUR, restant))
+    if pause > 0:
+        await asyncio.sleep(pause)
+
+
+async def _appel_gemini_texte(
+    *, system: str, user: str, temperature: float, json_mode: bool
+) -> str:
+    """Gemini pour les tâches de texte (les tâches visuelles passent toujours par
+    `_appel_gemini_brut` directement).
+
+    Un refus de contenu est définitif : aucun autre fournisseur ne modifiera le
+    résultat, donc pas de bascule. Saturation, épuisement ou délai dépassé sont
+    temporaires : la bascule vers le fournisseur suivant est possible.
+    """
+    try:
+        return await _appel_gemini_brut(
+            [{"text": user}], temperature=temperature, system=system, json_mode=json_mode
+        )
+    except asyncio.CancelledError:
+        raise
+    except ErreurApp as exc:
+        if str(exc).startswith("Gemini a refusé le contenu"):
+            raise
+        raise ErreurFournisseurTexte(str(exc), temporaire=True) from exc
+
+
+@dataclass
+class ResultatTexte:
+    texte: str
+    fournisseur: str
+    bascules: list[str] = field(default_factory=list)
+
+
+def _resume_bascule(exc: ErreurFournisseurTexte) -> str:
+    message = str(exc)
+    for marqueur, resume in (
+        ("429", "quota 429"), ("503", "503"), ("502", "502"), ("500", "500"),
+        ("saturé", "saturation"),
+    ):
+        if marqueur in message:
+            return resume
+    bas = message.lower()
+    if "délai" in bas or "timeout" in bas or "temps" in bas:
+        return "délai dépassé"
+    return "échec temporaire"
+
+
+async def appel_texte_fournisseur(
+    *, system: str = "", user: str, temperature: float,
+    json_mode: bool = True, fournisseur: str = "auto",
+) -> ResultatTexte:
+    """Génération de texte routée entre Gemini, Groq et Mistral.
+
+    « auto » suit l'ordre FOURNISSEURS_TEXTE_ORDRE (fournisseurs configurés seulement)
+    et bascule, en le journalisant, sur le fournisseur suivant après une erreur
+    temporaire. Un fournisseur nommé est utilisé tel quel : s'il n'est pas configuré
+    ou s'il échoue, erreur explicite — jamais de remplacement silencieux.
+    """
+    nom = fournisseur_valide(fournisseur)
+    if nom == "auto":
+        chaine = [p for p in _ordre_fournisseurs_texte() if _fournisseur_configure(p)]
+        if not chaine:
+            raise ErreurApp(
+                "Aucun fournisseur de texte configuré sur le serveur : renseigne "
+                "GEMINI_API_KEYS, GROQ_API_KEY ou MISTRAL_API_KEY dans Render."
+            )
+    else:
+        if not _fournisseur_configure(nom):
+            raise ErreurApp(
+                f"Le fournisseur de texte « {LIBELLES_FOURNISSEURS_TEXTE[nom]} » n'est "
+                "pas configuré sur le serveur (clé manquante). Choisis « Auto » ou un "
+                "autre fournisseur dans Paramètres."
+            )
+        chaine = [nom]
+
+    messages: list[dict] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user})
+    budget = max(15.0, float(CONFIG.delai_gemini))
+    bascules: list[str] = []
+
+    for position, fourni in enumerate(chaine):
+        try:
+            if fourni == "gemini":
+                texte = await _appel_gemini_texte(
+                    system=system, user=user, temperature=temperature, json_mode=json_mode
+                )
+            else:
+                texte = await _appel_openai_compatible(
+                    fourni, messages, temperature=temperature,
+                    json_mode=json_mode, budget=budget,
+                )
+            return ResultatTexte(
+                texte=texte.strip(), fournisseur=fourni, bascules=list(bascules)
+            )
+        except asyncio.CancelledError:
+            raise
+        except ErreurFournisseurTexte as exc:
+            if not exc.temporaire:
+                raise ErreurApp(str(exc)) from exc
+            if position + 1 < len(chaine):
+                suivant = chaine[position + 1]
+                logger.warning(
+                    "[Fournisseurs texte] bascule %s → %s : %s",
+                    LIBELLES_FOURNISSEURS_TEXTE[fourni],
+                    LIBELLES_FOURNISSEURS_TEXTE[suivant],
+                    str(exc)[:200],
+                )
+                bascules.append(
+                    f"{LIBELLES_FOURNISSEURS_TEXTE[fourni]} → "
+                    f"{LIBELLES_FOURNISSEURS_TEXTE[suivant]} ({_resume_bascule(exc)})"
+                )
+                continue
+            raise ErreurApp(
+                f"{exc} Aucun fournisseur de repli n'était configuré après "
+                f"« {LIBELLES_FOURNISSEURS_TEXTE[fourni]} »."
+            ) from exc
+    raise ErreurApp("Tous les fournisseurs de texte ont échoué.")
+
+
+def _noter_fournisseur_texte(
+    contexte: Optional["ContexteJob"], resultat: Optional[ResultatTexte]
+) -> None:
+    """Trace dans le job quelle IA a écrit le texte (et les bascules survenues) :
+    c'est la ligne « IA utilisée » que l'affiche le suivi."""
+    if contexte is None or resultat is None:
+        return
+    job = contexte.job
+    utilises: list[str] = list(job.get("fournisseurs_texte_utilises") or [])
+    if resultat.fournisseur not in utilises:
+        utilises.append(resultat.fournisseur)
+    bascules: list[str] = list(job.get("bascules_fournisseur") or [])
+    for bascule in resultat.bascules:
+        if bascule not in bascules:
+            bascules.append(bascule)
+    contexte.update(
+        fournisseur_texte=", ".join(LIBELLES_FOURNISSEURS_TEXTE[n] for n in utilises),
+        fournisseurs_texte_utilises=utilises,
+        bascules_fournisseur=bascules,
+    )
+
+
+async def generer_script(source_texte: str, fournisseur: str = "auto") -> tuple[dict[str, str], ResultatTexte]:
+    """Rédige le script (hook, corps, thème visuel) avec le fournisseur choisi."""
+    resultat = await appel_texte_fournisseur(
+        system=PROMPT_SCRIPT, user=source_texte, temperature=0.8,
+        json_mode=True, fournisseur=fournisseur,
+    )
+    script = _parser_json(resultat.texte)
+    if not isinstance(script, dict):
         raise ErreurApp("Réponse IA non exploitable : un objet JSON était attendu.")
     for cle in ("hook", "corps", "mot_cle_broll"):
-        valeur = resultat.get(cle)
+        valeur = script.get(cle)
         if not isinstance(valeur, str) or not valeur.strip():
             raise ErreurApp(f"Réponse IA incomplète : « {cle} » manquant.")
-        resultat[cle] = valeur.strip()
-    return resultat
+        script[cle] = valeur.strip()
+    return script, resultat
 
 
 PROMPT_NOMS_RST = (
@@ -1060,34 +1579,36 @@ def borner_nombre_noms_rst(valeur: Any) -> int:
 
 
 async def extraire_noms_rst(
-    legende: str, nombre: int = RST_NOMS_DEFAUT, mot_cle_broll: str = ""
-) -> list[str]:
+    legende: str, nombre: int = RST_NOMS_DEFAUT, mot_cle_broll: str = "",
+    fournisseur: str = "auto",
+) -> tuple[list[str], Optional[ResultatTexte]]:
     """Extrait de la légende les `nombre` noms les plus importants (TOP N).
 
-    L'IA est interrogée en premier car elle reconnaît les noms propres ; si elle échoue
-    ou renvoie une liste vide, on retombe sur les mots-clés réellement présents dans la
-    légende. Aucun nom n'est inventé : la liste peut être plus courte que demandée.
+    L'IA de texte (fournisseur choisi) est interrogée en premier car elle reconnaît les
+    noms propres ; si elle échoue ou renvoie une liste vide, on retombe sur les
+    mots-clés réellement présents dans la légende. Aucun nom n'est inventé : la liste
+    peut être plus courte que demandée. Retourne (noms, résultat IA ou None).
     """
     limite = borner_nombre_noms_rst(nombre)
     noms: list[str] = []
+    resultat: Optional[ResultatTexte] = None
     try:
-        brut = await _appel_gemini_brut(
-            [{"text": legende}],
-            temperature=0.2,
-            system=PROMPT_NOMS_RST.format(nombre=limite),
-            json_mode=True,
+        resultat = await appel_texte_fournisseur(
+            system=PROMPT_NOMS_RST.format(nombre=limite), user=legende,
+            temperature=0.2, json_mode=True, fournisseur=fournisseur,
         )
-        resultat = _parser_json(brut)
-        if isinstance(resultat, dict):
-            noms = _deduplique_noms(resultat.get("noms") or [], limite)
+        donnees = _parser_json(resultat.texte)
+        if isinstance(donnees, dict):
+            noms = _deduplique_noms(donnees.get("noms") or [], limite)
     except (ErreurApp, ErreurMontage) as exc:
         logger.warning("[RsT] extraction des noms par l'IA indisponible : %s", exc)
+        resultat = None
 
     if len(noms) < limite:
         # Repli honnête : hashtags, thème visuel puis mots fréquents de la vraie légende.
         complement = _extraire_mots_cles_rst(legende, mot_cle_broll, limite=limite * 2)
         noms = _deduplique_noms([*noms, *complement], limite)
-    return noms
+    return noms, resultat
 
 
 # ======================================================================================
@@ -1133,7 +1654,11 @@ async def _transcrire_video(video_path: Path) -> str:
     )
 
 
-async def generer_script_depuis_reference(lien: str) -> dict[str, str]:
+async def generer_script_depuis_reference(
+    lien: str, fournisseur: str = "auto"
+) -> tuple[dict[str, str], ResultatTexte]:
+    """Reprend le script d'une vidéo : la transcription (audio) reste chez Gemini,
+    seule la réécriture du script passe par le fournisseur de texte choisi."""
     _verifier_ffmpeg()
     dossier = DOSSIER_TRAVAIL / uuid.uuid4().hex
     dossier.mkdir(parents=True, exist_ok=True)
@@ -1145,18 +1670,19 @@ async def generer_script_depuis_reference(lien: str) -> dict[str, str]:
         if not transcript.strip():
             raise ErreurApp("Transcription vide : impossible de lire ce qui est dit dans la vidéo.")
 
-        brut = await _appel_gemini_brut(
-            [{"text": transcript}], temperature=0.7, system=PROMPT_REFERENCE, json_mode=True
+        resultat = await appel_texte_fournisseur(
+            system=PROMPT_REFERENCE, user=transcript, temperature=0.7,
+            json_mode=True, fournisseur=fournisseur,
         )
-        resultat = _parser_json(brut)
-        if not isinstance(resultat, dict):
+        script = _parser_json(resultat.texte)
+        if not isinstance(script, dict):
             raise ErreurApp("Réponse IA non exploitable : un objet JSON était attendu.")
         for cle in ("hook", "corps", "mot_cle_broll"):
-            valeur = resultat.get(cle)
+            valeur = script.get(cle)
             if not isinstance(valeur, str) or not valeur.strip():
                 raise ErreurApp(f"Réponse IA incomplète : « {cle} » manquant.")
-            resultat[cle] = valeur.strip()
-        return resultat
+            script[cle] = valeur.strip()
+        return script, resultat
     finally:
         shutil.rmtree(dossier, ignore_errors=True)
 
@@ -2639,14 +3165,18 @@ async def _produire_rst(
         }
 
         contexte.update(statut="analysing", progress=12, detail="Rédaction du script à partir de la légende")
-        script = await generer_script(legende)
+        script, resultat_texte = await generer_script(legende, requete.fournisseur)
+        _noter_fournisseur_texte(contexte, resultat_texte)
         contexte.update(
             statut="analysing", progress=18, detail="Script prêt — extraction des noms à chercher",
             script=script, seed=seed_infos,
         )
 
         # TOP N : 3 ou 5 noms tirés de la vraie légende, chacun cherché séparément.
-        noms = await extraire_noms_rst(legende, nombre_noms, script.get("mot_cle_broll", ""))
+        noms, resultat_noms = await extraire_noms_rst(
+            legende, nombre_noms, script.get("mot_cle_broll", ""), requete.fournisseur
+        )
+        _noter_fournisseur_texte(contexte, resultat_noms)
         contexte.update(
             statut="analysing", progress=20,
             detail=(
@@ -3333,23 +3863,30 @@ def _noms_sst_valides(noms: Any, nombre: Any) -> list[str]:
     return resultat
 
 
-async def adapter_script_sst(source: str, noms: list[str]) -> dict[str, str]:
+async def adapter_script_sst(
+    source: str, noms: list[str], fournisseur: str = "auto"
+) -> tuple[dict[str, str], Optional[ResultatTexte]]:
     """Adapte un texte sans jamais déléguer le choix des noms à l'IA."""
     prompt = PROMPT_ADAPTATION_SST.format(
         nombre=len(noms), noms=json.dumps(noms, ensure_ascii=False), source=source[:6000]
     )
+    resultat: Optional[ResultatTexte] = None
     try:
-        brut = await _appel_gemini_brut([{"text": prompt}], temperature=0.2, json_mode=True)
-        resultat = _parser_json(brut)
-        if not isinstance(resultat, dict):
+        resultat = await appel_texte_fournisseur(
+            system="", user=prompt, temperature=0.2,
+            json_mode=True, fournisseur=fournisseur,
+        )
+        donnees = _parser_json(resultat.texte)
+        if not isinstance(donnees, dict):
             raise ErreurApp("Réponse SsT non exploitable.")
-        hook = str(resultat.get("hook") or "").strip()
-        corps = str(resultat.get("corps") or "").strip()
-        mot_cle = str(resultat.get("mot_cle_broll") or "").strip() or "sujet principal"
+        hook = str(donnees.get("hook") or "").strip()
+        corps = str(donnees.get("corps") or "").strip()
+        mot_cle = str(donnees.get("mot_cle_broll") or "").strip() or "sujet principal"
         if not hook or not corps:
             raise ErreurApp("Réponse SsT incomplète.")
     except Exception as exc:  # repli déterministe, sans création de nom
         logger.warning("Adaptation SsT IA indisponible, repli contrôlé : %s", exc)
+        resultat = None
         hook = f"TOP {len(noms)} : {noms[0]} et les autres"
         corps = "Voici les sujets demandés : " + ", ".join(noms) + ". " + source[:500]
         mot_cle = noms[0]
@@ -3358,7 +3895,65 @@ async def adapter_script_sst(source: str, noms: list[str]) -> dict[str, str]:
     manquants = [nom for nom in noms if nom.casefold() not in f"{hook} {corps}".casefold()]
     if manquants:
         corps = f"{corps.rstrip('.')} . " + " . ".join(manquants)
-    return {"hook": hook, "corps": corps, "mot_cle_broll": mot_cle}
+    return {"hook": hook, "corps": corps, "mot_cle_broll": mot_cle}, resultat
+
+
+# =====================================================================================
+# IA VIDÉO : idée → script (fournisseur de texte) → B-roll Pexels validé visuellement
+# =====================================================================================
+
+PROMPT_IDEE = (
+    "Tu transformes une idée brute en script court pour une vidéo verticale d'environ "
+    "30 s, style documentaire narré : une accroche forte, puis un corps concret. "
+    "La vidéo sera illustrée exclusivement par de vraies images de stock libres de "
+    "droits (B-roll) : aucune personne de face n'est filmée, aucun texte incrusté, "
+    "aucun logo. Chaque thème de B-roll doit pouvoir se trouver par une recherche "
+    "visuelle simple.\n"
+    "Réponds UNIQUEMENT avec un objet JSON de cette forme exacte :\n"
+    "{\n"
+    "  \"titre\": \"titre court de 4 à 8 mots\",\n"
+    "  \"hook\": \"une phrase d'accroche de 8 à 15 mots\",\n"
+    "  \"corps\": \"4 à 6 phrases courtes, 60 à 100 mots au total\",\n"
+    "  \"requetes_broll\": [\"3 à 4 courts mots-clés visuels en anglais, chacun "
+    "indépendant, sans texte ni logo\"]\n"
+    "}\n"
+    "Rien d'autre que ce JSON, sans texte avant ou après."
+)
+
+
+async def generer_script_ia_video(
+    idee: str, fournisseur: str = "auto"
+) -> tuple[dict[str, Any], ResultatTexte]:
+    """Idée brute → script court + thèmes de B-roll, via le routeur de fournisseurs de texte.
+
+    Gemini n'intervient pas ici : le texte reste chez le fournisseur choisi
+    (auto ou nommé). La validation visuelle des plans de B-roll reste, elle,
+    exclusivement à Gemini, plus tard dans `construire_video`.
+    """
+    if not str(idee or "").strip():
+        raise ErreurApp("L'idée est requise pour l'IA vidéo.")
+    resultat = await appel_texte_fournisseur(
+        system=PROMPT_IDEE, user=str(idee).strip(), temperature=0.8,
+        json_mode=True, fournisseur=fournisseur,
+    )
+    donnees = _parser_json(resultat.texte)
+    if not isinstance(donnees, dict):
+        raise ErreurApp("Le script IA n'est pas un objet JSON exploitable.")
+    script = {
+        "titre": str(donnees.get("titre") or "").strip()[:120],
+        "hook": str(donnees.get("hook") or "").strip()[:4000],
+        "corps": str(donnees.get("corps") or "").strip()[:12000],
+        "requetes_broll": [
+            str(valeur).strip()[:120]
+            for valeur in (donnees.get("requetes_broll") or [])
+            if isinstance(valeur, (str, int, float)) and str(valeur).strip()
+        ][:6],
+    }
+    if not script["hook"] or not script["corps"]:
+        raise ErreurApp("Le script IA est incomplet : hook ou corps manquant.")
+    if not script["requetes_broll"]:
+        raise ErreurApp("Le script IA n'indique aucun thème visuel pour le B-roll.")
+    return script, resultat
 
 
 def _selectionner_sources_sst(candidats: list[dict[str, Any]], noms: list[str], limite: int, duree_max: float) -> list[dict[str, Any]]:
@@ -3426,7 +4021,8 @@ async def _produire_sst(requete: "RequeteSst", contexte: "ContexteJob", session_
         if not source:
             raise ErreurApp("La vidéo source SsT ne possède pas de texte exploitable.")
         contexte.update(statut="analysing", progress=14, detail="Adaptation du script aux noms saisis", noms_saisis=noms)
-        script = await adapter_script_sst(source, noms)
+        script, resultat_texte = await adapter_script_sst(source, noms, requete.fournisseur)
+        _noter_fournisseur_texte(contexte, resultat_texte)
         contexte.update(statut="searching", progress=20, detail="Recherche indépendante du nom 1", script=script, noms_saisis=noms)
         candidats: dict[str, dict[str, Any]] = {}
         recherches: list[str] = []
@@ -3727,11 +4323,15 @@ app.mount("/videos", StaticFiles(directory=str(DOSSIER_VIDEOS)), name="videos")
 
 class RequeteAnalyser(BaseModel):
     lien: str = Field(min_length=1, max_length=2048)
+    # Fournisseur de texte : « auto » (ordre serveur, bascule journalisée) ou
+    # « gemini » / « groq » / « mistral » (sans repli silencieux).
+    fournisseur: str = Field(default="auto", max_length=16)
     idempotency_key: str = Field(default="", max_length=80)
 
 
 class RequeteReference(BaseModel):
     lien: str = Field(min_length=1, max_length=2048)
+    fournisseur: str = Field(default="auto", max_length=16)
     idempotency_key: str = Field(default="", max_length=80)
 
 
@@ -3742,6 +4342,18 @@ class RequeteVideo(BaseModel):
     style: str = Field(default="classique", max_length=32)
     mode: str = Field(default="qualite", pattern="^(rapide|qualite)$")
     voix_off: str = Field(default="", max_length=64)
+    idempotency_key: str = Field(default="", max_length=80)
+
+
+class RequeteIaVideo(BaseModel):
+    """IA vidéo : une idée → script (fournisseur de texte) → B-roll Pexels
+    validé visuellement par Gemini → voix off edge-tts facultative."""
+
+    titre: str = Field(default="", max_length=120)
+    idee: str = Field(min_length=5, max_length=2000)
+    style: str = Field(default="classique", max_length=32)
+    voix_off: bool = False
+    fournisseur: str = Field(default="auto", max_length=16)
     idempotency_key: str = Field(default="", max_length=80)
 
 
@@ -3769,6 +4381,7 @@ class RequeteRst(BaseModel):
     intensite_transitions: int = Field(default=2, ge=0, le=3)
     # Pipeline TOP N : 3 ou 5 noms extraits de la vidéo de départ, rien d'autre.
     nombre_noms: int = Field(default=RST_NOMS_DEFAUT)
+    fournisseur: str = Field(default="auto", max_length=16)
     voix_off: str = Field(default="", max_length=64)
     idempotency_key: str = Field(default="", max_length=80)
 
@@ -3797,6 +4410,7 @@ class RequeteSst(BaseModel):
     profil_id: str = Field(default="", max_length=80)
     mode: str = Field(default="qualite", pattern="^(rapide|qualite)$")
     intensite_transitions: int = Field(default=2, ge=0, le=3)
+    fournisseur: str = Field(default="auto", max_length=16)
     voix_off: str = Field(default="", max_length=64)
     idempotency_key: str = Field(default="", max_length=80)
 
@@ -3986,6 +4600,90 @@ async def _produire_video(
     return {"url": f"/videos/{chemin.name}", "path": chemin}
 
 
+async def _produire_ia_video(
+    requete: RequeteIaVideo, contexte: Optional[ContexteJob] = None, session_id: str = ""
+) -> dict[str, Any]:
+    """IA vidéo : idée → script via le fournisseur de texte choisi → B-roll Pexels
+    dont chaque image est regardée et validée visuellement par Gemini (fail-closed)
+    → voix off edge-tts facultative. Le texte est l'unique sortie du fournisseur
+    choisi ; Gemini n'écrit rien ici, il n'a que le droit de VÉRIFIER les images.
+    """
+    if not requete.idee.strip():
+        raise ErreurApp("L'idée est requise pour l'IA vidéo.")
+
+    if contexte:
+        contexte.update(statut="analysing", progress=5, detail="Rédaction du script depuis l'idée")
+    script, resultat_texte = await generer_script_ia_video(
+        requete.idee, fournisseur=fournisseur_valide(requete.fournisseur)
+    )
+    _noter_fournisseur_texte(contexte, resultat_texte)
+    hook, corps = script["hook"], script["corps"]
+    cues = _decouper_en_cues(hook, corps)
+    duree_totale = max(
+        DUREE_MIN_VIDEO_SECONDES,
+        cues[-1]["fin"] if cues else float(CONFIG.duree_cible),
+    )
+
+    # Voix off générée (facultative) : le script devient le texte dit par edge-tts.
+    # Si l'utilisateur l'a demandée et que la synthèse échoue, le travail échoue
+    # honnêtement : on ne livre pas une vidéo muette en silence.
+    chemin_voix: Optional[Path] = None
+    if requete.voix_off:
+        if contexte:
+            contexte.update(statut="analysing", progress=20, detail="Synthèse de la voix off (edge-tts)")
+        chemin_voix = DOSSIER_VIDEOS / f"{uuid.uuid4().hex}.mp3"
+        try:
+            await synthetiser_voix_off(f"{hook}. {corps}", chemin_voix)
+        except Exception:
+            chemin_voix.unlink(missing_ok=True)
+            raise
+        # Sinon le rendu final aligne l'audio sur l'image (apad / -shortest).
+
+    # B-roll : une recherche Pexels par thème du script. Chaque candidate sera
+    # réellement regardée par Gemini dans `construire_video` (fail-closed : une
+    # image non certifiée n'est jamais montée). Un thème sans résultat n'est pas
+    # fatal tant qu'un autre thème livre des images.
+    requetes_broll = script["requetes_broll"]
+    liens_broll: list[str] = []
+    duree_par_theme = max(6.0, duree_totale / len(requetes_broll))
+    for i, requete_broll in enumerate(requetes_broll, 1):
+        if contexte:
+            contexte.update(
+                statut="selecting",
+                progress=25 + min(10, 10 * i),
+                detail=f"B-roll {i}/{len(requetes_broll)} : recherche de « {requete_broll[:40]} »",
+            )
+        try:
+            liens_broll.extend(await chercher_broll(requete_broll, duree_par_theme))
+        except ErreurApp as exc:
+            logger.warning("[ia-video] thème B-roll %s écarté : %s", requete_broll, exc)
+    if not liens_broll:
+        raise ErreurApp(
+            "Aucune vidéo Pexels verticale n'a pu être trouvée pour les thèmes du "
+            "script. Précise l'idée (lieux, objets, gestes concrets) ou relance."
+        )
+
+    if contexte:
+        contexte.update(statut="editing", progress=45, detail="Téléchargement, validation visuelle et montage")
+    resolution = "1080" if CONFIG.autoriser_export_1080 else "720"
+    chemin = await construire_video(
+        liens_broll, cues, duree_totale, requete.style,
+        resolution=resolution, crf=21, voix_off=chemin_voix,
+    )
+    await envoyer_script_et_video(hook, corps, chemin)
+    sortie: dict[str, Any] = {
+        "url": f"/videos/{chemin.name}", "path": chemin,
+        "script_ia": {
+            "titre": script["titre"], "hook": hook, "corps": corps,
+            "requetes_broll": requetes_broll,
+        },
+    }
+    if chemin_voix is not None:
+        sortie["voix_url"] = f"/videos/{chemin_voix.name}"
+        sortie["voix_nom"] = "voix-off.mp3"
+    return sortie
+
+
 async def _produire_montage(
     requete: RequeteMontage, contexte: ContexteJob, session_id: str = ""
 ) -> dict[str, Any]:
@@ -4019,7 +4717,11 @@ async def _produire_reference(requete: RequeteReference, contexte: Optional[Cont
         raise ErreurApp("Lien vide.")
     if contexte:
         contexte.update(statut="analysing", progress=15, detail="Transcription de la référence")
-    return await generer_script_depuis_reference(requete.lien.strip())
+    script, resultat = await generer_script_depuis_reference(
+        requete.lien.strip(), fournisseur=fournisseur_valide(requete.fournisseur)
+    )
+    _noter_fournisseur_texte(contexte, resultat)
+    return script
 
 
 async def _produire_analyser(requete: RequeteAnalyser, contexte: Optional[ContexteJob] = None) -> dict[str, Any]:
@@ -4028,7 +4730,11 @@ async def _produire_analyser(requete: RequeteAnalyser, contexte: Optional[Contex
     if contexte:
         contexte.update(statut="analysing", progress=15, detail="Lecture et analyse du contenu")
     source_texte = await extraire_source(requete.lien.strip())
-    return await generer_script(source_texte)
+    script, resultat = await generer_script(
+        source_texte, fournisseur=fournisseur_valide(requete.fournisseur)
+    )
+    _noter_fournisseur_texte(contexte, resultat)
+    return script
 
 
 async def _sauvegarde_auto_drive(
@@ -4129,7 +4835,14 @@ def _demarrer_job(
     job_id = uuid.uuid4().hex
     maintenant = time.monotonic()
     titre = str(getattr(modele, "titre", "") or "").strip()
-    titre_defaut = "Création RsT" if type_job == "rst" else ("Création SsT" if type_job == "sst" else "Création vidéo")
+    if type_job == "rst":
+        titre_defaut = "Création RsT"
+    elif type_job == "sst":
+        titre_defaut = "Création SsT"
+    elif type_job == "ia-video":
+        titre_defaut = "Création IA vidéo"
+    else:
+        titre_defaut = "Création vidéo"
     JOBS[job_id] = {
         "job_id": job_id, "type": type_job, "owner": session_id, "status": "queued",
         "title": titre or (f"Création {batch_index + 1}" if batch_total > 1 else titre_defaut),
@@ -4253,6 +4966,42 @@ async def configuration_publique() -> dict[str, Any]:
             "livraison": "separee",
         },
         "gemini_modeles": _modeles_gemini(),
+        "fournisseurs_texte": {
+            "ordre": _ordre_fournisseurs_texte(),
+            "disponibles": [
+                nom for nom in _ordre_fournisseurs_texte() if _fournisseur_configure(nom)
+            ],
+        },
+    }
+
+
+@app.get("/api/fournisseurs-texte")
+async def etat_fournisseurs_texte() -> dict[str, Any]:
+    """État réel des fournisseurs de texte, pour la carte Paramètres.
+
+    Le quota n'est exposé que si l'API l'a réellement communiqué (en-têtes
+    x-ratelimit-*) : dans le cas contraire `quota_communiquee` reste null —
+    rien n'est inventé. `fenetre_reinitialisee` est le reset communiqué, qui
+    n'est pas un simple Retry-After.
+    """
+    fournisseurs = []
+    for nom in _ordre_fournisseurs_texte():
+        etat = QUOTAS_FOURNISSEURS.get(nom)
+        quota = None
+        if etat is not None and (etat.restant is not None or etat.limite is not None):
+            quota = {"restant": etat.restant, "limite": etat.limite}
+        fournisseurs.append({
+            "nom": nom,
+            "libelle": LIBELLES_FOURNISSEURS_TEXTE[nom],
+            "configure": _fournisseur_configure(nom),
+            "quota_communiquee": quota,
+            "fenetre_reinitialisee": etat.reset_iso if etat is not None else None,
+            "maj_unix": round(etat.maj_unix, 1) if etat is not None else None,
+            "derniere_erreur": (etat.derniere_erreur if etat is not None else "")[:200],
+        })
+    return {
+        "ordre": [fournisseur["nom"] for fournisseur in fournisseurs],
+        "fournisseurs": fournisseurs,
     }
 
 
@@ -4686,6 +5435,10 @@ async def diagnostic_montage(requete: RequeteDiagnosticMontage) -> dict[str, Any
 async def lancer_job_analyser(requete: RequeteAnalyser, request: Request):
     if not requete.lien.strip():
         raise HTTPException(400, "Lien vide.")
+    try:
+        fournisseur_valide(requete.fournisseur)
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
     session_id, nouveau = _session_id(request)
     job_id, reused = _demarrer_job(
         "analyser", requete, session_id, lambda contexte: _produire_analyser(requete, contexte)
@@ -4703,6 +5456,21 @@ async def lancer_job_video(requete: RequeteVideo, request: Request):
     job_id, reused = _demarrer_job(
         "video", requete, session_id,
         lambda contexte: _produire_video(requete, contexte, session_id),
+    )
+    return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
+
+
+@app.post("/api/jobs/ia-video", status_code=202)
+async def lancer_job_ia_video(requete: RequeteIaVideo, request: Request):
+    """IA vidéo : une idée suffit ; script, B-roll validé et voix off suivent."""
+    try:
+        fournisseur_valide(requete.fournisseur)
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
+    session_id, nouveau = _session_id(request)
+    job_id, reused = _demarrer_job(
+        "ia-video", requete, session_id,
+        lambda contexte: _produire_ia_video(requete, contexte, session_id),
     )
     return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
 
@@ -4734,6 +5502,7 @@ async def lancer_job_sst(requete: RequeteSst, request: Request):
     try:
         normaliser_lien_tiktok(requete.lien.strip())
         _noms_sst_valides(requete.noms, requete.nombre_noms)
+        fournisseur_valide(requete.fournisseur)
     except (ErreurMontage, ErreurApp) as exc:
         raise HTTPException(400, str(exc)) from exc
     session_id, nouveau = _session_id(request)
@@ -4752,8 +5521,11 @@ async def lancer_job_rst(requete: RequeteRst, request: Request):
         raise HTTPException(400, "Lien vide.")
     try:
         normaliser_lien_tiktok(lien)
+        fournisseur_valide(requete.fournisseur)
     except ErreurMontage as exc:
         raise HTTPException(400, f"Lien TikTok de départ invalide : {exc}") from exc
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
     session_id, nouveau = _session_id(request)
     job_id, reused = _demarrer_job(
         "rst", requete, session_id,
@@ -4812,6 +5584,10 @@ async def lancer_lot_montages(requete: RequeteLotMontages, request: Request):
 async def lancer_job_reference(requete: RequeteReference, request: Request):
     if not requete.lien.strip():
         raise HTTPException(400, "Lien vide.")
+    try:
+        fournisseur_valide(requete.fournisseur)
+    except ErreurApp as exc:
+        raise HTTPException(400, str(exc)) from exc
     session_id, nouveau = _session_id(request)
     job_id, reused = _demarrer_job(
         "reference", requete, session_id, lambda contexte: _produire_reference(requete, contexte)

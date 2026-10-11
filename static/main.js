@@ -26,7 +26,7 @@
      ÉTAT GLOBAL
   ------------------------------------------------------------------ */
 
-  const SETTINGS_KEY = 'vesper.settings.v2';
+  const SETTINGS_KEY = 'vesper.settings.v3';
   let settings = loadSettings();
   let serverConfig = null;
   let integrations = { tiktok: {}, google_drive: {} };
@@ -63,11 +63,23 @@
 
   const typeLabels = {
     analyser: 'Analyse', video: 'Lien → vidéo', reference: 'Référence',
+    ia: 'IA vidéo', 'ia-video': 'IA vidéo',
     rst: 'RsT', sst: 'SsT', montage: 'Montage'
   };
 
   const ETATS_FINAL = ['completed', 'failed', 'cancelled'];
   const RST_MAX = 6;
+
+  // Ligne « IA utilisée » du suivi : le fournisseur de texte réellement utilisé
+  // pour le travail, et le nombre de bascules journalisées (auto).
+  const iaUtiliseeLigne = (data) => {
+    if (!data || !data.fournisseur_texte) return '';
+    let ligne = ` · IA utilisée (texte) : ${data.fournisseur_texte}`;
+    if (Array.isArray(data.bascules_fournisseur) && data.bascules_fournisseur.length) {
+      ligne += ` · ${data.bascules_fournisseur.length} bascule(s)`;
+    }
+    return ligne;
+  };
   // Pipeline TOP N : 3 ou 5 noms extraits de la vidéo de départ (valeurs confirmées par /api/config).
   let rstNomsChoix = [3, 5];
   let rstNombreNoms = 3;
@@ -169,14 +181,55 @@
       const brut = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null');
       return {
         mode: brut && brut.mode === 'rapide' ? 'rapide' : 'qualite',
-        intensite: brut && [0, 1, 2, 3].includes(Number(brut.intensite)) ? Number(brut.intensite) : 2
+        intensite: brut && [0, 1, 2, 3].includes(Number(brut.intensite)) ? Number(brut.intensite) : 2,
+        // Aucun thème codé en dur : « auto » suit le système, sinon clair/noir.
+        theme: brut && ['auto', 'clair', 'noir'].includes(brut.theme) ? brut.theme : 'auto',
+        // Fournisseur de texte : « auto » (ordre serveur, bascule journalisée)
+        // ou un fournisseur nommé, sans repli silencieux.
+        fournisseur: brut && ['auto', 'gemini', 'groq', 'mistral'].includes(brut.fournisseur)
+          ? brut.fournisseur : 'auto'
       };
-    } catch (_) { return { mode: 'qualite', intensite: 2 }; }
+    } catch (_) { return { mode: 'qualite', intensite: 2, theme: 'auto', fournisseur: 'auto' }; }
   }
 
   function saveSettings() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
     syncSettingsUI();
+  }
+
+  /* ------------------------------------------------------------------
+     THÈME (clair / noir / auto) — rien n'est durci : le choix est conservé
+     dans ce navigateur, et « auto » suit prefers-color-scheme.
+  ------------------------------------------------------------------ */
+
+  const mediaSombre = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+
+  function themeEffectif() {
+    if (settings.theme === 'noir') return 'noir';
+    if (settings.theme === 'clair') return 'clair';
+    return (mediaSombre && mediaSombre.matches) ? 'noir' : 'clair';
+  }
+
+  function appliquerTheme() {
+    const theme = themeEffectif();
+    document.documentElement.dataset.theme = theme;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.content = theme === 'noir' ? '#000000' : '#f5f5f7';
+  }
+
+  function bindTheme() {
+    document.querySelectorAll('[data-theme-choix]').forEach((bouton) => {
+      bouton.addEventListener('click', () => {
+        settings.theme = bouton.dataset.themeChoix;
+        saveSettings();
+        appliquerTheme();
+      });
+    });
+    if (mediaSombre) {
+      mediaSombre.addEventListener('change', () => {
+        if (settings.theme === 'auto') appliquerTheme();
+      });
+    }
   }
 
   function resolutionPourMode() {
@@ -199,6 +252,12 @@
     document.querySelectorAll('[data-intensite]').forEach((bouton) => {
       bouton.classList.toggle('active', Number(bouton.dataset.intensite) === settings.intensite);
     });
+    document.querySelectorAll('[data-fournisseur]').forEach((bouton) => {
+      bouton.classList.toggle('active', bouton.dataset.fournisseur === settings.fournisseur);
+    });
+    document.querySelectorAll('[data-theme-choix]').forEach((bouton) => {
+      bouton.classList.toggle('active', bouton.dataset.themeChoix === settings.theme);
+    });
     const texte = libelleExport();
     $('export-courant').textContent = texte;
     $('export-courant-parametres').textContent = texte;
@@ -216,6 +275,15 @@
       bouton.addEventListener('click', () => {
         settings.intensite = Number(bouton.dataset.intensite);
         saveSettings();
+      });
+    });
+    document.querySelectorAll('[data-fournisseur]').forEach((bouton) => {
+      bouton.addEventListener('click', () => {
+        settings.fournisseur = bouton.dataset.fournisseur;
+        saveSettings();
+        toast(settings.fournisseur === 'auto'
+          ? 'Sélection automatique : l’ordre du serveur s’applique, bascule journalisée en cas d’échec.'
+          : `Fournisseur « ${bouton.textContent} » imposé : aucun repli silencieux.`);
       });
     });
   }
@@ -371,12 +439,71 @@
   }
 
   /* ------------------------------------------------------------------
+     FOURNISSEURS IA (TEXTE) — état réel lu depuis le serveur, rien d'inventé
+  ------------------------------------------------------------------ */
+
+  function fmtHeureLocale(iso) {
+    try {
+      return new Date(iso).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    } catch (_) { return iso; }
+  }
+
+  function renderFournisseurs(data) {
+    const conteneur = $('fournisseur-list');
+    const compteur = $('fournisseur-actif');
+    if (!conteneur) return;
+    conteneur.replaceChildren();
+    const liste = data.fournisseurs || [];
+    const configurees = liste.filter((f) => f.configure);
+    if (compteur) {
+      if (settings.fournisseur === 'auto') {
+        compteur.textContent = configurees.length
+          ? `Auto → ${configurees[0].libelle} d’abord`
+          : 'Auto → aucun fournisseur configuré';
+      } else {
+        const choisi = liste.find((f) => f.nom === settings.fournisseur);
+        compteur.textContent = choisi && choisi.configure
+          ? `Fixé → ${choisi.libelle}`
+          : 'Fixé → non configuré sur le serveur';
+      }
+    }
+    liste.forEach((f, index) => {
+      const item = el('div', 'fournisseur-item');
+      const nom = el('span', 'fournisseur-nom fournisseur-tete');
+      nom.append(el('i', f.configure ? '' : 'off'), document.createTextNode(`${index + 1}. ${f.libelle}`));
+      item.append(nom);
+      const meta = [f.configure ? 'clé présente sur le serveur' : 'non configuré (clé absente)'];
+      // Le quota n'apparaît que si l'API le communique vraiment ; le reset de la
+      // fenêtre est distinct d'un Retry-After et n'est montré que s'il est connu.
+      meta.push(f.quota_communiquee
+        ? `quota communiqué : ${f.quota_communiquee.restant ?? 'n/d'} / ${f.quota_communiquee.limite ?? 'n/d'} requêtes`
+        : 'quota non communiqué par l’API');
+      if (f.fenetre_reinitialisee) meta.push(`fenêtre réinitialisée à ${fmtHeureLocale(f.fenetre_reinitialisee)}`);
+      item.append(el('span', 'fournisseur-meta', meta.join(' · ')));
+      if (f.derniere_erreur) item.append(el('p', 'fournisseur-erreur', f.derniere_erreur));
+      conteneur.append(item);
+    });
+  }
+
+  async function loadFournisseurs() {
+    try {
+      const data = await requestJSON('/api/fournisseurs-texte');
+      renderFournisseurs(data);
+    } catch (_) {
+      const conteneur = $('fournisseur-list');
+      if (conteneur) {
+        conteneur.replaceChildren(el('p', 'hint', 'État des fournisseurs indisponible (API injoignable).'));
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------
      STYLES DE SOUS-TITRES
   ------------------------------------------------------------------ */
 
   function chargerStyles(liste) {
     const styles = Array.isArray(liste) && liste.length ? liste : ['classique', 'jaune', 'centre'];
-    ['lien', 'montage'].forEach((type) => {
+    ['lien', 'ia', 'montage'].forEach((type) => {
       const conteneur = $(`styles-${type}`);
       conteneur.replaceChildren(...styles.map((style, index) => {
         const label = el('label', '', style);
@@ -653,7 +780,8 @@
     $('tracker-bar').style.width = `${pourcent}%`;
     $('tracker-detail').textContent =
       `${statusLabels[data.status] || data.status} · ${data.detail || ''}` +
-      (data.status === 'queued' && data.queue_position ? ` · position ${data.queue_position}` : '');
+      (data.status === 'queued' && data.queue_position ? ` · position ${data.queue_position}` : '') +
+      iaUtiliseeLigne(data);
 
     renderSources($('tracker-sources'), data);
 
@@ -971,7 +1099,7 @@
       bouton.disabled = true;
       setStatus(statut, 'Analyse du contenu…');
       try {
-        const data = await launchJob('analyser', { lien, idempotency_key: uuid() }, statut);
+        const data = await launchJob('analyser', { lien, fournisseur: settings.fournisseur, idempotency_key: uuid() }, statut);
         $('hook').value = data.hook || '';
         $('corps').value = data.corps || '';
         $('mot-cle').value = data.mot_cle_broll || '';
@@ -1054,7 +1182,8 @@
 
       carte.append(el('p', 'job-detail',
         `${statusLabels[data.status] || data.status} · ${data.detail || ''}` +
-        (data.status === 'queued' && data.queue_position ? ` · position ${data.queue_position}` : '')));
+        (data.status === 'queued' && data.queue_position ? ` · position ${data.queue_position}` : '') +
+        iaUtiliseeLigne(data)));
 
       const barre = el('div', 'job-progress');
       barre.append(Object.assign(el('i'), { style: `width:${Number(data.progress || 0)}%` }));
@@ -1231,6 +1360,64 @@
     });
   }
 
+  /* ------------------------------------------------------------------
+     IA VIDÉO — une idée → script (fournisseur de texte) → B-roll validé
+  ------------------------------------------------------------------ */
+
+  function bindIaVideo() {
+    const button = $('btn-ia');
+    const statut = $('statut-ia');
+    const caseVoix = $('ia-voixoff');
+    const etatVoix = $('ia-voixoff-etat');
+    if (!button || !caseVoix || !etatVoix) return;
+
+    const reinitialiserVoix = () => {
+      etatVoix.textContent = caseVoix.checked
+        ? 'Le script rédigé sera lu par edge-tts : la vidéo partira avec sa voix off.'
+        : 'Non cochée : la vidéo reste muette (sous-titres uniquement).';
+    };
+
+    // La synthèse vocale n'est proposée que si le module edge-tts est réellement
+    // présent sur le serveur — état lu depuis l'API, rien d'inventé.
+    requestJSON('/api/sante').then((donnees) => {
+      caseVoix.disabled = !donnees.voix_off_generee_disponible;
+      if (caseVoix.disabled) caseVoix.checked = false;
+      if (!donnees.voix_off_generee_disponible) {
+        etatVoix.textContent = 'Synthèse vocale indisponible sur ce serveur (module edge-tts absent) : la vidéo restera muette.';
+      }
+    }).catch(() => {
+      caseVoix.disabled = true;
+      caseVoix.checked = false;
+      etatVoix.textContent = 'État de la synthèse vocale inconnu (API injoignable) : la vidéo restera muette.';
+    });
+    caseVoix.addEventListener('change', reinitialiserVoix);
+
+    button.addEventListener('click', async () => {
+      const idee = $('ia-idee').value.trim();
+      if (idee.length < 5) {
+        setStatus(statut, 'Décris ton idée en quelques mots (5 caractères minimum).', 'error');
+        return;
+      }
+      button.disabled = true;
+      setStatus(statut, 'Rédaction du script, recherche et validation des images…');
+      try {
+        await launchJob('ia-video', {
+          titre: idee.slice(0, 120),
+          idee,
+          voix_off: Boolean(caseVoix.checked),
+          style: (document.querySelector('input[name="style-ia"]:checked') || {}).value || 'classique',
+          fournisseur: settings.fournisseur,
+          idempotency_key: uuid()
+        }, statut);
+        setStatus(statut, 'Vidéo IA terminée.', 'success');
+      } catch (error) {
+        setStatus(statut, error.message, 'error');
+      } finally {
+        button.disabled = Boolean(activeJobId);
+      }
+    });
+  }
+
   function bindRst() {
     document.querySelectorAll('[data-noms]').forEach((bouton) => {
       bouton.addEventListener('click', () => {
@@ -1287,6 +1474,7 @@
               mode: settings.mode,
               intensite_transitions: settings.intensite,
               nombre_noms: rstNombreNoms,
+              fournisseur: settings.fournisseur,
               voix_off: voixOff.rst,
               idempotency_key: uuid()
             },
@@ -1378,7 +1566,8 @@
           titre: `SsT · TOP ${sstNombreNoms}`,
           lien: parsed.url, nombre_noms: sstNombreNoms, noms: names,
           profil_id: $('sst-profil').value, mode: settings.mode,
-          intensite_transitions: settings.intensite, voix_off: voixOff.rst,
+          intensite_transitions: settings.intensite, fournisseur: settings.fournisseur,
+          voix_off: voixOff.rst,
           idempotency_key: uuid()
         }, $('statut-sst'));
         setStatus($('statut-sst'), `SsT terminé : ${data.noms_saisis?.length || sstNombreNoms} noms utilisés tels quels.`, 'success');
@@ -1571,7 +1760,7 @@
       bouton.disabled = true;
       setStatus(statut, 'Transcription et réécriture du script de la référence…');
       try {
-        const data = await launchJob('reference', { lien, idempotency_key: uuid() }, statut);
+        const data = await launchJob('reference', { lien, fournisseur: settings.fournisseur, idempotency_key: uuid() }, statut);
         $('mon-hook').value = data.hook || '';
         $('mon-corps').value = data.corps || '';
         selectMtab('script');
@@ -1718,7 +1907,8 @@
       const lot = job.batch_total > 1 ? ` · lot ${Number(job.batch_index) + 1}/${job.batch_total}` : '';
       const trouve = job.type === 'rst' && job.found_count ? ` · ${job.found_count} vidéo(s) trouvée(s)` : '';
       meta.textContent =
-        `${statusLabels[job.status] || job.status}${file}${lot}${trouve} · ${job.detail || ''} · ${fmtHeure(job.created_at_unix)}`;
+        `${statusLabels[job.status] || job.status}${file}${lot}${trouve} · ${job.detail || ''}` +
+        iaUtiliseeLigne(job) + ` · ${fmtHeure(job.created_at_unix)}`;
 
       const barre = el('div', 'history-progress');
       barre.append(Object.assign(el('i'), { style: `width:${Number(job.progress || 0)}%` }));
@@ -1820,10 +2010,13 @@
   ------------------------------------------------------------------ */
 
   function init() {
+    appliquerTheme();
+    bindTheme();
     bindNavigation();
     bindTabs();
     bindSettings();
     bindLienVideo();
+    bindIaVideo();
     bindRst();
     bindSst();
     bindTrainingProfiles();
@@ -1847,6 +2040,7 @@
 
     requestJSON('/api/styles').then((data) => chargerStyles(data.styles)).catch(() => chargerStyles());
     loadConfig().then(loadSante);
+    loadFournisseurs();
     loadTrainingProfiles();
     loadIntegrations().then(loadHistory);
     resumeJob();

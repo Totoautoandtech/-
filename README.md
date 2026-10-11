@@ -1,14 +1,18 @@
 # ς੮ ς८Րɿƿ┮
 
-Tableau de bord privé de création de vidéos verticales avec FastAPI, JavaScript natif, FFmpeg/FFprobe, Gemini, TikWM, Pexels, TikTok OAuth et Google Drive OAuth.
+Tableau de bord privé de création de vidéos verticales avec FastAPI, JavaScript natif, FFmpeg/FFprobe, Gemini (et Groq / Mistral pour le texte), TikWM, Pexels, TikTok OAuth et Google Drive OAuth.
 
 ## Interface
 
-Le dashboard (sombre, premium, responsive) est construit en HTML/CSS/JS natif uniquement :
+Le dashboard (premium, responsive) est construit en HTML/CSS/JS natif uniquement :
 
 - `static/index.html` — structure des vues ;
-- `static/styles.css` — thème sombre complet, mobile inclus ;
-- `static/main.js` — logique des quatre sections, suivi des jobs, historique, OAuth.
+- `static/styles.css` — thèmes clair et **noir** (fond `#000`), complets, mobile inclus ;
+- `static/main.js` — logique des sections, suivi des jobs, historique, OAuth.
+
+Aucun thème n'est codé en dur : le choix (clair / noir / auto) se fait dans
+**Paramètres → Affichage**, est conservé dans le navigateur, et l'« Auto » suit
+`prefers-color-scheme` du système.
 
 La barre latérale contient **Créer**, **Entraînement IA**, **Mes créations**, **Connexions** et **Paramètres**. La vue Créer propose quatre sections :
 
@@ -105,6 +109,9 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 
 - `GEMINI_API_KEYS` — une ou plusieurs clés séparées par des virgules ;
 - `PEXELS_API_KEY` — nécessaire au mode B-roll libre ;
+- `GROQ_API_KEY` — facultatif, fournisseur de texte alternatif (gratuit dans la
+  limite de ses propres quotas publics) ;
+- `MISTRAL_API_KEY` — facultatif, fournisseur de texte alternatif (id.) ;
 - `TIKTOK_CLIENT_KEY`, `TIKTOK_CLIENT_SECRET` — Login Kit TikTok ;
 - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` — OAuth Google Drive ;
 - `GMAIL_ADRESSE`, `GMAIL_MOT_DE_PASSE_APP` — envoi e-mail facultatif ;
@@ -134,6 +141,7 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 | `RST_SOURCES_MAX` | `20` | sources retenues par RsT pour le montage final |
 | `EDGE_TTS_VOIX` | `fr-FR-DeniseNeural` | voix edge-tts de la voix off générée |
 | `EDGE_TTS_DEBIT` | `+0%` | débit de la voix off générée |
+| `FOURNISSEURS_TEXTE_ORDRE` | `gemini,groq,mistral` | ordre de la sélection « Auto » des fournisseurs de texte |
 
 Le TOP N (3 ou 5 noms) et le plafond de 5 s par plan ne sont pas configurables par variable
 d'environnement : ce sont des constantes du pipeline (`RST_NOMS_CHOIX`, `RST_DUREE_MAX_PLAN`),
@@ -183,6 +191,66 @@ atteignable, même lorsqu'un premier couple clé/modèle ne répond pas :
    quatre derniers échecs sans révéler de clé.
 
 `GET /api/config` expose la chaîne réellement active dans `gemini_modeles`.
+
+## Fournisseurs IA (texte) : Gemini, Groq, Mistral
+
+Gemini reste **obligatoire** pour l'audio, la vidéo et la validation visuelle des
+plans. Seules les tâches de **texte** (rédaction des scripts, extraction des noms
+TOP N, adaptation SsT, script de l'IA vidéo) passent par un routeur de
+fournisseurs :
+
+- **Sélection automatique** (défaut) : les fournisseurs *configurés* sur le
+  serveur sont essayés dans l'ordre `FOURNISSEURS_TEXTE_ORDRE`
+  (`gemini,groq,mistral` par défaut). Une erreur temporaire (quota 429, 5xx,
+  délai) déclenche une **bascule journalisée** vers le fournisseur suivant —
+  jamais silencieuse : le job enregistre `fournisseur_texte` et chaque bascule
+  (`bascules_fournisseur`), affichés dans le suivi (« IA utilisée (texte) »).
+  Un refus de contenu par Gemini est définitif : pas de bascule.
+- **Sélection manuelle** : la carte **Paramètres → Fournisseurs IA (texte)**
+  permet de pincer Gemini, Groq ou Mistral (conservé dans le navigateur). Le
+  fournisseur est alors utilisé tel quel, **sans repli** : s'il n'est pas
+  configuré (clé absente) ou s'il est épuisé, le travail échoue avec un message
+  explicite plutôt qu'un remplacement silencieux.
+- **Quotas** : l'interface n'affiche un quota que **si l'API le communique
+  réellement** (en-têtes `x-ratelimit-*` de Groq/Mistral). Sinon, la carte le
+  dit : « quota non communiqué par l'API ». Rien n'est inventé.
+- **Reset ≠ Retry-After** : une *remise à zéro* de fenêtre
+  (`x-ratelimit-reset-requests`, affichée « fenêtre réinitialisée à HH:MM:SS »)
+  est distincte d'un simple `Retry-After` (la pause avant retente). La pause
+  suit le Retry-After quand l'API l'envoie, sinon le reset communiqué, sinon un
+  backoff borné — et n'attend jamais au-delà du reset ni du budget.
+- **Clés côté serveur** : `GROQ_API_KEY` et `MISTRAL_API_KEY` ne vivent que dans
+  les variables secrètes Render ; elles ne figurent jamais dans le navigateur,
+  dans Git, ni en clair dans les journaux (seule une empreinte courte apparaît).
+  Aucun abonnement payant n'est requis ; chaque fournisseur reste dans ses
+  propres quotas publics, sans promesse de volume.
+
+`GET /api/fournisseurs-texte` expose l'état réel (ordre, clés présentes, quotas
+communiqués, dernière erreur) utilisé par la carte Paramètres.
+
+## IA vidéo : une idée → une vidéo
+
+L'onglet **IA vidéo** (vue Créer) part d'une simple idée (5 à 2000 caractères) :
+
+1. **Script** — l'idée est transformée en script court (titre, accroche, corps,
+   3 à 4 thèmes d'images) par le fournisseur de texte choisi (auto ou nommé,
+   voir section ci-dessus) ;
+2. **B-roll** — un thème = une recherche Pexels en portrait ; **chaque image
+   candidate est réellement regardée et validée visuellement par Gemini**
+   (fail-closed : texte incrusté, logo, flou, hors-sujet ou contrôle impossible
+   = image écartée, jamais montée) ;
+3. **Voix off générée (facultative)** — le script peut être lu par edge-tts
+   (gratuit, sans clé) ; non cochée, la vidéo reste muette et sous-titrée. Le
+   curseur n'est proposé que si le module edge-tts est présent sur le serveur
+   (état réel lu depuis `GET /api/sante`) ;
+4. **Montage** — sous-titres + voix off alignés, rendu vertical 720×1280 (ou
+   1080×1920 si activé), délai global de 30 minutes conservé.
+
+Le script complet (titre, accroche, corps, thèmes d'images) et la ligne
+« IA utilisée (texte) » sont conservés avec le travail. Gemini reste
+obligatoire pour la validation visuelle des plans, quelle que soit la
+sélection de texte. `POST /api/jobs/ia-video` accepte `idee`, `titre`,
+`style`, `voix_off` (booléen), `fournisseur` et `idempotency_key`.
 
 ## Voix off importée
 

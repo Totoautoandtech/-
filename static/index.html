@@ -73,6 +73,7 @@
 
           <div class="seg tabs" role="tablist" id="tabs-creer">
             <button class="seg-item active" data-tab="lien" role="tab">Lien → vidéo</button>
+            <button class="seg-item" data-tab="ia" role="tab">IA vidéo</button>
             <button class="seg-item" data-tab="rst" role="tab">RsT</button>
             <button class="seg-item" data-tab="sst" role="tab">SsT</button>
             <button class="seg-item" data-tab="montage" role="tab">Montage multi-source</button>
@@ -152,6 +153,44 @@
                 </div>
                 <p class="status" id="statut-video"></p>
               </div>
+            </div>
+          </div>
+
+          <!-- ============ SECTION : IA VIDÉO ============ -->
+          <div class="tool" data-tool="ia">
+            <div class="card">
+              <div class="card-head">
+                <h2>IA vidéo</h2>
+                <span class="chip">IDÉE → VIDÉO</span>
+              </div>
+              <p class="lead">Écris une idée, le reste est automatique : le script est rédigé par le fournisseur de texte choisi (Paramètres), les plans B-roll sont recherchés sur Pexels et <strong>chaque image est regardée et validée visuellement par Gemini</strong> avant le montage — une image non conforme est écartée, jamais montée.</p>
+
+              <div class="field">
+                <label for="ia-idee">Ton idée</label>
+                <textarea id="ia-idee" rows="4" placeholder="ex. les métiers de nuit dans un aéroport européen, ambiance documentaire"></textarea>
+                <p class="hint">5 à 2000 caractères. Plus l'idée est concrète (lieux, objets, gestes), plus les images trouvées colleront au script.</p>
+              </div>
+
+              <div class="grid-2">
+                <div class="field">
+                  <label>Voix off générée · facultative</label>
+                  <label class="check">
+                    <input type="checkbox" id="ia-voixoff">
+                    <span>Écrire la voix off avec edge-tts (gratuit, sans clé)</span>
+                  </label>
+                  <p class="hint" id="ia-voixoff-etat">Non cochée : la vidéo reste muette (sous-titres uniquement).</p>
+                </div>
+                <div class="field">
+                  <label>Sous-titres</label>
+                  <div class="styles" id="styles-ia"></div>
+                </div>
+              </div>
+
+              <div class="actions">
+                <button class="btn primary" id="btn-ia"><span>Générer la vidéo IA</span><span aria-hidden="true">✦</span></button>
+              </div>
+              <p class="status" id="statut-ia"></p>
+              <p class="foot-note">Le script complet (titre, accroche, corps, thèmes d'images) est conservé avec le travail. Gemini reste obligatoire pour la validation visuelle des plans, quelle que soit la sélection de texte.</p>
             </div>
           </div>
 
@@ -549,6 +588,38 @@
               <p class="hint">« Aucune » ne garde que des coupes franches ; « Forte » appuie les fondus, glissements et zooms entre les plans.</p>
             </div>
             <p class="hint" id="export-courant-parametres"></p>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h2>Fournisseurs IA (texte)</h2><span class="counter" id="fournisseur-actif"></span></div>
+            <p class="lead">Les scripts, l’extraction des noms et les adaptations de texte passent par ces fournisseurs. Gemini reste exclusivement chargé de l’audio, de la vidéo et de la validation visuelle des plans.</p>
+
+            <div class="field">
+              <label>Sélection du texte</label>
+              <div class="seg choices" id="fournisseur-choices">
+                <button class="seg-item active" data-fournisseur="auto" type="button">Auto</button>
+                <button class="seg-item" data-fournisseur="gemini" type="button">Gemini</button>
+                <button class="seg-item" data-fournisseur="groq" type="button">Groq</button>
+                <button class="seg-item" data-fournisseur="mistral" type="button">Mistral</button>
+              </div>
+              <p class="hint">« Auto » suit l’ordre du serveur et bascule, en le journalisant, vers le fournisseur suivant en cas d’échec temporaire. Un fournisseur nommé est utilisé tel quel : sans repli silencieux.</p>
+            </div>
+
+            <div class="fournisseur-list" id="fournisseur-list"><p class="hint">Chargement…</p></div>
+            <p class="hint">Le quota n’est affiché que si l’API le communique réellement (en-têtes x-ratelimit-*) ; la remise à zéro de la fenêtre est distincte d’un simple Retry-After. Si l’API ne dit rien, rien n’est affiché : aucune donnée inventée. Les clés restent côté serveur.</p>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h2>Affichage</h2></div>
+            <div class="field">
+              <label>Thème de l’interface</label>
+              <div class="seg choices" id="theme-choices">
+                <button class="seg-item" data-theme-choix="auto" type="button">Auto (système)</button>
+                <button class="seg-item" data-theme-choix="clair" type="button">Clair</button>
+                <button class="seg-item" data-theme-choix="noir" type="button">Noir</button>
+              </div>
+              <p class="hint">Aucun thème n’est codé en dur : le choix est conservé dans ce navigateur et l’« Auto » suit l’affichage du système.</p>
+            </div>
           </div>
 
           <div class="card">
