@@ -3,10 +3,12 @@ import base64
 import dataclasses
 import hashlib
 import json
+import logging
 import math
 import os
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -22,12 +24,14 @@ def nettoyer_etat():
         task.cancel()
     app.JOBS.clear(); app.JOB_TASKS.clear(); app.JOB_INDEX.clear()
     app.SESSIONS_INTEGRATIONS.clear()
+    app.QUOTAS_FOURNISSEURS.clear()
     _purger_profils_tests()
     yield
     for task in list(app.JOB_TASKS.values()):
         task.cancel()
     app.JOBS.clear(); app.JOB_TASKS.clear(); app.JOB_INDEX.clear()
     app.SESSIONS_INTEGRATIONS.clear()
+    app.QUOTAS_FOURNISSEURS.clear()
     _purger_profils_tests()
 
 
@@ -392,8 +396,16 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
-    async def script(_texte):
-        return {"hook": "Hook RsT", "corps": "Corps du script RsT.", "mot_cle_broll": "cuisine maison"}
+    async def script(_texte, *_args):
+        return (
+            {"hook": "Hook RsT", "corps": "Corps du script RsT.", "mot_cle_broll": "cuisine maison"},
+            # Le script a été écrit par Groq après une bascule journalisée depuis Gemini :
+            # le travail doit le signaler tel quel dans son suivi.
+            app.ResultatTexte(
+                texte="{}", fournisseur="groq",
+                bascules=["Gemini → Groq (quota 429)"],
+            ),
+        )
 
     monkeypatch.setattr(app, "generer_script", script)
 
@@ -416,6 +428,9 @@ def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
     job = _attendre_job(client, response.json()["job_id"])
     assert job["status"] == "completed", job.get("error")
     assert job["url"] == "/videos/rst.mp4"
+    # Ligne « IA utilisée » du suivi : le fournisseur réellement utilisé et la bascule.
+    assert job["fournisseur_texte"] == "Groq"
+    assert job["bascules_fournisseur"] == ["Gemini → Groq (quota 429)"]
     assert job["script"]["hook"] == "Hook RsT"
 
     # Vidéos réellement trouvées : seed exclue, plafonnées au maximum configuré.
@@ -510,9 +525,9 @@ def test_rst_ecarte_les_videos_generiques_pour_un_sujet_telephone(client, monkey
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
-    async def script(_texte):
-        return {"hook": "Hook téléphone", "corps": "Corps du script téléphone.",
-                "mot_cle_broll": "téléphone en main"}
+    async def script(_texte, *_args):
+        return ({"hook": "Hook téléphone", "corps": "Corps du script téléphone.",
+                "mot_cle_broll": "téléphone en main"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
 
     monkeypatch.setattr(app, "generer_script", script)
 
@@ -561,8 +576,8 @@ def test_rst_aucune_video_trouvee_echoue_honnetement(client, monkeypatch):
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
-    async def script(_texte):
-        return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "rare"}
+    async def script(_texte, *_args):
+        return ({"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "rare"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
 
     monkeypatch.setattr(app, "generer_script", script)
 
@@ -1203,11 +1218,14 @@ def test_rst_refuse_un_nombre_de_noms_hors_trois_et_cinq(client):
 
 
 def test_extraire_noms_rst_prefere_l_ia_puis_retombe_sur_la_legende(monkeypatch):
+    # Le routeur de texte n'appelle Gemini que s'il est réellement configuré.
+    monkeypatch.setattr(app.CONFIG, "gemini_api_keys", ["cle-de-test"])
+
     async def ia_ok(_parts, **_kwargs):
         return '{"noms": ["Kylian Mbappé", "Real Madrid", "Bernabéu"]}'
 
     monkeypatch.setattr(app, "_appel_gemini_brut", ia_ok)
-    noms = asyncio.run(app.extraire_noms_rst("Mbappé au Real #football", 3))
+    noms, _ = asyncio.run(app.extraire_noms_rst("Mbappé au Real #football", 3))
     assert noms == ["Kylian Mbappé", "Real Madrid", "Bernabéu"]
 
     # Gemini indisponible : on retombe sur les mots réellement présents, sans rien inventer.
@@ -1215,7 +1233,7 @@ def test_extraire_noms_rst_prefere_l_ia_puis_retombe_sur_la_legende(monkeypatch)
         raise app.ErreurApp("Gemini saturé")
 
     monkeypatch.setattr(app, "_appel_gemini_brut", ia_ko)
-    replis = asyncio.run(app.extraire_noms_rst("Recette de pancakes #cuisine #food", 3))
+    replis, _ = asyncio.run(app.extraire_noms_rst("Recette de pancakes #cuisine #food", 3))
     assert replis
     assert all(isinstance(nom, str) and nom.strip() for nom in replis)
     assert "cuisine" in [nom.lower() for nom in replis]
@@ -1300,13 +1318,13 @@ def test_rst_cinq_noms_lance_cinq_recherches_et_couvre_chaque_nom(client, monkey
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
-    async def script(_texte):
-        return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "football"}
+    async def script(_texte, *_args):
+        return ({"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "football"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
 
     monkeypatch.setattr(app, "generer_script", script)
 
-    async def noms(_legende, _nombre, _broll=""):
-        return list(noms_ia)
+    async def noms(_legende, _nombre, _broll="", *_args):
+        return (list(noms_ia), None)
 
     monkeypatch.setattr(app, "extraire_noms_rst", noms)
 
@@ -1520,11 +1538,11 @@ def test_rst_conserve_le_rendu_si_la_livraison_leve(client, monkeypatch):
              "author": {"unique_id": "auteur"}},
         ]}
 
-    async def script(_texte):
-        return {"hook": "Paris se prépare", "corps": "Le compte à rebours commence.", "mot_cle_broll": "Paris"}
+    async def script(_texte, *_args):
+        return ({"hook": "Paris se prépare", "corps": "Le compte à rebours commence.", "mot_cle_broll": "Paris"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
 
-    async def noms(_legende, _nombre, _broll=""):
-        return ["Paris"]
+    async def noms(_legende, _nombre, _broll="", *_args):
+        return (["Paris"], None)
 
     async def montage_fake(**_kwargs):
         return {
@@ -1568,13 +1586,13 @@ def test_rst_livre_video_muette_script_et_voix_off(client, monkeypatch):
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
-    async def script(_texte):
-        return {"hook": "Le PSG gagne", "corps": "Un but décisif.", "mot_cle_broll": "football"}
+    async def script(_texte, *_args):
+        return ({"hook": "Le PSG gagne", "corps": "Un but décisif.", "mot_cle_broll": "football"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
 
     monkeypatch.setattr(app, "generer_script", script)
 
-    async def noms(_legende, _nombre, _broll=""):
-        return ["PSG"]
+    async def noms(_legende, _nombre, _broll="", *_args):
+        return (["PSG"], None)
 
     monkeypatch.setattr(app, "extraire_noms_rst", noms)
 
@@ -1664,13 +1682,13 @@ def test_rst_recherche_vide_detaille_les_tentatives(client, monkeypatch):
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
-    async def script(_texte):
-        return {"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "bordeaux"}
+    async def script(_texte, *_args):
+        return ({"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "bordeaux"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
 
     monkeypatch.setattr(app, "generer_script", script)
 
-    async def noms(_legende, _nombre, _broll=""):
-        return ["Bordeaux", "Gironde"]
+    async def noms(_legende, _nombre, _broll="", *_args):
+        return (["Bordeaux", "Gironde"], None)
 
     monkeypatch.setattr(app, "extraire_noms_rst", noms)
 
@@ -1704,13 +1722,13 @@ def test_rst_sans_aucun_nom_elargit_la_recherche_aux_mots_cles(client, monkeypat
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
-    async def script(_texte):
-        return {"hook": "H", "corps": "C.", "mot_cle_broll": "rangement"}
+    async def script(_texte, *_args):
+        return ({"hook": "H", "corps": "C.", "mot_cle_broll": "rangement"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
 
     monkeypatch.setattr(app, "generer_script", script)
 
-    async def aucun_nom(_legende, _nombre, _broll=""):
-        return []                                  # l'IA n'a trouvé aucun nom exploitable
+    async def aucun_nom(_legende, _nombre, _broll="", *_args):
+        return ([], None)  # l'IA n'a trouvé aucun nom exploitable
 
     monkeypatch.setattr(app, "extraire_noms_rst", aucun_nom)
 
@@ -1750,13 +1768,13 @@ def test_rst_sans_requete_possible_le_dit_clairement(client, monkeypatch):
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
 
-    async def script(_texte):
-        return {"hook": "H", "corps": "C.", "mot_cle_broll": ""}
+    async def script(_texte, *_args):
+        return ({"hook": "H", "corps": "C.", "mot_cle_broll": ""}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
 
     monkeypatch.setattr(app, "generer_script", script)
 
-    async def aucun_nom(_legende, _nombre, _broll=""):
-        return []
+    async def aucun_nom(_legende, _nombre, _broll="", *_args):
+        return ([], None)
 
     monkeypatch.setattr(app, "extraire_noms_rst", aucun_nom)
 
@@ -1877,13 +1895,13 @@ def test_rst_bascule_sur_les_sources_publiques_si_tikwm_recherche_repond_403(cli
 
     monkeypatch.setattr(app, "_source_urlebird", urlebird_bloque)
 
-    async def script(_texte):
-        return {"hook": "Le duel des smartphones 2026", "corps": "Galaxy A56 face au Magic 7 Pro.", "mot_cle_broll": "smartphone"}
+    async def script(_texte, *_args):
+        return ({"hook": "Le duel des smartphones 2026", "corps": "Galaxy A56 face au Magic 7 Pro.", "mot_cle_broll": "smartphone"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
 
     monkeypatch.setattr(app, "generer_script", script)
 
-    async def noms(_legende, _nombre, _broll=""):
-        return ["Galaxy A56", "Honor Magic 7 Pro"]
+    async def noms(_legende, _nombre, _broll="", *_args):
+        return (["Galaxy A56", "Honor Magic 7 Pro"], None)
 
     monkeypatch.setattr(app, "extraire_noms_rst", noms)
 
@@ -2666,11 +2684,14 @@ def test_sst_les_noms_ne_sont_jamais_remplaces_ni_completes_par_l_ia(monkeypatch
     et le complément manquant n'utilisent que les noms fournis par l'utilisateur."""
     noms = ["Alpha One", "Beta S", "Gamma X"]
 
+    # Le routeur de texte n'appelle Gemini que s'il est réellement configuré.
+    monkeypatch.setattr(app.CONFIG, "gemini_api_keys", ["cle-de-test"])
+
     async def gemini_indisponible(_parts, **_kwargs):
         raise app.ErreurApp("GEMINI_API_KEYS n'est pas configuré sur le serveur.")
 
     monkeypatch.setattr(app, "_appel_gemini_brut", gemini_indisponible)
-    script = asyncio.run(app.adapter_script_sst("Un classement de véhicules électriques.", noms))
+    script, _ = asyncio.run(app.adapter_script_sst("Un classement de véhicules électriques.", noms))
     for nom in noms:
         assert nom.casefold() in f"{script['hook']} {script['corps']}".casefold()
 
@@ -2681,7 +2702,7 @@ def test_sst_les_noms_ne_sont_jamais_remplaces_ni_completes_par_l_ia(monkeypatch
         return reponse_ia
 
     monkeypatch.setattr(app, "_appel_gemini_brut", gemini_oublieuse)
-    script = asyncio.run(app.adapter_script_sst("Un classement de véhicules électriques.", noms))
+    script, _ = asyncio.run(app.adapter_script_sst("Un classement de véhicules électriques.", noms))
     assert "Gamma X" in script["corps"]  # complété avec le nom fourni, jamais un autre
     assert "Alpha One" in script["corps"] and "Beta S" in script["corps"]
     assert script["hook"] == "TOP 3 spécial"
@@ -3100,3 +3121,309 @@ def test_sst_reduit_les_sources_sous_la_limite_de_temps_comme_rst(client, monkey
     assert len(avec_reference) == len(avec_reference) < len(sans_reference) < 12
     # Le verdict par plan du contrôle qualité final remonte jusqu'au résultat du travail.
     assert job["plan_verification"][0]["conforme"] is True
+
+
+# ======================================================================================
+# FOURNISSEURS DE TEXTE : GEMINI / GROQ / MISTRAL (sélection auto ou manuelle)
+# ======================================================================================
+
+
+def _corps_openai(contenu: str) -> str:
+    """Corps de réponse d'une API compatible OpenAI (Groq / Mistral)."""
+    return json.dumps({"choices": [{"message": {"role": "assistant", "content": contenu}}]})
+
+
+SCRIPT_FOURNISSEUR = json.dumps(
+    {"hook": "Accroche du fournisseur", "corps": "Corps du corps.", "mot_cle_broll": "atelier"},
+    ensure_ascii=False,
+)
+
+
+class _ReponseFournisseur:
+    def __init__(self, statut: int, corps: str, headers: dict | None = None) -> None:
+        self.status = statut
+        self._corps = corps
+        self.headers = dict(headers or {})
+
+    async def text(self) -> str:
+        return self._corps
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _FausseSessionFournisseurs:
+    """Session simulée routée par hôte : Gemini, Groq, Mistral (et Pexels plus loin).
+
+    `defaut[hote]` = réponse permanente ; `reponses[hote]` = pile consommée dans
+    l'ordre (pour les scénarios « 429 puis 200 »).
+    """
+
+    appels: list[str] = []
+    defaut: dict[str, tuple[int, str, dict]] = {}
+    reponses: dict[str, list] = {}
+
+    def __init__(self, *_args, timeout=None, **_kwargs) -> None:
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    def post(self, url, headers=None, json=None, timeout=None):  # noqa: A002
+        import urllib.parse
+
+        hote = urllib.parse.urlparse(url).netloc
+        type(self).appels.append(hote)
+        pile = type(self).reponses.get(hote)
+        if pile:
+            statut, corps, entetes = pile.pop(0)
+        else:
+            statut, corps, entetes = type(self).defaut.get(
+                hote, (500, '{"error":"host non programmé dans le test"}', {})
+            )
+        return _ReponseFournisseur(statut, corps, headers=entetes)
+
+
+@pytest.fixture
+def fournisseurs_simules(monkeypatch):
+    """Isole les fournisseurs de texte : aucun réseau, aucune attente réelle."""
+    _FausseSessionFournisseurs.appels = []
+    _FausseSessionFournisseurs.defaut = {}
+    _FausseSessionFournisseurs.reponses = {}
+    monkeypatch.setattr(app.aiohttp, "ClientSession", _FausseSessionFournisseurs)
+    # Zéro backoff (routeur de texte ET boucle interne Gemini) : aucune attente réelle.
+    monkeypatch.setattr(app, "FOURNISSEURS_TEXTE_BACKOFF", (0.0, 0.0))
+    monkeypatch.setattr(app, "GEMINI_BACKOFF", (0.0, 0.0, 0.0, 0.0))
+    return _FausseSessionFournisseurs
+
+
+@pytest.mark.parametrize(
+    "brut,attendu",
+    [
+        ("gemini,groq,mistral", ["gemini", "groq", "mistral"]),
+        ("GROQ , gemini", ["groq", "gemini"]),
+        ("gemini,gemini,xyz", ["gemini"]),
+        ("", []),
+        ("xyz,abc", []),
+    ],
+)
+def test_purification_ordre_fournisseurs_texte(brut, attendu):
+    assert app._purer_ordre_fournisseurs_texte(brut) == attendu
+
+
+def test_endpoint_fournisseurs_texte_annonce_la_configuration_sans_inventer_le_quota(
+    fournisseurs_simules, client, monkeypatch
+):
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "cle-groq-test")
+    monkeypatch.setattr(app.CONFIG, "mistral_api_key", "cle-mistral-test")
+    donnees = client.get("/api/fournisseurs-texte").json()
+    assert donnees["ordre"] == ["gemini", "groq", "mistral"]  # ordre par défaut
+    par_nom = {f["nom"]: f for f in donnees["fournisseurs"]}
+    assert par_nom["gemini"]["configure"] is False
+    assert par_nom["groq"]["configure"] is True
+    assert par_nom["mistral"]["configure"] is True
+    # L'API n'a rien communiqué : aucun quota, aucun reset — rien n'est inventé.
+    for nom in ("gemini", "groq", "mistral"):
+        assert par_nom[nom]["quota_communiquee"] is None
+        assert par_nom[nom]["fenetre_reinitialisee"] is None
+
+
+def test_quota_communiquee_par_l_api_est_relayee_telle_quelle(
+    fournisseurs_simules, client, monkeypatch
+):
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "cle-groq-test")
+    _FausseSessionFournisseurs.defaut["api.groq.com"] = (
+        200,
+        _corps_openai(SCRIPT_FOURNISSEUR),
+        {
+            "x-ratelimit-remaining-requests": "12",
+            "x-ratelimit-limit-requests": "3000",
+            "x-ratelimit-reset-requests": "2026-12-31T23:59:59Z",
+        },
+    )
+    asyncio.run(app.generer_script("Une idée.", "groq"))
+    donnees = client.get("/api/fournisseurs-texte").json()
+    groq = next(f for f in donnees["fournisseurs"] if f["nom"] == "groq")
+    assert groq["quota_communiquee"] == {"restant": 12, "limite": 3000}
+    assert groq["fenetre_reinitialisee"] == "2026-12-31T23:59:59Z"
+
+
+def test_bascule_auto_gemini_vers_groq_est_journalisee(
+    fournisseurs_simules, monkeypatch, caplog
+):
+    monkeypatch.setattr(app.CONFIG, "gemini_api_keys", ["cle-gemini-test"])
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "cle-groq-test")
+    # Gemini répond 429 (quota), Groq répond normalement.
+    _FausseSessionFournisseurs.defaut["generativelanguage.googleapis.com"] = (
+        429, '{"error":{"message":"quota exceeded"}}', {"Retry-After": "0"}
+    )
+    _FausseSessionFournisseurs.defaut["api.groq.com"] = (
+        200, _corps_openai(SCRIPT_FOURNISSEUR), {}
+    )
+    with caplog.at_level(logging.WARNING, logger="videoapp"):
+        script, resultat = asyncio.run(app.generer_script("Une idée.", "auto"))
+    assert resultat.fournisseur == "groq"
+    assert script["hook"] == "Accroche du fournisseur"
+    assert resultat.bascules and "Gemini → Groq" in resultat.bascules[0]
+    assert any(
+        "bascule Gemini → Groq" in record.message for record in caplog.records
+    )
+    # Toutes les tentatives d'abord vers Gemini (boucle interne : modèles ×
+    # tentatives), puis la bascule journalisée vers Groq.
+    appels = _FausseSessionFournisseurs.appels
+    assert appels[-1] == "api.groq.com"
+    assert all(h == "generativelanguage.googleapis.com" for h in appels[:-1])
+
+
+def test_selection_manuelle_ne_bascule_jamais_silencieusement(
+    fournisseurs_simules, monkeypatch
+):
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "cle-groq-test")
+    monkeypatch.setattr(app.CONFIG, "mistral_api_key", "cle-mistral-test")
+    # Groq reste saturé : pas de repli silencieux vers Mistral.
+    _FausseSessionFournisseurs.defaut["api.groq.com"] = (
+        429, '{"error":"rate limit"}', {"Retry-After": "0"}
+    )
+    with pytest.raises(app.ErreurApp) as exc:
+        asyncio.run(app.generer_script("Une idée.", "groq"))
+    assert "Groq" in str(exc.value)
+    assert _FausseSessionFournisseurs.appels == ["api.groq.com"] * app.FOURNISSEURS_TEXTE_TENTATIVES
+
+    # Un fournisseur nommé mais non configuré : erreur explicite, aucun appel.
+    _FausseSessionFournisseurs.appels.clear()
+    monkeypatch.setattr(app.CONFIG, "mistral_api_key", "")
+    with pytest.raises(app.ErreurApp) as exc2:
+        asyncio.run(app.generer_script("Une idée.", "mistral"))
+    assert "n'est pas configuré" in str(exc2.value)
+    assert _FausseSessionFournisseurs.appels == []
+
+
+def test_aucun_fournisseur_configure_donne_un_message_explicite(
+    fournisseurs_simules, monkeypatch
+):
+    monkeypatch.setattr(app.CONFIG, "gemini_api_keys", [])
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "")
+    monkeypatch.setattr(app.CONFIG, "mistral_api_key", "")
+    with pytest.raises(app.ErreurApp) as exc:
+        asyncio.run(app.generer_script("Une idée.", "auto"))
+    assert "Aucun fournisseur de texte configuré" in str(exc.value)
+    assert _FausseSessionFournisseurs.appels == []
+
+
+def test_remise_a_zero_distincte_d_un_simple_retry_after(
+    fournisseurs_simules, monkeypatch
+):
+    """Retry-After: 1 s ne veut pas dire « quota remis à zéro dans 1 s ».
+
+    La pause suit le Retry-After ; le reset communiqué (ici +40 s) est conservé
+    à part, dans l'état du fournisseur, et n'est jamais confondu avec la pause.
+    """
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "cle-groq-test")
+    futur = (
+        datetime.now(timezone.utc) + timedelta(seconds=40)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _FausseSessionFournisseurs.defaut["api.groq.com"] = (
+        429,
+        '{"error":"rate limit"}',
+        {
+            "Retry-After": "1",
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-reset-requests": futur,
+        },
+    )
+    pauses: list[float] = []
+    vrai_sleep = asyncio.sleep
+
+    async def sleep_suite(secondes: float) -> None:
+        pauses.append(secondes)
+        await vrai_sleep(min(secondes, 0.05))
+
+    monkeypatch.setattr(app.asyncio, "sleep", sleep_suite)
+    with pytest.raises(app.ErreurApp):
+        asyncio.run(app.generer_script("Une idée.", "groq"))
+    # La pause est le Retry-After (1 s), pas le reset (+40 s) ni le backoff.
+    assert pauses and all(pause == 1.0 for pause in pauses)
+    etat = app.QUOTAS_FOURNISSEURS["groq"]
+    assert etat.restant == 0
+    assert etat.reset_iso == futur
+    assert etat.reset_unix is not None
+    assert abs(etat.reset_unix - (time.time() + 40)) < 5
+
+
+def test_fournisseur_pinne_utilise_seulement_ce_provider(
+    fournisseurs_simules, monkeypatch
+):
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "cle-groq-test")
+    _FausseSessionFournisseurs.defaut["api.groq.com"] = (
+        200, _corps_openai(SCRIPT_FOURNISSEUR), {}
+    )
+    script, resultat = asyncio.run(app.generer_script("Une idée.", "groq"))
+    assert script == {
+        "hook": "Accroche du fournisseur",
+        "corps": "Corps du corps.",
+        "mot_cle_broll": "atelier",
+    }
+    assert resultat.fournisseur == "groq"
+    assert resultat.bascules == []
+    assert _FausseSessionFournisseurs.appels == ["api.groq.com"]
+
+
+def test_requetes_refusent_un_fournisseur_inconnu_au_lancement(client):
+    reponse = client.post(
+        "/api/jobs/analyser",
+        json={"lien": "https://example.com/article", "fournisseur": "openai"},
+    )
+    assert reponse.status_code == 400
+    assert "Fournisseur de texte inconnu" in reponse.json()["detail"]
+
+    reponse = client.post(
+        "/api/jobs/rst",
+        json={
+            "lien": "https://www.tiktok.com/@chef/video/111",
+            "fournisseur": "groq2",
+        },
+    )
+    assert reponse.status_code == 400
+    assert "Fournisseur de texte inconnu" in reponse.json()["detail"]
+
+    reponse = client.post(
+        "/api/jobs/sst",
+        json={
+            "lien": "https://www.tiktok.com/@chef/video/111",
+            "nombre_noms": 3,
+            "noms": ["Alpha", "Beta", "Gamma"],
+            "fournisseur": "mistral2",
+        },
+    )
+    assert reponse.status_code == 400
+    assert "Fournisseur de texte inconnu" in reponse.json()["detail"]
+
+
+def test_interface_presente_fournisseurs_texte_et_theme_noir():
+    static = Path(__file__).parents[1] / "static"
+    index = (static / "index.html").read_text()
+    styles = (static / "styles.css").read_text()
+    js = (static / "main.js").read_text()
+
+    # Carte Paramètres : sélection auto/manuelle + état réel lu depuis le serveur.
+    assert "Fournisseurs IA (texte)" in index
+    assert 'data-fournisseur="auto"' in index and 'data-fournisseur="groq"' in index
+    assert 'data-fournisseur="mistral"' in index and "fournisseur-list" in index
+    # Affichage : aucun thème codé en dur — clair / noir / auto.
+    assert 'data-theme-choix="noir"' in index
+    assert 'data-theme-choix="clair"' in index
+    assert 'data-theme-choix="auto"' in index
+    # Le thème noir est une variante complète des variables, fond noir pur.
+    assert '[data-theme="noir"]' in styles
+    assert "--bg: #000000" in styles
+    # Le JS pose l'attribut de thème et suit le système en « auto ».
+    assert "appliquerTheme" in js and "prefers-color-scheme" in js
+    assert "fournisseurs-texte" in js
+    # La ligne « IA utilisée » figure dans le suivi.
+    assert "iaUtiliseeLigne" in js

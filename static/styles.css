@@ -1,8 +1,10 @@
 /* =====================================================================
-   ς੮ ς८Րɿƿ┮ — Studio vidéo · redesign clair, inspiré d'une esthétique
-   « premium minimaliste » (fonds doux, cartes arrondies, ombres discrètes,
-   typographie système). Aucune ressource externe, aucun logo ni nom de marque
-   tiers. HTML/CSS/JS natif uniquement.
+   ς੮ ς८Րɿƿ┮ — Studio vidéo · thème « premium minimaliste » (fonds doux,
+   cartes arrondies, ombres discrètes, typographie système), décliné en
+   deux thèmes : clair (défaut) et noir (fond #000). Aucun thème n'est codé
+   en dur : `data-theme` sur <html> décide, seules les variables changent.
+   Aucune ressource externe, aucun logo ni nom de marque tiers.
+   HTML/CSS/JS natif uniquement.
    ===================================================================== */
 
 :root {
@@ -1439,4 +1441,125 @@ select {
     scroll-behavior: auto !important;
   }
   .nav-dot, .pulse { animation: none !important; }
+}
+
+/* =====================================================================
+   THÈME NOIR — noir profond, même structure que le thème clair.
+   Aucun thème n'est codé en dur dans le HTML ou le JS : l'attribut
+   `data-theme` sur <html> est posé par main.js (choix utilisateur ou
+   `prefers-color-scheme` du système), et seules les variables changent.
+   ===================================================================== */
+
+:root[data-theme="noir"] {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg: #000000;
+  --bg-soft: #0a0a0b;
+  --surface: #101014;
+  --surface-2: #17171c;
+  --surface-glass: rgba(8, 8, 10, 0.72);
+  --fill: rgba(245, 245, 247, 0.09);
+  --fill-strong: rgba(245, 245, 247, 0.16);
+
+  /* Bordures : les contours de contrôles restent au moins 3:1 */
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --control-border: #8e8e93;
+
+  /* Texte : niveaux ≥ 4.5:1 sur les surfaces sombres */
+  --text: #f5f5f7;
+  --text-2: #d9d9de;
+  --muted: #a8a8ae;
+  --faint: #8e8e93;
+
+  /* Accent bleu nocturne */
+  --accent: #0a84ff;
+  --accent-hover: #409cff;
+  --accent-ink: #74b9ff;
+  --accent-soft: rgba(10, 132, 255, 0.18);
+  --accent-ring: rgba(10, 132, 255, 0.55);
+  --on-accent: #ffffff;
+
+  /* États sémantiques (versions clairées pour le contraste) */
+  --success: #30d158;
+  --success-dot: #30d158;
+  --success-soft: rgba(48, 209, 88, 0.14);
+  --warning: #ff9f0a;
+  --warning-dot: #ff9f0a;
+  --warning-soft: rgba(255, 159, 10, 0.14);
+  --danger: #ff453a;
+  --danger-dot: #ff453a;
+  --danger-soft: rgba(255, 69, 58, 0.12);
+
+  /* Ombres : sur fond noir, l'ombre est surtout un contour doux */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.45);
+  --shadow: 0 2px 6px rgba(0, 0, 0, 0.4), 0 14px 36px rgba(0, 0, 0, 0.55);
+  --shadow-lift: 0 4px 12px rgba(0, 0, 0, 0.5), 0 22px 48px rgba(0, 0, 0, 0.65);
+}
+
+:root[data-theme="noir"] body::before {
+  background:
+    radial-gradient(900px 520px at 90% -12%, rgba(10, 132, 255, 0.08), transparent 62%),
+    radial-gradient(760px 480px at -8% 24%, rgba(16, 16, 20, 0.85), transparent 60%);
+}
+
+:root[data-theme="noir"] ::selection { background: rgba(10, 132, 255, 0.35); }
+
+/* Barre latérale mobile : fond opaque adapté au noir (le thème clair en définit
+   un blanc dans le media query). */
+:root[data-theme="noir"] .sidebar { background: rgba(8, 8, 10, 0.94); }
+
+/* ============================== FOURNISSEURS IA (TEXTE) ============================== */
+
+.fournisseur-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.fournisseur-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 13.5px;
+}
+
+.fournisseur-item .fournisseur-nom {
+  font-weight: 650;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fournisseur-item i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--success-dot);
+  display: inline-block;
+}
+
+.fournisseur-item i.off { background: var(--faint); }
+
+.fournisseur-meta {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.fournisseur-erreur {
+  width: 100%;
+  color: var(--danger);
+  font-size: 12.5px;
+}
+
+.fournisseur-tete {
+  font-weight: 650;
 }

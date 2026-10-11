@@ -12,6 +12,17 @@ services:
         sync: false
       - key: PEXELS_API_KEY
         sync: false
+      # Fournisseurs de TEXTE (scripts, extraction de noms, adaptations) : la
+      # sélection se fait dans l'interface (auto = ordre ci-dessous, bascule
+      # journalisée ; ou fournisseur nommé sans repli silencieux). Gemini reste
+      # obligatoire pour l'audio, la vidéo et la validation visuelle des plans.
+      # Les clés restent côté serveur, jamais dans Git ni dans le navigateur.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: FOURNISSEURS_TEXTE_ORDRE
+        value: gemini,groq,mistral
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
       # Chaîne de modèles de secours essayée dans l'ordre. Quand Google répond 503
