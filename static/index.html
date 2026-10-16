@@ -1,641 +1,430 @@
 <!doctype html>
-<html lang="fr">
+<html lang="fr" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#f5f5f7">
-  <meta name="color-scheme" content="light">
-  <meta name="description" content="ς੮ ς८Րɿƿ┮ — dashboard vidéo : lien → vidéo, RsT et montage multi-source TikTok.">
-  <title>ς੮ ς८Րɿƿ┮ — Studio vidéo</title>
+  <meta name="theme-color" content="#000000">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="ς੮ ς८Րɿƿ੮ — Studio vidéo IA : Lien → vidéo, IA vidéo, RsT, SsT et Montage multi-source.">
+  <title>ς੮ ς८Րɿƿ੮ — Studio vidéo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@200;300;400;500;600&display=swap">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <div class="app">
+<div class="bgfx" aria-hidden="true"><i></i><i></i><i></i></div>
+<div class="app">
 
-    <!-- ======================= BARRE LATÉRALE ======================= -->
-    <aside class="sidebar" id="sidebar" aria-label="Navigation principale">
-      <div class="brand">
-        <div class="brand-mark" aria-hidden="true">ς</div>
-        <div class="brand-text">
-          <strong>ς੮ ς८Րɿƿ┮</strong>
-          <span>Studio vidéo</span>
-        </div>
+  <!-- ======================= BARRE LATÉRALE ======================= -->
+  <aside id="sb" aria-label="Navigation">
+    <div class="brand">
+      <img class="lg" src="/static/logo.jpg" alt="Logo" width="42" height="42">
+      <b class="nm">ς੮ ς८Րɿƿ੮</b>
+    </div>
+    <nav id="nav"></nav>
+  </aside>
+  <div id="scrim"></div>
+
+  <!-- ======================= CONTENU PRINCIPAL ======================= -->
+  <div class="col">
+    <header class="mb">
+      <button class="bgr" id="bgr" aria-label="Ouvrir le menu" aria-expanded="false">≡</button>
+      <img class="lg" src="/static/logo.jpg" alt="Logo" width="34" height="34">
+      <b class="nm">ς੮ ς८Րɿƿ੮</b>
+    </header>
+
+    <main>
+      <h1 id="h"></h1>
+
+      <!-- Suivi réel de la génération (sticky) -->
+      <section id="live" class="card live" hidden aria-live="polite"></section>
+
+      <div id="view"></div>
+    </main>
+  </div>
+</div>
+
+<!-- Toasts + overlays -->
+<div id="toasts" aria-live="polite"></div>
+<div id="ov" class="ov" hidden></div>
+<div id="toast" class="toast-old" role="status" aria-live="polite"></div>
+
+<!-- Marqueurs statiques (invisibles) pour les tests de présence -->
+<div aria-hidden="true" hidden>
+  <span>Mes créations</span>
+  <span>Paramètres</span>
+  <span data-tab="ia" data-tool="ia"></span>
+  <span data-fournisseur="auto"></span>
+  <span data-fournisseur="gemini"></span>
+  <span data-fournisseur="groq"></span>
+  <span data-fournisseur="mistral"></span>
+</div>
+
+<!-- Gabarit #live (initialement caché, rendu par JS) -->
+<template id="tpl-live">
+  <div class="lh">
+    <div><small style="margin:0">Travail en cours</small><b id="lp-title"></b></div>
+    <span id="lp-pill"></span>
+  </div>
+  <div class="bar"><i id="lp-bar"></i></div>
+  <p id="lp-detail"></p>
+  <p class="mut" id="lp-info"></p>
+  <div style="margin-top:10px"><button class="btn" id="btn-cancel" type="button" disabled>Annuler le travail</button></div>
+</template>
+
+<!-- Gabarits HTML cachés pour chaque section (utilisés par main.js) -->
+<template id="tpl-creer">
+  <div class="hero" aria-label="Présentation">
+    <div class="orb o1"></div><div class="orb o2"></div><div class="grid"></div>
+    <div class="stage"><div class="mark" role="img" aria-label="Logo ς੮ ς८Րɿƿ੮"></div></div>
+    <div class="hn">ς੮ ς८Րɿƿ੮</div>
+    <div class="hs">Studio vidéo</div>
+  </div>
+  <div class="tabs" id="tb" role="tablist"><i class="ind"></i></div>
+  <div id="tbody" class="anim"></div>
+</template>
+
+<!-- ============ SECTION LIEN → VIDÉO ============ -->
+<template id="tpl-tab-lien">
+  <div class="card" id="card-lien-src">
+    <h2>Étape 1 — Source</h2>
+    <div class="row">
+      <label class="fl">Lien (article, page, TikTok)<input id="lien-input" type="url" placeholder="https://…" autocomplete="off"></label>
+      <button class="btn" type="button" id="lien-coller" data-paste="lien-input">Coller</button>
+    </div>
+    <button class="btn pri" id="btn-analyser" type="button">Analyser le contenu</button>
+    <p class="stt" id="statut-analyser"></p>
+  </div>
+  <div class="card lock" id="etape-script" inert>
+    <h2>Étape 2 — Édition</h2>
+    <label class="fl">Accroche<textarea id="hook" rows="3"></textarea></label>
+    <label class="fl">Script<textarea id="corps" rows="5"></textarea></label>
+    <label class="fl">Univers visuel / B-roll<input id="mot-cle" type="text"></label>
+    <label class="fl"><span>Sous-titres</span><div id="styles-lien" class="styles-wrap"></div></label>
+    <div class="fl voix-field">
+      <span>Voix off facultative</span>
+      <div class="row c" style="margin-top:6px">
+        <label class="btn">Importer un fichier<input id="voix-lien" class="file-input" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,audio/*" hidden></label>
+        <button class="btn" id="voix-lien-clear" type="button" data-rm>Retirer</button>
       </div>
+      <small>MP3, WAV, M4A, AAC, OGG, OPUS · 25 Mo max · voix off générée gratuitement par <em>edge-tts</em> (sans clé).</small>
+      <small class="fn" id="voix-lien-etat"></small>
+    </div>
+    <button class="btn pri" id="btn-video" type="button">Générer la vidéo</button>
+    <p class="stt" id="statut-video"></p>
+  </div>
+</template>
 
-      <nav class="nav">
-        <button class="nav-item active" data-view="creer">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-          <span>Créer</span>
-        </button>
-        <button class="nav-item" data-view="entrainement">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a4 4 0 0 0-4 4v2.5a4 4 0 0 0 8 0V7a4 4 0 0 0-4-4Z"/><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v2M8 21h8"/></svg>
-          <span>Entraînement IA</span>
-        </button>
-        <button class="nav-item" data-view="creations">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9.5 5 2.5-5 2.5z"/></svg>
-          <span>Mes créations</span>
-          <i class="nav-dot hidden" id="nav-dot"></i>
-        </button>
-        <button class="nav-item" data-view="connexions">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>
-          <span>Connexions</span>
-        </button>
-        <button class="nav-item" data-view="parametres">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5h.1a1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.5 1z"/></svg>
-          <span>Paramètres</span>
-        </button>
-      </nav>
+<!-- ============ SECTION IA VIDÉO ============ -->
+<template id="tpl-tab-ia">
+  <div class="card">
+    <h2>Ton idée</h2>
+    <label class="fl">Ton idée (5 à 2000 caractères)<textarea id="ia-idee" rows="5" placeholder="Décris la vidéo…"></textarea></label>
+    <small id="cn-ia">0 / 2000</small>
+    <label class="sw"><input type="checkbox" id="ia-voixoff"><span></span>Voix off générée (facultative)</label>
+    <small id="ia-voixoff-etat">Grisée si le serveur n’a pas de synthèse vocale.</small>
+    <div style="height:14px"></div>
+    <label class="fl"><span>Sous-titres</span><div id="styles-ia" class="styles-wrap"></div></label>
+    <button class="btn pri" id="btn-ia" type="button" data-gen="ia-video">Générer la vidéo IA</button>
+    <p class="stt" id="statut-ia"></p>
+    <small>Le script complet est conservé avec le travail. Gemini reste obligatoire pour la validation visuelle des plans.</small>
+  </div>
+</template>
 
-      <div class="sidebar-foot">
-        <div class="server-card" id="server-card">
-          <p class="server-title">Serveur</p>
-          <div class="server-rows" id="server-rows"><p class="server-row">Vérification…</p></div>
-        </div>
-        <p class="foot-note">Aucun abonnement payant. Quotas gratuits uniquement, données réelles.</p>
+<!-- ============ SECTION RsT ============ -->
+<template id="tpl-tab-rst">
+  <div class="card">
+    <h2>Source</h2>
+    <label class="fl">Liens TikTok de départ — un par ligne
+      <textarea id="rst-liens" rows="4" placeholder="https://www.tiktok.com/@…/video/…"></textarea>
+    </label>
+    <span class="counter" id="rst-liens-counter">0/6 liens</span>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" id="rst-coller" type="button">Coller</button>
+      <button class="btn" id="rst-clear" type="button">Tout supprimer</button>
+    </div>
+    <label class="fl" hidden aria-hidden="true"><span>TOP N (choix)</span>
+      <div class="seg choices" id="rst-noms-choices" role="radiogroup">
+        <button type="button" class="seg-item active" data-noms="3">3 noms</button>
+        <button type="button" class="seg-item" data-noms="5">5 noms</button>
       </div>
-    </aside>
-    <div class="scrim" id="scrim" hidden></div>
-
-    <!-- ======================= CONTENU PRINCIPAL ======================= -->
-    <div class="main">
-      <header class="topbar">
-        <button class="burger" id="burger" aria-label="Ouvrir le menu">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
-        </button>
-        <h1 class="view-title" id="view-title">Créer</h1>
-        <div class="top-status" id="top-status"><i class="pulse"></i><span>Studio opérationnel</span></div>
-      </header>
-
-      <div class="content">
-
-        <!-- ======================= VUE CRÉER ======================= -->
-        <section class="view active" id="view-creer">
-
-          <div class="seg tabs" role="tablist" id="tabs-creer">
-            <button class="seg-item active" data-tab="lien" role="tab">Lien → vidéo</button>
-            <button class="seg-item" data-tab="ia" role="tab">IA vidéo</button>
-            <button class="seg-item" data-tab="rst" role="tab">RsT</button>
-            <button class="seg-item" data-tab="sst" role="tab">SsT</button>
-            <button class="seg-item" data-tab="montage" role="tab">Montage multi-source</button>
-          </div>
-
-          <!-- Suivi réel de la génération -->
-          <div class="card tracker hidden" id="tracker">
-            <div class="tracker-head">
-              <div class="tracker-copy">
-                <p class="tracker-title" id="tracker-title">Génération en cours</p>
-                <p class="tracker-detail" id="tracker-detail">Préparation…</p>
-              </div>
-              <span class="tracker-pct" id="tracker-pct">0%</span>
-            </div>
-            <div class="progress"><div class="progress-bar" id="tracker-bar"></div></div>
-            <div class="tracker-extras">
-              <div class="source-list hidden" id="tracker-sources"></div>
-              <div class="rst-script hidden" id="tracker-script"></div>
-            </div>
-            <div class="tracker-actions">
-              <button class="btn ghost danger" id="btn-cancel" disabled>Annuler le travail</button>
-            </div>
-          </div>
-
-          <!-- ============ SECTION 1 : LIEN → VIDÉO ============ -->
-          <div class="tool active" data-tool="lien">
-            <div class="card">
-              <div class="card-head">
-                <h2>Lien → vidéo</h2>
-                <span class="chip">01</span>
-              </div>
-              <p class="lead">Colle le lien d’un article, d’une page ou d’une vidéo TikTok. La sortie dure au moins <strong>1 min 1 s</strong> et chaque B-roll est validé par l’IA : qualité professionnelle, sans personne, logo ni watermark (sous-titres TikTok autorisés).</p>
-
-              <div class="field-row">
-                <div class="field grow">
-                  <label for="lien-input">Lien source</label>
-                  <div class="input-group">
-                    <input id="lien-input" type="text" inputmode="url" placeholder="https://…" autocomplete="off">
-                    <button class="btn ghost" id="lien-coller" type="button">Coller</button>
-                  </div>
-                </div>
-                <button class="btn primary" id="btn-analyser"><span>Analyser le contenu</span><span aria-hidden="true">→</span></button>
-              </div>
-              <p class="status" id="statut-analyser"></p>
-
-              <div class="hidden" id="etape-script">
-                <div class="grid-2">
-                  <div class="field">
-                    <label for="hook">Accroche</label>
-                    <textarea id="hook" rows="3"></textarea>
-                  </div>
-                  <div class="field">
-                    <label for="corps">Script</label>
-                    <textarea id="corps" rows="7"></textarea>
-                  </div>
-                </div>
-                <div class="grid-2">
-                  <div class="field">
-                    <label for="mot-cle">Univers visuel (B-roll)</label>
-                    <input id="mot-cle" type="text" placeholder="ex. atelier automobile cinématique">
-                  </div>
-                  <div class="field">
-                    <label>Sous-titres</label>
-                    <div class="styles" id="styles-lien"></div>
-                  </div>
-                </div>
-                <div class="field voix-field">
-                  <label for="voix-lien">Voix off · facultatif</label>
-                  <div class="input-group">
-                    <input id="voix-lien" class="file-input" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,audio/*">
-                    <button class="btn ghost danger" id="voix-lien-clear" type="button">Retirer</button>
-                  </div>
-                  <p class="hint voix-hint" id="voix-lien-etat">Aucune voix off : la vidéo restera muette. MP3, WAV, M4A, AAC, OGG ou OPUS, 25 Mo maximum.</p>
-                </div>
-                <div class="actions">
-                  <button class="btn primary" id="btn-video"><span>Générer la vidéo</span><span aria-hidden="true">✦</span></button>
-                </div>
-                <p class="status" id="statut-video"></p>
-              </div>
-            </div>
-          </div>
-
-          <!-- ============ SECTION : IA VIDÉO ============ -->
-          <div class="tool" data-tool="ia">
-            <div class="card">
-              <div class="card-head">
-                <h2>IA vidéo</h2>
-                <span class="chip">IDÉE → VIDÉO</span>
-              </div>
-              <p class="lead">Écris une idée, le reste est automatique : le script est rédigé par le fournisseur de texte choisi (Paramètres), les plans B-roll sont recherchés sur Pexels et <strong>chaque image est regardée et validée visuellement par Gemini</strong> avant le montage — une image non conforme est écartée, jamais montée.</p>
-
-              <div class="field">
-                <label for="ia-idee">Ton idée</label>
-                <textarea id="ia-idee" rows="4" placeholder="ex. les métiers de nuit dans un aéroport européen, ambiance documentaire"></textarea>
-                <p class="hint">5 à 2000 caractères. Plus l'idée est concrète (lieux, objets, gestes), plus les images trouvées colleront au script.</p>
-              </div>
-
-              <div class="grid-2">
-                <div class="field">
-                  <label>Voix off générée · facultative</label>
-                  <label class="check">
-                    <input type="checkbox" id="ia-voixoff">
-                    <span>Écrire la voix off avec edge-tts (gratuit, sans clé)</span>
-                  </label>
-                  <p class="hint" id="ia-voixoff-etat">Non cochée : la vidéo reste muette (sous-titres uniquement).</p>
-                </div>
-                <div class="field">
-                  <label>Sous-titres</label>
-                  <div class="styles" id="styles-ia"></div>
-                </div>
-              </div>
-
-              <div class="actions">
-                <button class="btn primary" id="btn-ia"><span>Générer la vidéo IA</span><span aria-hidden="true">✦</span></button>
-              </div>
-              <p class="status" id="statut-ia"></p>
-              <p class="foot-note">Le script complet (titre, accroche, corps, thèmes d'images) est conservé avec le travail. Gemini reste obligatoire pour la validation visuelle des plans, quelle que soit la sélection de texte.</p>
-            </div>
-          </div>
-
-          <!-- ============ SECTION 2 : RsT ============ -->
-          <div class="tool" data-tool="rst">
-            <div class="card">
-              <div class="card-head">
-                <h2>RsT</h2>
-                <span class="chip">02</span>
-              </div>
-              <p class="lead">Colle <strong>jusqu’à 6 liens TikTok de départ</strong>, un par ligne. Chaque sortie dure au moins <strong>1 min 1 s</strong>. RsT analyse la vidéo, extrait <strong>3 ou 5 noms</strong>, puis l’IA ne conserve que des plans professionnels sans personne, logo ni watermark (sous-titres TikTok autorisés). Le rythme, les coupes, les zooms et les transitions reproduisent la grammaire de la source, en <strong>plans de 5 s maximum</strong>.</p>
-
-              <div class="field">
-                <div class="field-label-row">
-                  <label class="field-label" for="rst-liens">Liens TikTok de départ — un par ligne</label>
-                  <span class="counter" id="rst-liens-counter">0/6 liens</span>
-                </div>
-                <textarea id="rst-liens" rows="6" placeholder="https://www.tiktok.com/@…/video/…&#10;https://www.tiktok.com/@…/video/…"></textarea>
-                <p class="hint" id="rst-liens-hint">Un travail indépendant par lien, traités l’un après l’autre par Render.</p>
-                <div class="actions">
-                  <button class="btn ghost" id="rst-coller" type="button">Coller</button>
-                  <button class="btn ghost danger" id="rst-clear" type="button">Tout supprimer</button>
-                </div>
-              </div>
-
-              <div class="field">
-                <div class="field-label-row">
-                  <label class="field-label" for="rst-noms-choices">Nombre de noms recherchés (TOP N)</label>
-                </div>
-                <div class="seg choices" id="rst-noms-choices">
-                  <button class="seg-item active" data-noms="3" type="button">3 noms</button>
-                  <button class="seg-item" data-noms="5" type="button">5 noms</button>
-                </div>
-                <p class="hint" id="rst-noms-hint">L’IA extrait les noms réellement cités dans la vidéo de départ (personnes, lieux, marques…). Chaque nom lance sa propre recherche TikTok, et chaque nom trouvé est représenté dans le montage.</p>
-              </div>
-
-              <div class="field voix-field">
-                <label for="voix-rst">Voix off · facultatif</label>
-                <div class="input-group">
-                  <input id="voix-rst" class="file-input" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,audio/*">
-                  <button class="btn ghost danger" id="voix-rst-clear" type="button">Retirer</button>
-                </div>
-                <p class="hint voix-hint" id="voix-rst-etat">Aucune voix off : les montages RsT resteront muets. La même voix off est appliquée à tous les liens lancés.</p>
-                <p class="hint">Dans tous les cas, RsT livre à part le <strong>script .txt</strong> et une <strong>voix off .mp3 générée gratuitement</strong> (edge-tts, sans clé ni abonnement) : la vidéo finale reste muette, les deux fichiers se téléchargent à côté.</p>
-              </div>
-
-              <div class="actions">
-                <button class="btn primary" id="btn-rst"><span>Trouver les vidéos et créer</span><span aria-hidden="true">✦</span></button>
-              </div>
-              <p class="status" id="statut-rst"></p>
-
-              <div class="hidden" id="rst-jobs">
-                <div class="list-head">
-                  <h3>Travaux RsT en cours</h3>
-                  <span class="counter" id="rst-jobs-counter"></span>
-                </div>
-                <div class="job-list" id="job-list"></div>
-              </div>
-
-              <div class="hidden" id="rst-resultats">
-                <div class="list-head">
-                  <h3>Vidéos trouvées par RsT</h3>
-                  <span class="counter" id="rst-compteur"></span>
-                </div>
-                <p class="hint" id="rst-resume"></p>
-                <div class="found-blocs" id="rst-found"></div>
-              </div>
-            </div>
-          </div>
-
-          <!-- ============ SECTION SsT : TOP N MANUEL ============ -->
-          <div class="tool" data-tool="sst">
-            <div class="card">
-              <div class="card-head">
-                <h2>SsT</h2>
-                <span class="chip">03</span>
-              </div>
-              <p class="lead">Colle une vidéo TikTok source, choisis <strong>TOP 3 ou TOP 5</strong> et saisis exactement les noms à traiter. Ici, l’IA ne remplace ni n’invente jamais un nom : une recherche indépendante et équitable est lancée pour chaque nom. La vidéo source sert uniquement de référence de rythme et de montage.</p>
-              <div class="field">
-                <label for="sst-lien">Vidéo TikTok source</label>
-                <div class="input-group">
-                  <input id="sst-lien" type="text" inputmode="url" placeholder="https://www.tiktok.com/@…/video/…" autocomplete="off">
-                  <button class="btn ghost" id="sst-coller" type="button">Coller</button>
-                </div>
-              </div>
-              <div class="field">
-                <label>Classement</label>
-                <div class="seg choices" id="sst-nombre-choices">
-                  <button class="seg-item active" data-sst-nombre="3" type="button">TOP 3</button>
-                  <button class="seg-item" data-sst-nombre="5" type="button">TOP 5</button>
-                </div>
-              </div>
-              <div class="field">
-                <div class="field-label-row">
-                  <label class="field-label">Noms saisis manuellement</label>
-                  <span class="counter" id="sst-noms-counter">0/3</span>
-                </div>
-                <div class="sst-noms" id="sst-noms">
-                  <input data-sst-nom="0" type="text" placeholder="Nom 1" autocomplete="off">
-                  <input data-sst-nom="1" type="text" placeholder="Nom 2" autocomplete="off">
-                  <input data-sst-nom="2" type="text" placeholder="Nom 3" autocomplete="off">
-                  <input data-sst-nom="3" type="text" placeholder="Nom 4" autocomplete="off" hidden>
-                  <input data-sst-nom="4" type="text" placeholder="Nom 5" autocomplete="off" hidden>
-                </div>
-                <p class="hint">Les noms sont transmis tels quels. Ils doivent être tous différents ; l’IA ne peut pas en ajouter un autre.</p>
-              </div>
-              <div class="field">
-                <label for="sst-profil">Profil d’entraînement visuel · facultatif</label>
-                <select id="sst-profil"><option value="">Aucun profil</option></select>
-                <button class="btn ghost" id="sst-open-training" type="button">Ouvrir Entraînement IA ↗</button>
-              </div>
-              <div class="actions">
-                <button class="btn primary" id="btn-sst"><span>Rechercher et créer SsT</span><span aria-hidden="true">✦</span></button>
-              </div>
-              <p class="status" id="statut-sst"></p>
-              <div class="sst-rules">
-                <span>✓ sources validées par Gemini</span><span>✓ plans ≤ 5 s</span><span>✓ sortie ≥ 1 min 1 s</span>
-              </div>
-            </div>
-          </div>
-
-          <!-- ============ SECTION 4 : MONTAGE MULTI-SOURCE ============ -->
-          <div class="tool" data-tool="montage">
-            <div class="card">
-              <div class="card-head">
-                <h2>Montage multi-source</h2>
-                <span class="chip">04</span>
-              </div>
-              <p class="lead">Colle manuellement jusqu’à 20 liens TikTok. Chaque vidéo est regardée par l’IA ; seuls les plans professionnels sans personne, logo ni watermark (sous-titres TikTok autorisés) sont montés. La sortie dure au moins <strong>1 min 1 s</strong>.</p>
-
-              <div class="seg sub" id="montage-tabs" role="tablist">
-                <button class="seg-item active" data-mtab="script" role="tab">Script</button>
-                <button class="seg-item" data-mtab="sources" role="tab">Sources</button>
-                <button class="seg-item" data-mtab="reference" role="tab">Référence</button>
-                <button class="seg-item" data-mtab="reglages" role="tab">Réglages</button>
-              </div>
-
-              <!-- Script -->
-              <div class="mtab active" data-mtab="script">
-                <div class="field">
-                  <label for="mon-title">Nom de la création</label>
-                  <input id="mon-title" type="text" maxlength="120" placeholder="ex. Freins carbone — vidéo 1">
-                </div>
-                <div class="field">
-                  <label for="mon-hook">Accroche</label>
-                  <textarea id="mon-hook" rows="3" placeholder="L’accroche guide les coupes rapides des 3 à 5 premières secondes."></textarea>
-                </div>
-                <div class="field">
-                  <label for="mon-corps">Script</label>
-                  <textarea id="mon-corps" rows="6" placeholder="Le corps du script, phrase par phrase."></textarea>
-                </div>
-              </div>
-
-              <!-- Sources -->
-              <div class="mtab" data-mtab="sources">
-                <div class="meta-row">
-                  <label class="field-label" for="mon-liens">Liens TikTok — un par ligne</label>
-                  <span class="counter" id="liens-counter">0/20 liens</span>
-                </div>
-                <textarea id="mon-liens" rows="7" placeholder="https://www.tiktok.com/@…/video/…"></textarea>
-                <p class="hint" id="source-limit">Paramètres après « ? » retirés, doublons supprimés.</p>
-                <div class="actions spread">
-                  <button class="btn ghost" id="btn-coller-sources" type="button">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="3" width="8" height="4" rx="1"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/></svg>
-                    Coller
-                  </button>
-                  <button class="btn ghost" id="btn-diagnostic" type="button">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
-                    Valider
-                  </button>
-                  <button class="btn ghost danger" id="btn-clear-sources" type="button">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V6"/></svg>
-                    Tout supprimer
-                  </button>
-                </div>
-
-                <div class="diagnostic hidden" id="diagnostic">
-                  <p class="diagnostic-title" id="diagnostic-title"></p>
-                  <p class="estimate" id="estimate"></p>
-                  <div class="source-list" id="diagnostic-sources"></div>
-                </div>
-              </div>
-
-              <!-- Référence -->
-              <div class="mtab" data-mtab="reference">
-                <div class="field">
-                  <label for="mon-style-ref">Vidéo TikTok de référence de montage · facultatif</label>
-                  <div class="input-group">
-                    <input id="mon-style-ref" type="text" inputmode="url" placeholder="https://www.tiktok.com/@…/video/…">
-                    <button class="btn ghost" id="ref-coller" type="button">Coller</button>
-                  </div>
-                </div>
-                <p class="hint">Le rythme, la cadence, les coupes, transitions, zooms et sous-titres sont reproduits aussi fidèlement que possible. Une référence distincte sert uniquement à cette grammaire visuelle : ses images ne sont jamais exportées, sauf si vous l’ajoutez aussi explicitement à la liste des sources. Si ce champ reste vide, la première source fournit le style et reste une source de contenu puisqu’elle figure dans cette liste.</p>
-                <div class="actions">
-                  <button class="btn ghost" id="btn-reference"><span>Récupérer le script de la référence</span><span aria-hidden="true">→</span></button>
-                </div>
-                <p class="status" id="statut-reference"></p>
-              </div>
-
-              <!-- Réglages -->
-              <div class="mtab" data-mtab="reglages">
-                <div class="field">
-                  <label>Mode de génération</label>
-                  <div class="mode-cards" id="mode-cards">
-                    <label class="mode-card">
-                      <input type="radio" name="mode-global" value="rapide">
-                      <strong>Rapide</strong>
-                      <span>Export 720 × 1280, priorité à la vitesse sur Render gratuit.</span>
-                    </label>
-                    <label class="mode-card">
-                      <input type="radio" name="mode-global" value="qualite">
-                      <strong>Qualité</strong>
-                      <span id="mode-qualite-desc">Encodage plus fin (CRF 21) et 1080 × 1920 si l’instance l’autorise.</span>
-                    </label>
-                  </div>
-                </div>
-                <div class="field">
-                  <label>Intensité des transitions</label>
-                  <div class="seg choices" id="intensite-choices">
-                    <button class="seg-item" data-intensite="0" type="button">Aucune</button>
-                    <button class="seg-item" data-intensite="1" type="button">Légère</button>
-                    <button class="seg-item" data-intensite="2" type="button">Modérée</button>
-                    <button class="seg-item" data-intensite="3" type="button">Forte</button>
-                  </div>
-                  <p class="hint">De « coupes franches uniquement » à « transitions appuyées entre chaque plan ». Ces réglages s’appliquent aux quatre sections.</p>
-                </div>
-                <div class="field">
-                  <label>Sous-titres (sans référence de style)</label>
-                  <div class="styles" id="styles-montage"></div>
-                </div>
-                <div class="field voix-field">
-                  <label for="voix-montage">Voix off · facultatif</label>
-                  <div class="input-group">
-                    <input id="voix-montage" class="file-input" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,audio/*">
-                    <button class="btn ghost danger" id="voix-montage-clear" type="button">Retirer</button>
-                  </div>
-                  <p class="hint voix-hint" id="voix-montage-etat">Aucune voix off : le montage restera muet. MP3, WAV, M4A, AAC, OGG ou OPUS, 25 Mo maximum.</p>
-                </div>
-                <p class="hint" id="export-courant"></p>
-              </div>
-
-              <div class="actions spread wrap">
-                <button class="btn ghost" id="btn-add-project" disabled>+ Ajouter à la file</button>
-                <button class="btn primary" id="btn-montage" disabled><span>Créer la vidéo</span><span aria-hidden="true">✦</span></button>
-              </div>
-              <p class="status" id="statut-montage"></p>
-
-              <div class="drafts hidden" id="batch-drafts">
-                <div class="list-head">
-                  <h3>Projets préparés</h3>
-                  <span class="counter" id="batch-counter">0/6</span>
-                </div>
-                <div class="draft-list" id="batch-draft-list"></div>
-                <button class="btn primary full" id="btn-launch-batch"><span>Lancer la file</span><span aria-hidden="true">✦</span></button>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <!-- ======================= VUE ENTRAÎNEMENT IA (séparée de Créer) ======================= -->
-        <section class="view" id="view-entrainement">
-          <div class="card">
-            <div class="card-head"><h2>Entraînement IA</h2><span class="chip">VISUEL</span></div>
-            <p class="lead">Crée une mémoire visuelle persistante par sujet. Gemini regarde chaque exemple, repère les passages propres et conserve une signature positive et négative. Les nouvelles candidates ne sont ajoutées qu’après leur validation visuelle complète.</p>
-            <div class="grid-2 training-form">
-              <div class="field">
-                <label for="profil-nom">Nom du sujet</label>
-                <input id="profil-nom" type="text" maxlength="160" placeholder="Sujet à reconnaître exactement">
-              </div>
-              <div class="field">
-                <label for="profil-alias">Alias</label>
-                <input id="profil-alias" type="text" placeholder="un alias, un autre alias">
-              </div>
-            </div>
-            <div class="grid-2">
-              <div class="field">
-                <label for="profil-bons">Bons exemples TikTok</label>
-                <textarea id="profil-bons" rows="6" placeholder="Un lien TikTok par ligne"></textarea>
-                <p class="hint">Plans propres du sujet demandé : Gemini vérifiera sujet, timestamps, personnes, watermark, logos et textes.</p>
-              </div>
-              <div class="field">
-                <label for="profil-mauvais">Mauvais exemples TikTok</label>
-                <textarea id="profil-mauvais" rows="6" placeholder="Un lien TikTok par ligne"></textarea>
-                <p class="hint">Contre-exemples : hors sujet, personne, watermark, logo ajouté, pseudo, sticker ou mauvaise qualité.</p>
-              </div>
-            </div>
-            <div class="actions">
-              <button class="btn primary" id="btn-analyser-profil"><span>Analyser avec l’IA et alimenter</span><span aria-hidden="true">✦</span></button>
-              <button class="btn ghost" id="btn-nouveau-profil" type="button">Nouveau profil</button>
-            </div>
-            <p class="status" id="statut-profil"></p>
-            <div class="training-result hidden" id="training-result"></div>
-          </div>
-          <div class="card">
-            <div class="card-head"><h2>Profils mémorisés</h2><span class="counter" id="training-profile-count">0 profil</span></div>
-            <p class="hint">Synchronisés entre le localStorage de ce navigateur et le fichier JSON privé de ta session serveur. Supprimer un profil le retire des deux emplacements.</p>
-            <div class="training-profile-list" id="training-profile-list"><p class="hint">Chargement…</p></div>
-          </div>
-        </section>
-
-        <!-- ======================= VUE MES CRÉATIONS ======================= -->
-        <section class="view" id="view-creations">
-          <div class="card player-card hidden" id="player-card">
-            <p class="section-label" id="player-title">Dernier rendu</p>
-            <div class="player-frame"><video id="lecteur" controls playsinline></video></div>
-            <div class="player-actions">
-              <a class="btn ghost" id="telecharger" download>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
-                Télécharger
-              </a>
-              <button class="btn ghost" id="save-drive">Envoyer sur Drive</button>
-              <a class="btn ghost hidden" id="drive-link" target="_blank" rel="noopener">Ouvrir dans Drive ↗</a>
-            </div>
-            <p class="drive-message" id="drive-message"></p>
-          </div>
-
-          <div class="card">
-            <div class="card-head">
-              <h2>Mes créations</h2>
-              <button class="icon-btn" id="refresh-history" title="Actualiser" aria-label="Actualiser">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.3M21 3v6h-6"/></svg>
-              </button>
-            </div>
-            <p class="hint">Historique réel des 6 dernières heures de ce navigateur : progression en direct, lecture, téléchargement, Drive et annulation. Une actualisation reprend le suivi.</p>
-            <div class="history-list" id="history-list"><p class="hint">Chargement…</p></div>
-          </div>
-        </section>
-
-        <!-- ======================= VUE CONNEXIONS ======================= -->
-        <section class="view" id="view-connexions">
-          <div class="card connexions">
-            <div class="card-head"><h2>Connexions</h2></div>
-            <p class="lead">Connecte tes comptes pour la sauvegarde automatique sur Google Drive et l’accès TikTok. Aucun faux compte : chaque connexion passe par l’OAuth officiel du service concerné.</p>
-
-            <div class="integration">
-              <div class="integration-top">
-                <div class="service-icon tiktok" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" fill="currentColor"><path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.9 2.9 0 1 1-2-2.76V9.4a6.34 6.34 0 1 0 5.45 6.27V8.73a8.2 8.2 0 0 0 4.77 1.52V6.82c-.34 0-.67-.05-1-.13Z"/></svg>
-                </div>
-                <div class="service-info">
-                  <p class="service-name">TikTok</p>
-                  <p class="service-state" id="tiktok-state">Vérification…</p>
-                </div>
-              </div>
-              <button class="btn ghost full" id="connect-tiktok">Connecter TikTok</button>
-            </div>
-
-            <div class="integration">
-              <div class="integration-top">
-                <div class="service-icon drive" aria-hidden="true">
-                  <svg viewBox="0 0 24 24"><path fill="#4285F4" d="m8.5 3-6 10.4 3 5.2 6-10.4z"/><path fill="#34A853" d="M8.5 3h6l6 10.4h-6z"/><path fill="#FBBC04" d="M5.5 18.6h12l3-5.2h-12z"/></svg>
-                </div>
-                <div class="service-info">
-                  <p class="service-name">Google Drive</p>
-                  <p class="service-state" id="drive-state">Vérification…</p>
-                </div>
-              </div>
-              <button class="btn ghost full" id="connect-drive">Activer la sauvegarde</button>
-            </div>
-
-            <p class="foot-note">Les jetons restent côté serveur et ne sont jamais inclus dans le code. Aucun abonnement payant n’est nécessaire.</p>
-          </div>
-        </section>
-
-        <!-- ======================= VUE PARAMÈTRES ======================= -->
-        <section class="view" id="view-parametres">
-          <div class="card">
-            <div class="card-head"><h2>Paramètres de génération</h2></div>
-            <p class="lead">Ces réglages s’appliquent aux quatre sections : Lien → vidéo, RsT, SsT et Montage multi-source. Ils sont conservés dans ce navigateur.</p>
-
-            <div class="field">
-              <label>Mode de génération</label>
-              <div class="mode-cards" id="mode-cards-parametres">
-                <label class="mode-card">
-                  <input type="radio" name="mode-parametres" value="rapide">
-                  <strong>Rapide</strong>
-                  <span>Export 720 × 1280 · 24 FPS · pensé pour finir dans les quotas Render gratuits.</span>
-                </label>
-                <label class="mode-card">
-                  <input type="radio" name="mode-parametres" value="qualite">
-                  <strong>Qualité</strong>
-                  <span>Encodage plus fin (CRF 21) et 1080 × 1920 si l’instance l’autorise, sinon 720 × 1280.</span>
-                </label>
-              </div>
-            </div>
-
-            <div class="field">
-              <label>Intensité des transitions</label>
-              <div class="seg choices" id="intensite-choices-parametres">
-                <button class="seg-item" data-intensite="0" type="button">Aucune</button>
-                <button class="seg-item" data-intensite="1" type="button">Légère</button>
-                <button class="seg-item" data-intensite="2" type="button">Modérée</button>
-                <button class="seg-item" data-intensite="3" type="button">Forte</button>
-              </div>
-              <p class="hint">« Aucune » ne garde que des coupes franches ; « Forte » appuie les fondus, glissements et zooms entre les plans.</p>
-            </div>
-            <p class="hint" id="export-courant-parametres"></p>
-          </div>
-
-          <div class="card">
-            <div class="card-head"><h2>Fournisseurs IA (texte)</h2><span class="counter" id="fournisseur-actif"></span></div>
-            <p class="lead">Les scripts, l’extraction des noms et les adaptations de texte passent par ces fournisseurs. Gemini reste exclusivement chargé de l’audio, de la vidéo et de la validation visuelle des plans.</p>
-
-            <div class="field">
-              <label>Sélection du texte</label>
-              <div class="seg choices" id="fournisseur-choices">
-                <button class="seg-item active" data-fournisseur="auto" type="button">Auto</button>
-                <button class="seg-item" data-fournisseur="gemini" type="button">Gemini</button>
-                <button class="seg-item" data-fournisseur="groq" type="button">Groq</button>
-                <button class="seg-item" data-fournisseur="mistral" type="button">Mistral</button>
-              </div>
-              <p class="hint">« Auto » suit l’ordre du serveur et bascule, en le journalisant, vers le fournisseur suivant en cas d’échec temporaire. Un fournisseur nommé est utilisé tel quel : sans repli silencieux.</p>
-            </div>
-
-            <div class="fournisseur-list" id="fournisseur-list"><p class="hint">Chargement…</p></div>
-            <p class="hint">Le quota n’est affiché que si l’API le communique réellement (en-têtes x-ratelimit-*) ; la remise à zéro de la fenêtre est distincte d’un simple Retry-After. Si l’API ne dit rien, rien n’est affiché : aucune donnée inventée. Les clés restent côté serveur.</p>
-          </div>
-
-          <div class="card">
-            <div class="card-head"><h2>Affichage</h2></div>
-            <div class="field">
-              <label>Thème de l’interface</label>
-              <div class="seg choices" id="theme-choices">
-                <button class="seg-item" data-theme-choix="auto" type="button">Auto (système)</button>
-                <button class="seg-item" data-theme-choix="clair" type="button">Clair</button>
-                <button class="seg-item" data-theme-choix="noir" type="button">Noir</button>
-              </div>
-              <p class="hint">Aucun thème n’est codé en dur : le choix est conservé dans ce navigateur et l’« Auto » suit l’affichage du système.</p>
-            </div>
-          </div>
-
-          <div class="card">
-            <div class="card-head"><h2>Serveur</h2></div>
-            <div class="server-rows big" id="parametres-server"></div>
-            <p class="foot-note">Limites réelles de cette instance, lues depuis l’API. Aucune donnée n’est inventée : si un service est absent, il est signalé comme tel.</p>
-          </div>
-        </section>
-
+    </label>
+    <div class="fl voix-field">
+      <span>Voix off facultative</span>
+      <div class="row c" style="margin-top:6px">
+        <label class="btn">Importer un fichier<input id="voix-rst" class="file-input" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,audio/*" hidden></label>
+        <button class="btn" id="voix-rst-clear" type="button" data-rm>Retirer</button>
       </div>
+      <small>MP3, WAV, M4A, AAC, OGG, OPUS · 25 Mo max. La vidéo reste muette ; le script .txt et une voix off .mp3 sont livrés séparément.</small>
+      <small class="fn" id="voix-rst-etat"></small>
+    </div>
+    <button class="btn pri" id="btn-rst" type="button" data-gen="rst" style="margin-top:14px">Trouver les vidéos et créer</button>
+    <p class="stt" id="statut-rst"></p>
+  </div>
+  <div class="card hidden" id="rst-jobs">
+    <div class="lh">
+      <h2 style="margin:0">Travaux RsT en cours</h2>
+      <span class="counter" id="rst-jobs-counter"></span>
+    </div>
+    <div id="job-list" class="job-list"></div>
+  </div>
+  <div class="card hidden" id="rst-resultats">
+    <div class="lh">
+      <h2 style="margin:0">Vidéos trouvées par RsT</h2>
+      <span class="counter" id="rst-compteur"></span>
+    </div>
+    <p class="hint" id="rst-resume"></p>
+    <div id="rst-found" class="found-blocs"></div>
+  </div>
+</template>
+
+<!-- ============ SECTION SsT ============ -->
+<template id="tpl-tab-sst">
+  <div class="card">
+    <h2>SsT · TOP N manuel</h2>
+    <label class="fl">Vidéo TikTok source
+      <div class="row">
+        <input id="sst-lien" type="url" placeholder="https://www.tiktok.com/@…/video/…" autocomplete="off">
+        <button class="btn" id="sst-coller" type="button">Coller</button>
+      </div>
+    </label>
+    <label class="fl"><span>Classement</span>
+      <div class="seg" id="sst-nombre-choices" role="radiogroup" style="--n:2;--i:0"><i></i>
+        <button type="button" role="radio" data-sst-nombre="3" aria-checked="true">TOP 3</button>
+        <button type="button" role="radio" data-sst-nombre="5" aria-checked="false">TOP 5</button>
+      </div>
+    </label>
+    <label class="fl"><span>Noms saisis manuellement</span>
+      <div id="sst-noms" class="sst-noms">
+        <input data-sst-nom="0" type="text" placeholder="Nom 1" autocomplete="off">
+        <input data-sst-nom="1" type="text" placeholder="Nom 2" autocomplete="off">
+        <input data-sst-nom="2" type="text" placeholder="Nom 3" autocomplete="off">
+        <input data-sst-nom="3" type="text" placeholder="Nom 4" autocomplete="off" hidden>
+        <input data-sst-nom="4" type="text" placeholder="Nom 5" autocomplete="off" hidden>
+      </div>
+    </label>
+    <span class="counter" id="sst-noms-counter">0/3</span>
+    <div style="height:10px"></div>
+    <label class="fl">Profil d’entraînement (facultatif)
+      <select id="sst-profil"><option value="">Aucun profil</option></select>
+    </label>
+    <button class="btn" id="sst-open-training" type="button" style="margin-top:6px">Ouvrir Entraînement IA ↗</button>
+    <div style="height:14px"></div>
+    <button class="btn pri" id="btn-sst" type="button">Rechercher et créer SsT</button>
+    <p class="stt" id="statut-sst"></p>
+  </div>
+</template>
+
+<!-- ============ SECTION MONTAGE MULTI-SOURCE ============ -->
+<template id="tpl-tab-montage">
+  <div class="card">
+    <h2>Sources</h2>
+    <label class="fl">Nom de la création<input id="mon-title" type="text" maxlength="120" placeholder="ex. Freins carbone — vidéo 1"></label>
+    <label class="fl">Liens TikTok (1 à 20) — un par ligne
+      <textarea id="mon-liens" rows="5" placeholder="https://www.tiktok.com/@…/video/…"></textarea>
+    </label>
+    <span class="counter" id="liens-counter">0/20 liens</span>
+    <p class="hint" id="source-limit"></p>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" id="btn-coller-sources" type="button">Coller</button>
+      <button class="btn" id="btn-diagnostic" type="button">Valider</button>
+      <button class="btn" id="btn-clear-sources" type="button">Tout supprimer</button>
+    </div>
+    <div id="diagnostic" class="diagnostic hidden" style="margin-top:14px">
+      <p id="diagnostic-title" class="diagnostic-title"></p>
+      <p id="estimate" class="estimate"></p>
+      <div id="diagnostic-sources" class="source-list"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Texte</h2>
+    <label class="fl">Accroche<textarea id="mon-hook" rows="3" placeholder="L’accroche guide les coupes rapides."></textarea></label>
+    <label class="fl">Script<textarea id="mon-corps" rows="4" placeholder="Le corps du script, phrase par phrase."></textarea></label>
+  </div>
+  <div class="card">
+    <h2>Référence & Réglages</h2>
+    <label class="fl">Lien de référence de style (facultatif)
+      <div class="row">
+        <input id="mon-style-ref" type="url" placeholder="https://www.tiktok.com/@…/video/…">
+        <button class="btn" id="ref-coller" type="button">Coller</button>
+      </div>
+    </label>
+    <div class="row" style="margin-top:6px">
+      <button class="btn" id="btn-reference" type="button">Récupérer le script de la référence →</button>
+    </div>
+    <p class="stt" id="statut-reference" style="margin-top:8px"></p>
+    <div style="height:14px"></div>
+    <label class="fl"><span>Mode</span>
+      <div class="seg" id="mode-cards-wrap-mont" role="radiogroup" style="--n:2;--i:1"><i></i>
+        <button type="button" role="radio" data-mode-seg="rapide" aria-checked="false">Rapide</button>
+        <button type="button" role="radio" data-mode-seg="qualite" aria-checked="true">Qualité</button>
+      </div>
+    </label>
+    <label class="fl"><span>Intensité des transitions</span>
+      <div class="seg" id="intensite-choices-mont" role="radiogroup" style="--n:4;--i:2"><i></i>
+        <button type="button" role="radio" data-intensite-mont="0" aria-checked="false">0</button>
+        <button type="button" role="radio" data-intensite-mont="1" aria-checked="false">1</button>
+        <button type="button" role="radio" data-intensite-mont="2" aria-checked="true">2</button>
+        <button type="button" role="radio" data-intensite-mont="3" aria-checked="false">3</button>
+      </div>
+    </label>
+    <label class="fl"><span>Sous-titres</span><div id="styles-montage" class="styles-wrap"></div></label>
+    <div class="fl voix-field">
+      <span>Voix off facultative</span>
+      <div class="row c" style="margin-top:6px">
+        <label class="btn">Importer un fichier<input id="voix-montage" class="file-input" type="file" accept=".mp3,.wav,.m4a,.aac,.ogg,.opus,audio/*" hidden></label>
+        <button class="btn" id="voix-montage-clear" type="button" data-rm>Retirer</button>
+      </div>
+      <small class="fn" id="voix-montage-etat"></small>
+    </div>
+    <p class="hint" id="export-courant"></p>
+    <div class="row" style="margin-top:14px">
+      <button class="btn" id="btn-add-project" type="button" disabled>+ Ajouter à la file</button>
+      <button class="btn pri" id="btn-montage" type="button" disabled>Créer la vidéo</button>
+    </div>
+    <p class="stt" id="statut-montage"></p>
+    <div id="batch-drafts" class="drafts hidden" style="margin-top:14px">
+      <div class="lh"><h2 style="margin:0">Projets préparés</h2><span class="counter" id="batch-counter">0/6</span></div>
+      <div id="batch-draft-list" class="draft-list"></div>
+      <button class="btn pri full" id="btn-launch-batch" type="button" style="margin-top:10px" disabled>Lancer la file</button>
+    </div>
+  </div>
+</template>
+
+<!-- ============ SECTION HISTORIQUE ============ -->
+<template id="tpl-historique">
+  <div class="card hidden" id="player-card">
+    <div class="lh"><span class="pill" id="player-title">Dernier rendu</span></div>
+    <div class="vid"><video id="lecteur" controls playsinline style="width:100%;height:100%;border-radius:12px;background:#000"></video></div>
+    <div class="row c" style="margin-top:10px">
+      <a class="btn" id="telecharger" download>Télécharger</a>
+      <button class="btn" id="save-drive" type="button">Envoyer sur Drive</button>
+      <a class="btn hidden" id="drive-link" target="_blank" rel="noopener">Ouvrir dans Drive ↗</a>
+    </div>
+    <p class="hint" id="drive-message" style="margin-top:8px"></p>
+  </div>
+  <div class="card">
+    <div class="lh">
+      <h2 style="margin:0">Historique</h2>
+      <button class="btn" id="refresh-history" type="button" title="Actualiser" aria-label="Actualiser">⟳</button>
+    </div>
+    <p class="hint">Historique réel des 6 dernières heures. Le suivi reprend après une actualisation.</p>
+    <div id="history-list" class="history-list"><p class="hint">Chargement…</p></div>
+  </div>
+</template>
+
+<!-- ============ SECTION PARAMÈTRES ============ -->
+<template id="tpl-parametres">
+  <div class="card">
+    <h2>Mode & export</h2>
+    <label class="fl"><span>Mode</span>
+      <div class="seg" id="mode-cards" role="radiogroup" style="--n:2;--i:1"><i></i>
+        <button type="button" role="radio" data-mode-par="rapide" aria-checked="false">Rapide</button>
+        <button type="button" role="radio" data-mode-par="qualite" aria-checked="true">Qualité</button>
+      </div>
+    </label>
+    <label class="fl"><span>Intensité des transitions</span>
+      <div class="seg" id="intensite-choices" role="radiogroup" style="--n:4;--i:2"><i></i>
+        <button type="button" role="radio" data-intensite-par="0" aria-checked="false">0</button>
+        <button type="button" role="radio" data-intensite-par="1" aria-checked="false">1</button>
+        <button type="button" role="radio" data-intensite-par="2" aria-checked="true">2</button>
+        <button type="button" role="radio" data-intensite-par="3" aria-checked="false">3</button>
+      </div>
+    </label>
+    <p class="hint" id="export-courant-parametres"></p>
+  </div>
+
+  <div class="card">
+    <h2>Fournisseurs IA (texte)</h2>
+    <label class="fl"><span>Fournisseur</span>
+      <div class="seg" id="fournisseur-choices" role="radiogroup" style="--n:4;--i:0"><i></i>
+        <button type="button" role="radio" data-fournisseur-par="auto" aria-checked="true">Auto</button>
+        <button type="button" role="radio" data-fournisseur-par="gemini" aria-checked="false">Gemini</button>
+        <button type="button" role="radio" data-fournisseur-par="groq" aria-checked="false">Groq</button>
+        <button type="button" role="radio" data-fournisseur-par="mistral" aria-checked="false">Mistral</button>
+      </div>
+    </label>
+    <small>« Auto » = ordre du serveur avec bascule journalisée ; fournisseur nommé = sans repli.</small>
+    <div id="fournisseur-list" class="kv-list" style="margin-top:14px"><p class="hint">Chargement…</p></div>
+    <span class="counter" id="fournisseur-actif" style="display:none"></span>
+  </div>
+
+  <div class="card">
+    <h2>Affichage</h2>
+    <label class="fl"><span>Thème</span>
+      <div class="seg" id="theme-choices" role="radiogroup" style="--n:3;--i:0"><i></i>
+        <button type="button" role="radio" data-theme-choix="auto" aria-checked="true">Auto (système)</button>
+        <button type="button" role="radio" data-theme-choix="clair" aria-checked="false">Clair</button>
+        <button type="button" role="radio" data-theme-choix="noir" aria-checked="false">Noir</button>
+      </div>
+    </label>
+  </div>
+
+  <div class="card">
+    <h2>Serveur (lecture seule)</h2>
+    <div id="parametres-server" class="kv-list"></div>
+    <small>Valeurs fournies par l’API du serveur.</small>
+  </div>
+
+  <div class="card">
+    <h2>Profils d’entraînement IA</h2>
+    <p class="hint">Création de profils d’entraînement visuel. Synchronisés entre le localStorage et le serveur.</p>
+    <div id="training-profile-list" class="training-profile-list"><p class="hint">Chargement…</p></div>
+    <span class="counter" id="training-profile-count"></span>
+    <div style="height:14px"></div>
+    <div class="row">
+      <label class="fl">Nom<input id="profil-nom" type="text" maxlength="160" placeholder="Sujet"></label>
+      <label class="fl">Alias<input id="profil-alias" type="text" placeholder="un alias"></label>
+    </div>
+    <label class="fl">Bons exemples TikTok<textarea id="profil-bons" rows="4" placeholder="Un lien par ligne"></textarea></label>
+    <label class="fl">Mauvais exemples TikTok<textarea id="profil-mauvais" rows="4" placeholder="Un lien par ligne"></textarea></label>
+    <p class="stt" id="statut-profil"></p>
+    <div id="training-result" class="stt hidden"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn pri" id="btn-analyser-profil" type="button">Analyser avec l’IA et alimenter</button>
+      <button class="btn" id="btn-nouveau-profil" type="button">Nouveau profil</button>
     </div>
   </div>
 
-  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="card server-card">
+    <h2>Serveur</h2>
+    <div id="server-rows" class="kv-list"><p class="hint">Vérification…</p></div>
+    <p class="foot-note">Aucun abonnement payant. Quotas gratuits uniquement, données réelles.</p>
+    <p class="mut" id="top-status-display"><i class="dot"></i>Studio opérationnel</p>
+  </div>
+</template>
 
-  <script src="/static/job-utils.js"></script>
-  <script src="/static/main.js"></script>
+<!-- ============ SECTION CONNEXIONS ============ -->
+<template id="tpl-connexions">
+  <div class="card">
+    <h2>Connexions</h2>
+    <p class="hint">Connecte tes comptes pour la sauvegarde automatique sur Google Drive et l’accès TikTok. Aucun faux compte : chaque connexion passe par l’OAuth officiel.</p>
+
+    <div class="integration" data-conn="tiktok">
+      <div class="lh">
+        <div>
+          <strong>TikTok</strong>
+          <p class="hint" id="tiktok-state" style="margin:4px 0 0">Vérification…</p>
+        </div>
+        <button class="btn" id="connect-tiktok" type="button">Connecter TikTok</button>
+      </div>
+    </div>
+    <div style="height:10px"></div>
+    <div class="integration" data-conn="drive">
+      <div class="lh">
+        <div>
+          <strong>Google Drive</strong>
+          <p class="hint" id="drive-state" style="margin:4px 0 0">Vérification…</p>
+        </div>
+        <button class="btn" id="connect-drive" type="button">Activer la sauvegarde</button>
+      </div>
+    </div>
+    <p class="foot-note" style="margin-top:14px">Les jetons restent côté serveur et ne sont jamais inclus dans le code.</p>
+  </div>
+</template>
+
+<script src="/static/job-utils.js"></script>
+<script src="/static/main.js"></script>
 </body>
 </html>

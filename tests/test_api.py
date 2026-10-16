@@ -1184,12 +1184,15 @@ def test_interface_contient_rst_multiple_et_voix_off():
     assert "job-card" in js and "found-bloc" in js
     assert "rst-liens" in js and "parseRstLinks" in js
 
-    # Thème clair « premium minimaliste » : typographie système uniquement (aucune
-    # ressource externe), accent bleu sobre, plus de violet ni de cyan.
-    assert "fonts.googleapis.com" not in html
-    assert "-apple-system" in css and "ui-monospace" in css
-    assert "#7c5cff" not in css and "#43d9ff" not in css
-    assert "--accent: #0071e3;" in css
+    # Design approuvé : police Outfit via Google Fonts (preconnect), thème clair/sombre
+    # avec [data-theme=dark] fond noir, glassmorphism, logo static/logo.jpg.
+    assert "fonts.googleapis.com" in html
+    assert "Outfit" in html or "Outfit" in css
+    assert "-apple-system" in css
+    assert "preconnect" in html
+    assert "logo.jpg" in html
+    assert '[data-theme="dark"]' in css or "[data-theme=dark]" in css
+    assert "--bg:#000000" in css or "--bg: #000000" in css
 
 
 # ======================================================================================
