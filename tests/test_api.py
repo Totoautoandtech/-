@@ -899,20 +899,24 @@ def test_gemini_429_bascule_aussi_sur_le_modele_suivant(gemini_simule):
 
 
 def test_gemini_503_total_donne_un_message_clair_en_francais(gemini_simule):
-    """Tous les modèles et toutes les clés saturés : message explicite, pas de trace brute."""
+    """Tous les modèles et toutes les clés saturés : message explicite qui porte le
+    nombre de tentatives réellement effectuées, sans trace brute ni clé."""
     gemini_simule.reponses_par_modele = {
         "gemini-2.5-flash": (503, REPONSE_GEMINI_503),
         "gemini-2.5-flash-lite": (503, REPONSE_GEMINI_503),
         "gemini-2.0-flash": (503, REPONSE_GEMINI_503),
     }
 
-    with pytest.raises(app.ErreurApp) as erreur:
+    with pytest.raises(app.ErreurGeminiIndisponible) as erreur:
         asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
 
-    assert str(erreur.value) == "Gemini est momentanément saturé (503). Réessaie dans quelques minutes."
-    assert str(erreur.value) == app.GEMINI_MESSAGE_SATURE
+    tentatives = 3 * app.GEMINI_TENTATIVES_PAR_MODELE
+    assert str(erreur.value) == app.GEMINI_MESSAGE_SATURE.format(tentatives=tentatives)
+    assert str(erreur.value).startswith(f"Gemini indisponible après {tentatives} tentatives")
+    assert "Réessaie dans quelques minutes" in str(erreur.value)
+    assert "cle-de-test" not in str(erreur.value)
     # 3 modèles × 5 tentatives : le backoff exponentiel est bien appliqué par modèle.
-    assert len(gemini_simule.appels) == 3 * app.GEMINI_TENTATIVES_PAR_MODELE
+    assert len(gemini_simule.appels) == tentatives
 
 
 def test_gemini_erreur_definitive_ne_declenche_pas_cinq_tentatives(gemini_simule):
@@ -1032,13 +1036,15 @@ def test_gemini_messages_distinguent_saturation_epuisement_et_delai(gemini_simul
     monkeypatch.setattr(app.random, "sample", lambda valeurs, _nombre: list(valeurs))
     gemini_simule.horloge = horloge
 
-    # Saturation : le message public reste strictement inchangé.
+    # Saturation : le message public reste explicite sur le nombre de tentatives.
     gemini_simule.reponses_par_modele = {
         modele: (503, REPONSE_GEMINI_503) for modele in app.CONFIG.gemini_modeles
     }
-    with pytest.raises(app.ErreurApp) as erreur_sature:
+    with pytest.raises(app.ErreurGeminiIndisponible) as erreur_sature:
         asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
-    assert str(erreur_sature.value) == app.GEMINI_MESSAGE_SATURE
+    assert str(erreur_sature.value) == app.GEMINI_MESSAGE_SATURE.format(
+        tentatives=len(app.CONFIG.gemini_modeles) * app.GEMINI_TENTATIVES_PAR_MODELE
+    )
 
     # Erreurs définitives HTTP ordinaires : c'est un épuisement, pas une saturation ni un délai.
     gemini_simule.appels = []
@@ -1073,6 +1079,318 @@ def test_gemini_messages_distinguent_saturation_epuisement_et_delai(gemini_simul
     assert "Toutes les clés Gemini ont échoué" not in str(erreur_delai.value)
     assert gemini_simule.appels == ["gemini-2.5-flash"]
     assert horloge.monotonic() == pytest.approx(15.0)
+
+
+# ======================================================================================
+# RÉSILIENCE GEMINI : scénarios de travaux complets (503 puis 200, 503 permanent)
+# ======================================================================================
+
+
+def _reponse_gemini_texte(texte: str) -> str:
+    """Réponse Gemini 200 transportant `texte` dans son candidat."""
+    return json.dumps(
+        {"candidates": [{"content": {"parts": [{"text": texte}]}}]}, ensure_ascii=False
+    )
+
+
+def _script_gemini_json(hook: str = "Hook test 503") -> str:
+    return json.dumps({
+        "hook": hook,
+        "corps": "Corps du script test 503.",
+        "mot_cle_broll": "gâteau chocolat",
+    }, ensure_ascii=False)
+
+
+def test_gemini_503_puis_200_le_travail_rst_finit_complete(client, monkeypatch, gemini_simule):
+    """Scénario métier : Gemini renvoie d'abord 503 (surcharge), le retry retente avec
+    backoff et obtient 200 — le travail RsT doit finir « completed », jamais échouer
+    sur le premier 503."""
+
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            return {
+                "id": "301", "title": "Gâteau au chocolat facile #recette #cuisine",
+                "duration": 20, "author": {"unique_id": "chef", "nickname": "Chef"},
+            }
+        if chemin == "/user/posts":
+            return {"videos": [
+                {"video_id": f"3{i:02d}", "title": f"Gâteau numéro {i}",
+                 "duration": 12 + i, "author": {"unique_id": "chef"}}
+                for i in range(1, 5)
+            ]}
+        if chemin == "/feed/search":
+            return {"videos": []}
+        raise AssertionError(f"endpoint TikWM inattendu : {chemin}")
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
+    # Gemini seul écrit le script : le scénario503→200 doit passer par ses retries.
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "")
+    monkeypatch.setattr(app.CONFIG, "mistral_api_key", "")
+
+    async def montage_fake(**_kwargs):
+        return {
+            "url": "/videos/rst_503.mp4", "path": app.DOSSIER_VIDEOS / "rst_503.mp4",
+            "sources": [], "source_errors": [],
+        }
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_fake)
+
+    async def livraison_fake(_script, _seed, _noms, budget=None):
+        return {
+            "script_url": "/videos/script.txt", "script_nom": "script.txt",
+            "script_erreur": "", "voix_url": "", "voix_nom": "",
+            "voix_erreur": "voix non demandée", "voix_moteur": "edge-tts",
+            "livraison_erreur": "",
+        }
+
+    monkeypatch.setattr(app, "livrer_script_et_voix", livraison_fake)
+
+    # File d'attente sur le premier modèle : 503, puis 200 avec le script demandé.
+    # Les appels suivants (extraction des noms) lisent `reponses_par_modele`.
+    gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash")] = [
+        (503, REPONSE_GEMINI_503),
+        (200, _reponse_gemini_texte(_script_gemini_json())),
+    ]
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash": (
+            200, _reponse_gemini_texte(json.dumps(
+                {"noms": ["gâteau", "chocolat", "recette"]}, ensure_ascii=False
+            )),
+        ),
+    }
+
+    response = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@chef/video/301",
+    })
+    assert response.status_code == 202, response.text
+    job = _attendre_job(client, response.json()["job_id"])
+    assert job["status"] == "completed", job.get("error")
+    # Le 503 initial a bien été retenté (même modèle) avant le 200 qui a abouti.
+    assert gemini_simule.appels[:2] == ["gemini-2.5-flash", "gemini-2.5-flash"]
+    assert job["script"]["hook"] == "Hook test 503"
+    assert job["fournisseur_texte"] == "Gemini"
+
+
+def test_rst_gemini_503_systematique_echoue_apres_retries_avec_message_explicite(
+    client, monkeypatch, gemini_simule
+):
+    """Scénario métier : Gemini renvoie 503 sans interruption. Chaque couple
+    clé/modèle reçoit ses5 tentatives (backoff + jitter), puis le travail échoue
+    avec « Gemini indisponible après N tentatives » — jamais un échec silencieux."""
+
+    async def donnees_tikwm(_session, chemin, params):
+        if chemin == "/":
+            return {
+                "id": "302", "title": "Tarte aux pommes #recette",
+                "duration": 18, "author": {"unique_id": "chef", "nickname": "Chef"},
+            }
+        return {"videos": []}
+
+    monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
+    # Aucun fournisseur de repli : Gemini seul écrit le script, l'échec doit remonter.
+    monkeypatch.setattr(app.CONFIG, "groq_api_key", "")
+    monkeypatch.setattr(app.CONFIG, "mistral_api_key", "")
+
+    async def montage_interdit(**_kwargs):
+        raise AssertionError("aucun montage ne doit commencer sans script Gemini")
+
+    monkeypatch.setattr(app, "construire_montage_professionnel", montage_interdit)
+
+    async def livraison_interdite(_script, _seed, _noms, budget=None):
+        raise AssertionError("aucune livraison ne doit commencer sans script Gemini")
+
+    monkeypatch.setattr(app, "livrer_script_et_voix", livraison_interdite)
+
+    # Le scénario par défaut du faux serveur est un503 permanent.
+    response = client.post("/api/jobs/rst", json={
+        "lien": "https://www.tiktok.com/@chef/video/302",
+    })
+    assert response.status_code == 202, response.text
+    job = _attendre_job(client, response.json()["job_id"])
+
+    tentatives = len(app.CONFIG.gemini_modeles) * app.GEMINI_TENTATIVES_PAR_MODELE
+    assert job["status"] == "failed"
+    assert f"Gemini indisponible après {tentatives} tentatives" in job["error"]
+    assert "saturation 503/429" in job["error"]
+    assert "Réessaie dans quelques minutes" in job["error"]
+    # Les retries ont réellement eu lieu :5 tentatives par modèle de la chaîne.
+    assert gemini_simule.appels.count("gemini-2.5-flash") == app.GEMINI_TENTATIVES_PAR_MODELE
+    assert len(gemini_simule.appels) == tentatives
+
+
+def test_gemini_429_retry_after_est_respecte_et_le_backoff_prend_un_jitter(
+    gemini_simule, monkeypatch
+):
+    """Un Retry-After Google est respecté tel quel (sans jitter) ; les pauses de
+    backoff exponentiel, elles, sont réellement déformées par le jitter."""
+    horloge = _HorlogeGemini()
+    monkeypatch.setattr(app, "time", horloge)
+    gemini_simule.horloge = horloge
+    monkeypatch.setattr(app, "GEMINI_BACKOFF", (2, 4, 8, 16))
+    pauses = []
+
+    async def sommeil_simule(secondes):
+        pauses.append(secondes)
+        horloge.avancer(secondes)
+
+    monkeypatch.setattr(app.asyncio, "sleep", sommeil_simule)
+    gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash")] = [
+        _ScenarioReponseGemini(
+            429,
+            '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}',
+            headers={"Retry-After": "9"},
+        ),
+        _ScenarioReponseGemini(503, REPONSE_GEMINI_503),
+        _ScenarioReponseGemini(200, REPONSE_GEMINI_OK),
+    ]
+
+    texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+
+    assert texte == "réponse modèle de secours"
+    assert gemini_simule.appels == ["gemini-2.5-flash"] * 3
+    # Le délai demandé par Google prime et n'est jamais déformé par le jitter.
+    assert pauses[0] == 9.0
+    # La tentative suivante retombe sur le backoff exponentiel, avec jitter.
+    base = app.GEMINI_BACKOFF[1]
+    assert base * (1 - app.GEMINI_JITTER_MAX) <= pauses[1] <= base * (1 + app.GEMINI_JITTER_MAX)
+
+
+def test_gemini_budget_parametre_est_la_seule_echeance_des_retries(gemini_simule, monkeypatch):
+    """Le budget passé à l'appel borne retries et replis ; aucun temps de retry ne
+    s'écoule au-delà — c'est ce budget qui s'impute à la limite globale du travail."""
+    horloge = _HorlogeGemini()
+    monkeypatch.setattr(app, "time", horloge)
+    monkeypatch.setattr(app.random, "sample", lambda valeurs, _nombre: list(valeurs))
+    gemini_simule.horloge = horloge
+    app.CONFIG.gemini_modeles = ["gemini-2.5-flash"]
+    gemini_simule.reponses_par_modele = {"gemini-2.5-flash": _GEMINI_NE_REPOND_JAMAIS}
+
+    with pytest.raises(app.ErreurGeminiIndisponible) as erreur:
+        asyncio.run(app._appel_gemini_brut(
+            [{"text": "bonjour"}], temperature=0.5, budget=30.0
+        ))
+
+    assert str(erreur.value).startswith("Délai Gemini dépassé (30s)")
+    assert horloge.monotonic() <= 30.0
+    assert gemini_simule.appels == ["gemini-2.5-flash"]
+
+
+def test_controle_qualite_gemini_indisponible_echoue_le_travail_pas_un_rejet(
+    tmp_path, monkeypatch
+):
+    """Fail-closed ≠ indisponibilité : si Gemini ne répond pas (délai ou 5xx après
+    retries), le plan reste NON VALIDÉ et le travail échoue avec une erreur explicite —
+    jamais un verdict « non conforme » qui dégraderait silencieusement en 0 plan."""
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+    clip = {"id": 0, "source": "source_0", "debut": 1.0, "duree": 2.0, "hook": False}
+    config = studio_montage.ConfigurationMontage(
+        dossier_travail=tmp_path / "travail", dossier_videos=tmp_path / "videos"
+    )
+
+    async def faux_extrait(_source, destination, _debut, _duree, _config, _rapporteur):
+        destination.write_bytes(b"extrait")
+        return destination
+
+    monkeypatch.setattr(studio_montage, "creer_extrait_verification", faux_extrait)
+
+    async def gemini_timeout(_parts, **_kwargs):
+        raise asyncio.TimeoutError
+
+    with pytest.raises(studio_montage.ErreurGeminiIndisponible) as erreur_delai:
+        asyncio.run(studio_montage.verifier_conformite_extrait(
+            clip, source, "https://www.tiktok.com/@demo/video/1", config,
+            studio_montage.Rapporteur(lambda **_kw: None, lambda: False, lambda: 300.0),
+            gemini_timeout,
+        ))
+    assert isinstance(erreur_delai.value, studio_montage.ErreurMontage)
+    assert getattr(erreur_delai.value, "indisponible", False) is True
+    assert "Gemini indisponible" in str(erreur_delai.value)
+    assert "plan non validé" in str(erreur_delai.value)
+    assert "https://www.tiktok.com/@demo/video/1" in str(erreur_delai.value)
+
+    # Une indisponibilité explicite remontée par l'appel (5xx après retries) garde
+    # son message « Gemini indisponible après N tentatives » jusqu'au statut du travail.
+    async def gemini_indisponible(_parts, **_kwargs):
+        raise app.ErreurGeminiIndisponible(
+            "Gemini indisponible après 15 tentatives (saturation 503/429 persistante "
+            "sur tous les modèles et toutes les clés). Réessaie dans quelques minutes."
+        )
+
+    with pytest.raises(studio_montage.ErreurGeminiIndisponible) as erreur_appel:
+        asyncio.run(studio_montage.verifier_conformite_extrait(
+            clip, source, "https://www.tiktok.com/@demo/video/1", config,
+            studio_montage.Rapporteur(lambda **_kw: None, lambda: False, lambda: 300.0),
+            gemini_indisponible,
+        ))
+    assert "Gemini indisponible après 15 tentatives" in str(erreur_appel.value)
+
+
+def test_controle_qualite_rejet_valide_exclut_le_plan_sans_echec_de_travail(
+    tmp_path, monkeypatch
+):
+    """Comportement existant conservé : un verdict VALIDE « rejet » exclut seulement
+    le plan — ce n'est pas une erreur d'indisponibilité."""
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+    clip = {"id": 0, "source": "source_0", "debut": 1.0, "duree": 2.0, "hook": False}
+    config = studio_montage.ConfigurationMontage(
+        dossier_travail=tmp_path / "travail", dossier_videos=tmp_path / "videos"
+    )
+
+    async def faux_extrait(_source, destination, _debut, _duree, _config, _rapporteur):
+        destination.write_bytes(b"extrait")
+        return destination
+
+    monkeypatch.setattr(studio_montage, "creer_extrait_verification", faux_extrait)
+
+    async def gemini_rejette(_parts, **_kwargs):
+        return json.dumps({
+            "conforme": False, "personnes_visibles": True, "watermark": False,
+            "logo_ajoute": False, "autre_element_superpose": False,
+            "texte_non_sous_titre": False, "flou_ou_illisible": False,
+            "hors_sujet": False, "raisons": ["une main est visible dans le cadre"],
+        })
+
+    verdict = asyncio.run(studio_montage.verifier_conformite_extrait(
+        clip, source, "https://www.tiktok.com/@demo/video/1", config,
+        studio_montage.Rapporteur(lambda **_kw: None, lambda: False, lambda: 300.0),
+        gemini_rejette,
+    ))
+    assert verdict["conforme"] is False
+    assert "une main est visible dans le cadre" in verdict["raisons"]
+    assert verdict["url"] == "https://www.tiktok.com/@demo/video/1"
+
+
+def test_validation_source_gemini_indisponible_n_est_pas_un_rejet_ia(tmp_path, monkeypatch):
+    """Une source dont la validation IA est impossible faute de Gemini remonte une
+    ErreurGeminiIndisponible — elle ne sera jamais classée « rejected_by_ai »."""
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"video")
+    config = studio_montage.ConfigurationMontage(
+        dossier_travail=tmp_path / "travail", dossier_videos=tmp_path / "videos",
+        exiger_validation_ia=True,
+    )
+
+    async def faux_apercu(_source, destination, _duree, _config, _rapporteur):
+        destination.write_bytes(b"apercu")
+        return destination
+
+    async def gemini_indisponible(_parts, **_kwargs):
+        raise app.ErreurGeminiIndisponible("Gemini indisponible après 15 tentatives.")
+
+    monkeypatch.setattr(studio_montage, "creer_apercu", faux_apercu)
+    with pytest.raises(studio_montage.ErreurGeminiIndisponible) as erreur:
+        asyncio.run(studio_montage.analyser_video(
+            source, 12.0, [{"id": 0, "texte": "bonjour"}], config,
+            studio_montage.Rapporteur(lambda **_kw: None, lambda: False, lambda: 300.0),
+            gemini_indisponible,
+        ))
+    assert getattr(erreur.value, "indisponible", False) is True
+    assert "Validation IA indisponible pour source.mp4" in str(erreur.value)
+    assert "Gemini indisponible après 15 tentatives" in str(erreur.value)
 
 
 # ======================================================================================
