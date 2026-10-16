@@ -37,6 +37,18 @@ class TravailAnnule(ErreurMontage):
     """Le propriétaire a demandé l'annulation du travail."""
 
 
+class ErreurGeminiIndisponible(ErreurMontage):
+    """L'API Gemini n'a pas pu être jointe (5xx, 429, délai ou transport).
+
+    Distincte d'un verdict de rejet qualité : le contenu n'a jamais pu être jugé.
+    Le plan reste « non validé » et le travail s'arrête avec cette erreur explicite —
+    jamais silencieusement traitée comme un rejet ou un « 0 plan valide ». Porte le
+    marqueur `indisponible` pour être reconnue telle quelle à travers les couches.
+    """
+
+    indisponible = True
+
+
 @dataclass(frozen=True)
 class ConfigurationMontage:
     dossier_travail: Path
@@ -311,8 +323,14 @@ DUREE_PLAN_QUALITE = 4.5
 # Tours de sélection et de relecture maximum avant l'échec final, détaillé.
 TOURS_MAX_CONTROLE_QUALITE = 3
 # Borne haute d'un appel de relecture : le coût typique est ~18 s, ce plafond évite
-# qu'un appel bloqué par la saturation Gemini consomme toute la fenêtre du job.
+# qu'un appel bloqué par la saturation Gemini consomme toute la fenêtre du job. Ce
+# budget passe tel quel à l'appel Gemini (retries inclus) : c'est la seule échéance
+# pilotante, comptabilisée dans la limite globale du travail.
 DELAI_CONTROLE_QUALITE_PLAN = 75.0
+# Marge hors budget (attente du sémaphore, marge réseau) ajoutée à la borne de
+# sécurité `asyncio.wait_for` qui entoure chaque appel Gemini : elle ne doit jamais
+# couper un retry en cours, sinon la double échéance défaite silencieusement l'appel.
+MARGE_APPEL_GEMINI = 60.0
 # Un extrait de vérification couvre quelques secondes : la limite mémoire est basse.
 TAILLE_MAX_EXTRAIT_VERIFICATION = 4 * 1024 * 1024
 
@@ -598,12 +616,15 @@ async def analyser_video(
                 for s in segments
             ], ensure_ascii=False),
         )
+        # Une seule échéance pilotante, retries compris : bornée par le budget restant
+        # du travail via rapporteur.timeout, donc comptabilisée dans la limite globale.
+        budget_appel = float(rapporteur.timeout(config.delai_gemini))
         brut = await asyncio.wait_for(
             appel_gemini(
                 [{"inline_data": {"mime_type": "video/mp4", "data": video_b64}}, {"text": prompt}],
-                temperature=0.1, json_mode=True,
+                temperature=0.1, json_mode=True, budget=budget_appel,
             ),
-            timeout=rapporteur.timeout(config.delai_gemini),
+            timeout=budget_appel + MARGE_APPEL_GEMINI,
         )
         del video_b64
         try:
@@ -628,12 +649,20 @@ async def analyser_video(
         raise
     except asyncio.TimeoutError as exc:
         if config.exiger_validation_ia:
-            raise ErreurMontage(f"Validation IA trop longue pour {source.name}.") from exc
+            raise ErreurGeminiIndisponible(
+                f"Gemini indisponible : délai dépassé pendant la validation IA de "
+                f"{source.name} — source non validée, aucun plan non conforme n'est monté."
+            ) from exc
         return _repli_scenes(duree, segments), "Délai Gemini dépassé, sélection de repli utilisée."
     except Exception as exc:  # une analyse en échec ne condamne pas les autres sources
         if config.exiger_validation_ia:
             if isinstance(exc, ErreurMontage):
                 raise
+            if getattr(exc, "indisponible", False):
+                # L'API n'a pas pu être jointe : ce n'est pas un rejet de la source.
+                raise ErreurGeminiIndisponible(
+                    f"Validation IA indisponible pour {source.name} : {exc}"
+                ) from exc
             raise ErreurMontage(f"Validation IA indisponible pour {source.name} : {exc}") from exc
         return _repli_scenes(duree, segments), f"Analyse indisponible, sélection de repli utilisée : {exc}"
     finally:
@@ -653,12 +682,13 @@ async def analyser_style_reference(
         contenu = await asyncio.to_thread(apercu.read_bytes)
         video_b64 = base64.b64encode(contenu).decode("ascii")
         del contenu
+        budget_appel = float(rapporteur.timeout(config.delai_gemini))
         brut = await asyncio.wait_for(
             appel_gemini(
                 [{"inline_data": {"mime_type": "video/mp4", "data": video_b64}}, {"text": PROMPT_STYLE}],
-                temperature=0.1, json_mode=True,
+                temperature=0.1, json_mode=True, budget=budget_appel,
             ),
-            timeout=rapporteur.timeout(config.delai_gemini),
+            timeout=budget_appel + MARGE_APPEL_GEMINI,
         )
         objet = json.loads(brut.strip().removeprefix("```json").removesuffix("```").strip())
         return StyleReference.model_validate(objet), None
@@ -1106,9 +1136,12 @@ async def verifier_conformite_extrait(
 ) -> dict[str, Any]:
     """Relit UNE DEUXIÈME FOIS un plan sur un extrait de sa fenêtre exacte.
 
-    Verdict échoué par construction : réponse illisible, incomplète, contradictoire ou
-    appel impossible valent tous « non conforme ». Un contrôle impossible écarte le plan,
-    il ne le laisse jamais passer.
+    Verdict échoué par construction : réponse illisible, incomplète ou contradictoire
+    valent « non conforme » et écartent le plan — il ne le laisse jamais passer. En
+    revanche, une INDISPONIBILITÉ de l'API (5xx/429/délai/transport après les retries)
+    n'est pas un verdict de rejet : le plan reste « non validé » et le travail échoue
+    avec une ErreurGeminiIndisponible explicite, jamais confondue avec un rejet qualité
+    ni dégradée silencieusement en « 0 plan valide ».
     """
     source = str(clip.get("source", ""))
     url_source = str(url or "").strip()
@@ -1159,21 +1192,40 @@ async def verifier_conformite_extrait(
             segment=_texte_attendu_plan(clip), debut=debut, fin=debut + duree
         )
         try:
+            # Budget unique de l'appel, retries inclus : le temps des retries Gemini
+            # s'impute donc au budget restant du travail (limite globale de 30 min).
+            budget_appel = float(rapporteur.timeout(
+                min(float(config.delai_gemini), DELAI_CONTROLE_QUALITE_PLAN)
+            ))
             brut = await asyncio.wait_for(
                 appel_gemini(
                     [
                         {"inline_data": {"mime_type": "video/mp4", "data": video_b64}},
                         {"text": prompt},
                     ],
-                    temperature=0.0, json_mode=True,
+                    temperature=0.0, json_mode=True, budget=budget_appel,
                 ),
-                timeout=rapporteur.timeout(
-                    min(float(config.delai_gemini), DELAI_CONTROLE_QUALITE_PLAN)
-                ),
+                timeout=budget_appel + MARGE_APPEL_GEMINI,
             )
-        except asyncio.TimeoutError:
-            verdict["raisons"] = ["Gemini n’a pas répondu à temps : contrôle qualité impossible"]
-            return verdict
+        except asyncio.TimeoutError as exc:
+            # Gemini n'a pas pu être joint : le plan reste NON VALIDÉ, mais ce n'est
+            # pas un verdict de rejet — le travail échoue avec une erreur explicite au
+            # lieu d'être silencieusement traité comme « 0 plan valide ».
+            verdict["raisons"] = ["Gemini indisponible : délai dépassé, plan non validé"]
+            raise ErreurGeminiIndisponible(
+                "Gemini indisponible : délai dépassé pendant le contrôle qualité du plan "
+                f"{url_source} [{debut:.2f} s → {debut + duree:.2f} s] — plan non validé, "
+                "aucun plan non conforme n'est monté."
+            ) from exc
+        except (TravailAnnule, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            if not getattr(exc, "indisponible", False):
+                raise
+            # Indisponibilité explicite remontée par l'appel (5xx/429/transport après
+            # épuisement des retries) : plan non validé, travail en échec clair.
+            verdict["raisons"] = [f"Gemini indisponible : {exc}"]
+            raise ErreurGeminiIndisponible(str(exc)) from exc
         del video_b64
         try:
             objet = json.loads(brut.strip().removeprefix("```json").removesuffix("```").strip())
@@ -1245,7 +1297,9 @@ async def controler_qualite_plan(
 
     Un plan non confirmé est écarté AVEC sa scène, puis la sélection est relancée. Au
     plus `tours_max` tours : passé ce cap, l'échec est détaillé (URL, timestamps,
-    raisons) plutôt qu'une vidéo non conforme.
+    raisons) plutôt qu'une vidéo non conforme. Une indisponibilité de Gemini pendant
+    la relecture n'est jamais un rejet : ErreurGeminiIndisponible remonte immédiatement
+    et met le travail en échec avec un message explicite.
     """
     derniers_rejets: list[dict[str, Any]] = []
     for tour in range(1, max(1, int(tours_max)) + 1):
@@ -1724,8 +1778,19 @@ async def construire_montage_professionnel(
                             "error": avertissement, "status": "analysis_fallback",
                         })
                 except ErreurMontage as exc:
-                    # Une source refusée par l'IA (texte, réponse invalide, timeout)
-                    # est exclue ; les autres sources propres peuvent continuer.
+                    if getattr(exc, "indisponible", False):
+                        # Gemini est injoignable : ce n'est PAS un rejet qualité de la
+                        # source. Le plan reste non validé et le travail doit s'arrêter
+                        # sur une erreur explicite, jamais sur un « rejected_by_ai »
+                        # silencieux qui dégraderait en « 0 plan valide ».
+                        rapports[index].update(status="unavailable", scenes=0, error=str(exc))
+                        erreurs_sources.append({
+                            "index": index, "url": metadonnees[nom]["url"],
+                            "error": str(exc), "status": "unavailable",
+                        })
+                        raise
+                    # Une source refusée par l'IA (texte, réponse invalide) est exclue ;
+                    # les autres sources propres peuvent continuer.
                     rapports[index].update(status="rejected_by_ai", scenes=0, error=str(exc))
                     erreurs_sources.append({
                         "index": index, "url": metadonnees[nom]["url"],
@@ -1738,7 +1803,15 @@ async def construire_montage_professionnel(
                     source_errors=erreurs_sources,
                 )
 
-        await asyncio.gather(*(analyser_une(nom) for nom in sources))
+        # return_exceptions=True : aucune tâche d'analyse n'est laissée en arrière-plan
+        # quand une indisponibilité Gemini interrompt le travail ; l'erreur remonte
+        # ensuite telle quelle (ErreurGeminiIndisponible, TravailAnnule…).
+        resultats_analyses = await asyncio.gather(
+            *(analyser_une(nom) for nom in sources), return_exceptions=True
+        )
+        for resultat in resultats_analyses:
+            if isinstance(resultat, BaseException):
+                raise resultat
 
         style_reference = STYLE_DEFAUT.model_copy(deep=True)
         if reference_path and reference_infos:
