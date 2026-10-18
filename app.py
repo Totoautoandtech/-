@@ -753,31 +753,39 @@ PROMPT_SCRIPT = (
 GEMINI_STATUTS_REESSAYABLES = {429, 500, 502, 503, 504}
 # Statuts qui signalent explicitement une saturation temporaire du modèle.
 GEMINI_STATUTS_SATURATION = {429, 503}
+# Part du budget total qu'aucune requête isolée ne peut dépasser quand plusieurs
+# couples clé/modèle existent : ~35 % du budget restent toujours disponibles pour que
+# la rotation visite réellement les autres couples, même si une requête se bloque.
 PART_BUDGET_REPLI = 0.35
+# Timeout minimal d'une requête, quel que soit le budget restant de l'appel.
 BUDGET_COUPLE_MIN = 20.0
+# Borne haute d'un Retry-After Google : l'attente réellement respectée est plafonnée
+# à 60 s, puis bornée par le budget total restant de l'appel.
 PAUSE_MAX_RETRY_AFTER = 60.0
 GEMINI_TENTATIVES_PAR_MODELE = 5
-# Backoff exponentiel entre deux tentatives (1 s, 2 s, 4 s, 8 s…), auquel s'ajoute un
-# jitter de ±GEMINI_JITTER_MAX pour éviter que plusieurs travaux ne retentent en rafale
-# au même instant. Un Retry-After renvoyé par Google prime et n'est jamais déformé.
+# Backoff exponentiel entre deux tentatives d'un même couple (1 s, 2 s, 4 s, 8 s…),
+# auquel s'ajoute un jitter de ±GEMINI_JITTER_MAX pour éviter que plusieurs travaux ne
+# retentent en rafale au même instant. Un Retry-After renvoyé par Google prime et n'est
+# jamais déformé : il est honoré jusqu'à sa date réelle (plafonnée, puis bornée par le
+# budget restant) — pendant ce refroidissement, la rotation visite les autres couples.
 GEMINI_BACKOFF = (1, 2, 4, 8)
 GEMINI_JITTER_MAX = 0.5
 # Marge hors budget pour les bornes de sécurité qui entourent un appel Gemini (attente
 # du sémaphore, marge réseau). Le budget passé à l'appel reste la SEULE échéance
 # pilotante des retries : la borne de sécurité ne doit jamais les couper silencieusement.
 GEMINI_MARGE_HORS_BUDGET = 60.0
-# Messages publics après épuisement des réessais : le nombre de tentatives réellement
-# effectuées est repris tel quel dans le statut du travail. Un verdict de rejet qualité
-# n'utilise jamais ces messages — ils ne décrivent qu'une indisponibilité de l'API.
+# Messages publics après épuisement des réessais : le détail nomme les modèles
+# réellement essayés avec leur nombre de tentatives, les modèles non essayés quand le
+# budget a coupé la rotation, et la cause distingue le quota d'une surcharge. Un
+# verdict de rejet qualité n'utilise jamais ces messages — ils ne décrivent qu'une
+# indisponibilité de l'API.
 GEMINI_MESSAGE_SATURE = (
-    "Gemini indisponible après {tentatives} tentatives "
-    "(saturation 503/429 persistante sur tous les modèles et toutes les clés). "
+    "Gemini indisponible après {tentatives} tentatives ({detail}) — {cause}. "
     "Réessaie dans quelques minutes."
 )
 GEMINI_MESSAGE_INDISPONIBLE = (
-    "Gemini indisponible après {tentatives} tentatives "
-    "(erreurs 5xx ou réseau persistantes sur tous les modèles et toutes les clés). "
-    "Réessaie dans quelques minutes."
+    "Gemini indisponible après {tentatives} tentatives ({detail}) — {cause}. "
+    "Réessaie dans quelques minutes. Derniers échecs : {echecs}"
 )
 
 
@@ -907,21 +915,76 @@ def _raison_erreur_gemini(exc: Exception, cles: list[str]) -> str:
     return raison
 
 
+def _detail_rotation_gemini(
+    ordre_modeles: list[str],
+    tentatives_par_modele: dict[str, int],
+    budget_total: float,
+    coupe_par_horloge: bool,
+) -> str:
+    """Détail honnête de la rotation : comptes par modèle, modèles non essayés, budget.
+
+    Ne jamais prétendre « tous les modèles et toutes les clés » quand le budget a
+    interrompu la rotation avant la fin : le message public cite les modèles
+    réellement visités et ceux que le budget n'a pas permis d'atteindre.
+    """
+    essayes = [
+        f"{modele} ×{tentatives_par_modele.get(modele, 0)}"
+        for modele in ordre_modeles
+        if tentatives_par_modele.get(modele, 0) > 0
+    ]
+    non_essayes = [
+        modele for modele in ordre_modeles
+        if tentatives_par_modele.get(modele, 0) <= 0
+    ]
+    detail = ", ".join(essayes) or "aucun couple clé/modèle essayé"
+    if non_essayes:
+        pluriel = "non essayé" if len(non_essayes) == 1 else "non essayés"
+        detail += (
+            f" ; {', '.join(non_essayes)} {pluriel} "
+            f"avant la fin du budget de {budget_total:g} s"
+        )
+    elif coupe_par_horloge:
+        detail += f" ; budget de {budget_total:g} s épuisé pendant la rotation"
+    return detail
+
+
+def _cause_indisponibilite_gemini(statuts_vus: set[int], saturation_vue: bool) -> str:
+    """Distingue le quota (429 RESOURCE_EXHAUSTED) d'une surcharge (503 UNAVAILABLE)."""
+    quota_vu = 429 in statuts_vus
+    surcharge_vue = 503 in statuts_vus
+    if surcharge_vue and quota_vu:
+        return "saturation 503 et quota 429 persistants (surcharge puis quota épuisé)"
+    if surcharge_vue:
+        return "saturation 503 persistante"
+    if quota_vu:
+        return "quota 429 persistant (RESOURCE_EXHAUSTED)"
+    if saturation_vue:
+        return "saturation persistante signalée par Gemini"
+    return "erreurs 5xx ou réseau persistantes"
+
+
 async def _appel_gemini_brut(
     parts: list[dict], *, temperature: float, system: Optional[str] = None,
     json_mode: bool = False, budget: Optional[float] = None,
 ) -> str:
-    """Appelle Gemini avec un budget par couple clé/modèle et un repli réellement atteignable.
+    """Appelle Gemini en ROUND-ROBIN sur les couples clé/modèle, Retry-After honoré.
 
-    Les clés sont mélangées, puis chaque couple reçoit sa part du budget total. Les
-    erreurs temporaires (429, 5xx, transport, délai) sont retentées jusqu'à cinq fois
-    avec un backoff exponentiel muni d'un jitter, sans qu'une requête lente puisse
-    consommer le budget réservé aux modèles et clés de secours. `budget` (secondes) est
-    la seule échéance pilotante de l'appel, retries compris : les appels situés dans un
-    travail y passent le temps qu'il reste réellement, pour que les retries soient
+    Les clés sont mélangées, puis la tentative k visite le couple (k % nb_couples) :
+    chaque couple clé/modèle reçoit une première tentative avant qu'aucun n'en reçoive
+    une deuxième — on ne martèle plus cinq fois un modèle saturé avant d'effleurer le
+    suivant, car un 503 « high demand » ou un 429 de quota est par modèle. Chaque
+    couple refroidit ensuite à son rythme : Retry-After de Google honoré jusqu'à sa
+    date réelle (sans jitter, plafonné à 60 s, borné par le budget total restant),
+    sinon backoff exponentiel avec jitter. Pendant le refroidissement d'un couple, la
+    rotation visite les couples déjà réveillés ; si aucun n'est prêt, la pause est
+    réellement attendue dans la limite du budget — jamais abandonnée au profit d'une
+    martelade stérile dans la même fenêtre de quota. `budget` (secondes) est la seule
+    échéance pilotante de l'appel, retries compris : les appels situés dans un travail
+    y passent le temps qu'il reste réellement, pour que les retries soient
     comptabilisés dans la limite globale du travail sans double échéance silencieuse.
-    Après épuisement, une ErreurGeminiIndisponible explicite porte le nombre de
-    tentatives réellement effectuées jusqu'au statut du travail.
+    Après épuisement, une ErreurGeminiIndisponible explicite porte les tentatives
+    réellement effectuées par modèle, les modèles non essayés et la cause observée
+    (quota 429 vs surcharge 503).
     """
     cles = CONFIG.gemini_api_keys
     if not cles:
@@ -931,13 +994,12 @@ async def _appel_gemini_brut(
     couples = [(cle, modele) for cle in random.sample(cles, len(cles)) for modele in modeles]
     nb_couples = len(couples)
     budget_total = max(15.0, float(CONFIG.delai_gemini if budget is None else budget))
-    reserve_repli = budget_total * PART_BUDGET_REPLI if nb_couples > 1 else 0.0
-    budget_principal = max(BUDGET_COUPLE_MIN, budget_total - reserve_repli)
-    budget_secours = (
-        max(BUDGET_COUPLE_MIN, reserve_repli / (nb_couples - 1))
-        if nb_couples > 1 else 0.0
+    # Une requête isolée ne consomme jamais plus de 65 % du budget total : la rotation
+    # garde toujours de quoi visiter les autres couples clé/modèle.
+    duree_appel = max(
+        BUDGET_COUPLE_MIN,
+        budget_total if nb_couples == 1 else budget_total * (1.0 - PART_BUDGET_REPLI),
     )
-    duree_appel = max(BUDGET_COUPLE_MIN, budget_principal)
 
     payload: dict[str, Any] = {
         "contents": [{"role": "user", "parts": parts}],
@@ -948,13 +1010,20 @@ async def _appel_gemini_brut(
     if json_mode:
         payload["generationConfig"]["responseMimeType"] = "application/json"
 
-    echecs: list[str] = []
+    ordre_modeles = list(dict.fromkeys(modele for _, modele in couples))
+    tentatives_par_modele = {modele: 0 for modele in ordre_modeles}
+
     saturation_vue = False
     retentes_vues = False
     tentatives_totales = 0
     inepuisable = False
     coupe_par_horloge = False
-    repli_atteint = False
+    compteurs = [0] * nb_couples
+    reveil = [0.0] * nb_couples
+    couples_vivants = [True] * nb_couples
+    indices_essayes: set[int] = set()
+    raisons_couples: dict[int, str] = {}
+    statuts_vus: set[int] = set()
 
     # L'attente du sémaphore est hors budget : l'horloge démarre juste après son acquisition.
     async with GEMINI_SEMAPHORE:
@@ -963,148 +1032,171 @@ async def _appel_gemini_brut(
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None, connect=15)
         ) as session:
-            for rang, (cle, modele) in enumerate(couples):
+            rang_tentative = 0  # tentative globale k : le couple visé est k % nb_couples
+            while not inepuisable:
+                vivants = [
+                    index for index in range(nb_couples)
+                    if couples_vivants[index]
+                    and compteurs[index] < GEMINI_TENTATIVES_PAR_MODELE
+                ]
+                if not vivants:
+                    break
                 maintenant = time.monotonic()
                 restant_total = fin_totale - maintenant
                 if restant_total <= 0.0:
                     coupe_par_horloge = True
                     break
 
-                budget_alloue = budget_principal if rang == 0 else budget_secours
-                budget_couple = min(budget_alloue, restant_total)
-                if budget_couple <= 0.0:
+                # Couple suivant de la rotation : d'abord les couples déjà réveillés,
+                # dans l'ordre cyclique à partir du rang de la tentative.
+                prets = [index for index in vivants if reveil[index] <= maintenant]
+                if not prets:
+                    # Tous les couples refroidissent (Retry-After ou backoff) : la pause
+                    # est honorée jusqu'au prochain réveil, bornée par le budget restant
+                    # de l'appel — pas abandonnée pour marteler la même fenêtre de quota.
+                    cible = min(reveil[index] for index in vivants)
+                    attente = cible - maintenant
+                    if attente >= restant_total:
+                        coupe_par_horloge = True
+                        break
+                    logger.warning(
+                        "[Gemini] tous les couples refroidissent ; nouvelle tentative "
+                        "dans %.1f s (pause honorée dans le budget restant de %.1f s).",
+                        attente,
+                        restant_total,
+                    )
+                    if attente > 0.0:
+                        await asyncio.sleep(attente)
+                    maintenant = time.monotonic()
+                    prets = [
+                        index for index in vivants
+                        if reveil[index] <= maintenant + 1e-6
+                    ] or vivants
+
+                choisi = min(prets, key=lambda index: (index - rang_tentative) % nb_couples)
+                cle, modele = couples[choisi]
+                timeout_total = min(duree_appel, fin_totale - time.monotonic())
+                if timeout_total <= 0.0:
                     coupe_par_horloge = True
                     break
-                fin_couple = min(fin_totale, maintenant + budget_couple)
+
+                compteurs[choisi] += 1
+                tentatives_par_modele[modele] += 1
+                tentatives_totales += 1
+                indices_essayes.add(choisi)
+                rang_tentative += 1
+                tentative_couple = compteurs[choisi]
 
                 headers = {"x-goog-api-key": cle, "Content-Type": "application/json"}
                 url = (
                     "https://generativelanguage.googleapis.com/v1beta/models/"
                     f"{modele}:generateContent"
                 )
-                raison_couple: Optional[str] = None
+                timeout_requete = aiohttp.ClientTimeout(
+                    total=timeout_total,
+                    connect=min(15.0, timeout_total),
+                )
+                try:
+                    async with session.post(
+                        url, headers=headers, json=payload, timeout=timeout_requete
+                    ) as resp:
+                        texte = await resp.text()
+                        if resp.status == 200:
+                            data = json.loads(texte)
+                            return _extraire_texte_gemini(data)
 
-                for tentative in range(1, GEMINI_TENTATIVES_PAR_MODELE + 1):
-                    restant_couple = min(fin_couple, fin_totale) - time.monotonic()
-                    if restant_couple <= 0.0:
-                        coupe_par_horloge = True
-                        break
-                    timeout_total = min(duree_appel, restant_couple)
-                    if timeout_total <= 0.0:
-                        coupe_par_horloge = True
-                        break
-                    if rang > 0:
-                        repli_atteint = True
+                        entetes = getattr(resp, "headers", {}) or {}
+                        retry_after = entetes.get("Retry-After")
+                        if retry_after is None:
+                            retry_after = entetes.get("retry-after")
+                        erreur = ErreurGemini(
+                            f"Gemini a répondu {resp.status} : {texte[:200]}",
+                            statut=resp.status,
+                            saturation=_est_saturation_gemini(resp.status, texte),
+                            pause=_pause_reessai(retry_after),
+                        )
+                        erreur.retry_after_present = (
+                            retry_after is not None and bool(str(retry_after).strip())
+                        )
+                        raise erreur
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    raison_couple = _raison_erreur_gemini(exc, cles)
+                    raisons_couples[choisi] = raison_couple
+                    statut = int(getattr(exc, "statut", 0) or 0)
+                    if statut:
+                        statuts_vus.add(statut)
+                    sature = bool(getattr(exc, "saturation", False))
+                    saturation_vue = saturation_vue or sature
 
-                    tentatives_totales += 1
-                    timeout_requete = aiohttp.ClientTimeout(
-                        total=timeout_total,
-                        connect=min(15.0, timeout_total),
-                    )
-                    try:
-                        async with session.post(
-                            url, headers=headers, json=payload, timeout=timeout_requete
-                        ) as resp:
-                            texte = await resp.text()
-                            if resp.status == 200:
-                                data = json.loads(texte)
-                                return _extraire_texte_gemini(data)
-
-                            entetes = getattr(resp, "headers", {}) or {}
-                            retry_after = entetes.get("Retry-After")
-                            if retry_after is None:
-                                retry_after = entetes.get("retry-after")
-                            erreur = ErreurGemini(
-                                f"Gemini a répondu {resp.status} : {texte[:200]}",
-                                statut=resp.status,
-                                saturation=_est_saturation_gemini(resp.status, texte),
-                                pause=_pause_reessai(retry_after),
-                            )
-                            erreur.retry_after_present = (
-                                retry_after is not None and bool(str(retry_after).strip())
-                            )
-                            raise erreur
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        raison_couple = _raison_erreur_gemini(exc, cles)
-                        statut = int(getattr(exc, "statut", 0) or 0)
-                        sature = bool(getattr(exc, "saturation", False))
-                        saturation_vue = saturation_vue or sature
-
-                        if bool(getattr(exc, "definitif", False)):
-                            logger.warning(
-                                "[Gemini] %s (empreinte clé %s), tentative %s/%s — "
-                                "statut %s définitif : %s",
-                                modele,
-                                _empreinte_cle(cle),
-                                tentative,
-                                GEMINI_TENTATIVES_PAR_MODELE,
-                                statut or "transport/délai",
-                                raison_couple,
-                            )
-                            inepuisable = True
-                            break
-
-                        reessayable = statut == 0 or statut in GEMINI_STATUTS_REESSAYABLES
-                        if reessayable:
-                            retentes_vues = True
-                        if not reessayable or tentative >= GEMINI_TENTATIVES_PAR_MODELE:
-                            logger.warning(
-                                "[Gemini] %s (empreinte clé %s), tentative %s/%s — "
-                                "statut %s, abandon du couple : %s",
-                                modele,
-                                _empreinte_cle(cle),
-                                tentative,
-                                GEMINI_TENTATIVES_PAR_MODELE,
-                                statut or "transport/délai",
-                                raison_couple,
-                            )
-                            break
-
-                        if isinstance(exc, ErreurGemini) and exc.retry_after_present:
-                            # Le délai demandé par Google est respecté tel quel, sans
-                            # jitter : il exprime déjà la fenêtre de récupération.
-                            pause = exc.pause
-                            origine_pause = "Retry-After respecté"
-                        else:
-                            base = GEMINI_BACKOFF[
-                                min(tentative - 1, len(GEMINI_BACKOFF) - 1)
-                            ]
-                            pause = max(
-                                0.0,
-                                base * (1.0 + random.uniform(-GEMINI_JITTER_MAX, GEMINI_JITTER_MAX)),
-                            )
-                            origine_pause = "backoff exponentiel avec jitter"
-                        restant_couple = min(fin_couple, fin_totale) - time.monotonic()
+                    if bool(getattr(exc, "definitif", False)):
                         logger.warning(
-                            "[Gemini] %s (empreinte clé %s), tentative %s/%s — statut %s : "
-                            "%s ; nouvelle tentative dans %.1f s (%s)",
+                            "[Gemini] %s (empreinte clé %s), tentative %s/%s — "
+                            "statut %s définitif : %s",
                             modele,
                             _empreinte_cle(cle),
-                            tentative,
+                            tentative_couple,
                             GEMINI_TENTATIVES_PAR_MODELE,
                             statut or "transport/délai",
                             raison_couple,
-                            pause,
-                            origine_pause,
                         )
-                        if restant_couple <= 0.0 or pause >= restant_couple:
-                            coupe_par_horloge = True
-                            break
-                        if pause > 0.0:
-                            await asyncio.sleep(pause)
+                        inepuisable = True
+                        break
 
-                if raison_couple is not None:
-                    echecs.append(raison_couple)
+                    reessayable = statut == 0 or statut in GEMINI_STATUTS_REESSAYABLES
+                    if reessayable:
+                        retentes_vues = True
+                    if not reessayable:
+                        couples_vivants[choisi] = False
+                        logger.warning(
+                            "[Gemini] %s (empreinte clé %s), tentative %s/%s — "
+                            "statut %s, abandon du couple : %s",
+                            modele,
+                            _empreinte_cle(cle),
+                            tentative_couple,
+                            GEMINI_TENTATIVES_PAR_MODELE,
+                            statut or "transport/délai",
+                            raison_couple,
+                        )
+                        continue
+
+                    if isinstance(exc, ErreurGemini) and exc.retry_after_present:
+                        # Le délai demandé par Google est honoré jusqu'à sa date réelle,
+                        # sans jitter : il exprime déjà la fenêtre de récupération.
+                        pause = exc.pause
+                        origine_pause = "Retry-After honoré jusqu'à sa date"
+                    else:
+                        base = GEMINI_BACKOFF[
+                            min(tentative_couple - 1, len(GEMINI_BACKOFF) - 1)
+                        ]
+                        pause = max(
+                            0.0,
+                            base * (1.0 + random.uniform(-GEMINI_JITTER_MAX, GEMINI_JITTER_MAX)),
+                        )
+                        origine_pause = "backoff exponentiel avec jitter"
+                    reveil[choisi] = time.monotonic() + pause
                     logger.warning(
-                        "[Gemini] couple modèle %s / empreinte clé %s épuisé.",
+                        "[Gemini] %s (empreinte clé %s), tentative %s/%s — statut %s : "
+                        "%s ; le couple redevient candidat dans %.1f s (%s), "
+                        "la rotation visite d'abord les couples déjà réveillés",
                         modele,
                         _empreinte_cle(cle),
+                        tentative_couple,
+                        GEMINI_TENTATIVES_PAR_MODELE,
+                        statut or "transport/délai",
+                        raison_couple,
+                        pause,
+                        origine_pause,
                     )
-                if inepuisable:
-                    break
+                    if tentative_couple >= GEMINI_TENTATIVES_PAR_MODELE:
+                        logger.warning(
+                            "[Gemini] couple modèle %s / empreinte clé %s épuisé.",
+                            modele,
+                            _empreinte_cle(cle),
+                        )
 
+    echecs = list(raisons_couples.values())
     resume = " | ".join(echecs[-4:])
     if inepuisable:
         raise ErreurApp(
@@ -1112,11 +1204,17 @@ async def _appel_gemini_brut(
             "ni un autre modèle ni une autre clé ne le traiteraient. "
             f"Dernier retour : {resume}"
         )
+    detail = _detail_rotation_gemini(
+        ordre_modeles, tentatives_par_modele, budget_total, coupe_par_horloge
+    )
+    cause = _cause_indisponibilite_gemini(statuts_vus, saturation_vue)
     if saturation_vue:
         raise ErreurGeminiIndisponible(
-            GEMINI_MESSAGE_SATURE.format(tentatives=tentatives_totales)
+            GEMINI_MESSAGE_SATURE.format(
+                tentatives=tentatives_totales, detail=detail, cause=cause
+            )
         )
-    if coupe_par_horloge and not repli_atteint:
+    if coupe_par_horloge and indices_essayes <= {0}:
         raise ErreurGeminiIndisponible(
             f"Délai Gemini dépassé ({budget_total:g}s) avant d'obtenir une réponse exploitable : "
             "le repli n'a pas eu lieu. "
@@ -1125,8 +1223,9 @@ async def _appel_gemini_brut(
         )
     if retentes_vues:
         raise ErreurGeminiIndisponible(
-            GEMINI_MESSAGE_INDISPONIBLE.format(tentatives=tentatives_totales)
-            + f" Détail : {resume}"
+            GEMINI_MESSAGE_INDISPONIBLE.format(
+                tentatives=tentatives_totales, detail=detail, cause=cause, echecs=resume
+            )
         )
     raise ErreurApp(f"Toutes les clés Gemini ont échoué. Derniers échecs : {resume}")
 

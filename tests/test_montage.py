@@ -785,3 +785,115 @@ def test_echec_du_controle_qualite_est_detaille_avec_url_et_timestamps(tmp_path,
     assert "https://www.tiktok.com/@demo/video/" in message
     assert " s → " in message
     assert "filigrane incrusté" in message
+
+
+# ======================================================================================
+# SECONDE PASSE DU CONTRÔLE QUALITÉ (indisponibilité Gemini)
+# ======================================================================================
+
+
+def test_budget_controle_qualite_porte_une_rotation_complete(monkeypatch=None):
+    """DELAI_CONTROLE_QUALITE_PLAN couvre une rotation complète clé/modèle avec un
+    Retry-After de 60 s honoré ; l'estimation nominale reste ~18 s par plan et le tout
+    reste comptabilisé dans la limite globale (delai_job 1800 s, sans double échéance).
+    """
+    assert montage.DELAI_CONTROLE_QUALITE_PLAN == 150.0
+    assert montage.SECONDES_CONTROLE_QUALITE_PLAN == 18.0
+    assert montage.DELAI_SECONDE_PASSE_QUALITE < montage.DELAI_CONTROLE_QUALITE_PLAN
+    config_defaut = montage.ConfigurationMontage(
+        dossier_travail=Path("travail"), dossier_videos=Path("videos")
+    )
+    assert config_defaut.delai_job == 1800.0
+    assert montage.DELAI_CONTROLE_QUALITE_PLAN < config_defaut.delai_job
+
+
+def test_seconde_passe_controle_qualite_apres_indisponibilite_gemini(tmp_path, monkeypatch):
+    """Indisponibilité Gemini → pause d'éclipsage bornée au budget restant, puis une
+    SECONDE passe complète qui peut aboutir. Un échec autre qu'une indisponibilité ne
+    déclenche jamais de seconde passe."""
+    plan_retour = [{"source": "s1", "debut": 0.0, "duree": 2.0}]
+    appels_controle: list[int] = []
+
+    async def controle_puis_indisponible(*_args, **_kwargs):
+        appels_controle.append(1)
+        if len(appels_controle) == 1:
+            raise montage.ErreurGeminiIndisponible(
+                "Gemini indisponible après 3 tentatives (saturation 503 persistante)."
+            )
+        return plan_retour, [{"conforme": True}]
+
+    monkeypatch.setattr(montage, "controler_qualite_plan", controle_puis_indisponible)
+    pauses: list[float] = []
+
+    async def sommeil_simule(secondes):
+        pauses.append(secondes)
+
+    monkeypatch.setattr(montage.asyncio, "sleep", sommeil_simule)
+    mises_a_jour: list[str] = []
+
+    def note_maj(status=None, progress=None, detail="", **extras):  # noqa: A002
+        mises_a_jour.append(f"{status}:{detail}")
+
+    rapporteur = montage.Rapporteur(note_maj, lambda: False, lambda: 900.0)
+
+    plan, verdicts = asyncio.run(montage.controler_qualite_plan_avec_seconde_passe(
+        [], [], {}, {}, montage.STYLE_DEFAUT, {}, _config(tmp_path), rapporteur, None,
+    ))
+
+    assert plan == plan_retour and verdicts == [{"conforme": True}]
+    # Deux passages exactement, séparés par la pause d'éclipsage bornée au budget.
+    assert len(appels_controle) == 2
+    assert pauses == [min(montage.DELAI_SECONDE_PASSE_QUALITE, 900.0)]
+    assert any("seconde passe" in detail for detail in mises_a_jour)
+
+
+def test_seconde_passe_echouee_remonte_une_indisponibilite_claire(tmp_path, monkeypatch):
+    """Deux indisponibilités de suite : l'échec remonte clairement, jamais un
+    « 0 plan valide » silencieux."""
+    appels_controle: list[int] = []
+
+    async def controle_toujours_indisponible(*_args, **_kwargs):
+        appels_controle.append(1)
+        raise montage.ErreurGeminiIndisponible(
+            "Gemini indisponible après 7 tentatives — saturation 503 persistante."
+        )
+
+    monkeypatch.setattr(montage, "controler_qualite_plan", controle_toujours_indisponible)
+
+    async def sommeil_simule(_secondes):
+        return None
+
+    monkeypatch.setattr(montage.asyncio, "sleep", sommeil_simule)
+
+    with pytest.raises(montage.ErreurGeminiIndisponible) as excinfo:
+        asyncio.run(montage.controler_qualite_plan_avec_seconde_passe(
+            [], [], {}, {}, montage.STYLE_DEFAUT, {}, _config(tmp_path), _reporter(), None,
+        ))
+    assert "saturation 503" in str(excinfo.value)
+    assert getattr(excinfo.value, "indisponible", False) is True
+    assert len(appels_controle) == 2
+
+
+def test_rejet_qualite_ne_declenche_pas_de_seconde_passe(tmp_path, monkeypatch):
+    """Un rejet détaillé du contrôle n'est PAS une indisponibilité : pas de pause,
+    pas de seconde passe, l'échec remonte tel quel."""
+    appels_controle: list[int] = []
+
+    async def controle_rejette(*_args, **_kwargs):
+        appels_controle.append(1)
+        raise montage.ErreurMontage("Contrôle qualité final non satisfait après 3 tours.")
+
+    monkeypatch.setattr(montage, "controler_qualite_plan", controle_rejette)
+
+    async def sommeil_interdit(_secondes):
+        raise AssertionError("aucune pause hors indisponibilité Gemini")
+
+    monkeypatch.setattr(montage.asyncio, "sleep", sommeil_interdit)
+
+    with pytest.raises(montage.ErreurMontage) as excinfo:
+        asyncio.run(montage.controler_qualite_plan_avec_seconde_passe(
+            [], [], {}, {}, montage.STYLE_DEFAUT, {}, _config(tmp_path), _reporter(), None,
+        ))
+    assert "non satisfait" in str(excinfo.value)
+    assert not isinstance(excinfo.value, montage.ErreurGeminiIndisponible)
+    assert len(appels_controle) == 1

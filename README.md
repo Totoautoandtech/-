@@ -128,7 +128,7 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 | `DUREE_MAX_SOURCE_SECONDES` | `180` | limite annoncée et appliquée par source/référence |
 | `JOB_TIMEOUT_SECONDES` | `1800` | limite globale, soit 30 min (bornée à 60..3600) |
 | `FFMPEG_TIMEOUT_SECONDES` | `240` | timeout d'une commande FFmpeg |
-| `GEMINI_TIMEOUT_SECONDES` | `200` | budget total Gemini (borné à 15..300 s), réparti entre les couples clé/modèle |
+| `GEMINI_TIMEOUT_SECONDES` | `200` | budget total d'un appel Gemini, retries compris (borné à 15..300 s) ; la rotation clé/modèle s'y déroule |
 | `TIKWM_TIMEOUT_SECONDES` | `30` | timeout TikWM |
 | `RELAIS_LECTURE_URL` | `https://r.jina.ai/` | relais de lecture public utilisé par la découverte RsT quand l'IP du serveur est bloquée (gratuit, sans clé) |
 | `DOWNLOAD_TIMEOUT_SECONDES` | `120` | timeout par téléchargement |
@@ -163,32 +163,39 @@ Les sessions OAuth et jobs sont en mémoire. La file continue côté serveur san
 ## Résilience Gemini (timeouts et chaîne de modèles/clés de secours)
 
 Gemini renvoie parfois `503 UNAVAILABLE — This model is currently experiencing high demand`,
-`429 RESOURCE_EXHAUSTED` ou tarde à répondre. La chaîne de secours est maintenant réellement
-atteignable, même lorsqu'un premier couple clé/modèle ne répond pas :
+`429 RESOURCE_EXHAUSTED` ou tarde à répondre. Un 503 « high demand » ou un 429 de quota étant
+**par modèle**, la rotation visite le couple clé/modèle suivant AVANT d'approfondir celui qui
+vient d'échouer :
 
-1. **Chaîne de secours** — `GEMINI_MODELES` liste les modèles essayés dans l'ordre (défaut
-   `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash`). Les modèles sont essayés pour une
-   clé tirée au hasard, puis la chaîne recommence avec les autres clés de `GEMINI_API_KEYS`.
-2. **Budget réparti par couple** — `GEMINI_TIMEOUT_SECONDES` vaut `200` par défaut (borné à
-   15..300 s). Si plusieurs couples clé/modèle existent, 65 % du budget sont alloués au premier
-   et 35 % sont réservés aux replis ; à 200 s, le premier couple garde ainsi 130 s (contre 120 s
-   auparavant) et 70 s restent disponibles pour la chaîne de secours. Chaque couple dispose d'au
-   moins 20 s lorsque le temps total restant le permet. Chaque requête porte son propre timeout,
-   et l'attente du sémaphore ne consomme pas ce budget. Une requête bloquée ne peut donc plus
-   empêcher tous les replis.
-3. **Retry-After et retries** — pour les erreurs temporaires (`429`, `500`, `502`, `503`, `504` et
-   erreurs de transport), jusqu'à **5 tentatives par couple**. Le délai `Retry-After` envoyé par
-   Google prime sur le backoff exponentiel (2, 4, 8, 16 s) et est plafonné à 60 s. Si cette pause
-   ne tient pas dans le budget du couple, le service passe au couple suivant quand le budget global
-   le permet. Les clés ne figurent jamais en clair dans les logs : seule une empreinte SHA-256 courte
-   est affichée.
+1. **Chaîne de secours en round-robin** — `GEMINI_MODELES` liste les modèles essayés dans l'ordre
+   (défaut `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash`). Les couples clé/modèle sont
+   visités en rotation : la tentative k vise le couple (k % nombre de couples), donc chaque couple
+   reçoit une première tentative avant qu'aucun n'en reçoive une deuxième — jamais cinq échecs
+   d'affilée sur un modèle saturé pendant que les autres attendent.
+2. **Budget unique par appel** — `GEMINI_TIMEOUT_SECONDES` vaut `200` par défaut (borné à
+   15..300 s) : c'est le budget total de l'appel, retries compris, et la seule échéance
+   pilotante (comptabilisée dans la limite globale du travail, sans double échéance). Une
+   requête isolée ne consomme jamais plus de 65 % de ce budget ni moins de 20 s de timeout, et
+   l'attente du sémaphore ne le consomme pas : une requête bloquée ne peut plus empêcher la
+   rotation d'atteindre les autres couples.
+3. **Retry-After honoré, backoff avec jitter** — pour les erreurs temporaires (`429`, `500`,
+   `502`, `503`, `504` et erreurs de transport), jusqu'à **5 tentatives par couple**. Le délai
+   `Retry-After` envoyé par Google prime sur le backoff exponentiel (1, 2, 4, 8 s, jitter ±50 %) :
+   il est honoré **jusqu'à sa date réelle** (plafonné à 60 s, borné par le budget restant de
+   l'appel) — pendant ce refroidissement, la rotation visite les couples déjà réveillés, et si
+   aucun n'est prêt la pause est réellement attendue au lieu d'être abandonnée pour marteler la
+   même fenêtre de quota. Les clés ne figurent jamais en clair dans les logs : seule une empreinte
+   SHA-256 courte est affichée.
 4. **Refus de contenu** — un blocage de sécurité ou une réponse Gemini vide est définitif : aucun
    autre modèle ni aucune autre clé ne peut modifier ce résultat, et l'application l'indique sans
    parler d'épuisement des clés.
-5. **Messages distincts** — une saturation générale conserve le message exact « Gemini est
-   momentanément saturé (503). Réessaie dans quelques minutes. » ; un budget dépassé avant tout
-   repli indique explicitement que le repli n'a pas eu lieu ; les autres erreurs détaillent les
-   quatre derniers échecs sans révéler de clé.
+5. **Messages honnêtes** — après épuisement, le message public nomme les modèles réellement
+   essayés avec leurs comptes (`gemini-2.5-flash ×2, gemini-2.5-flash-lite ×1`), les modèles
+   **non essayés** quand le budget a coupé la rotation (« gemini-2.0-flash non essayé avant la
+   fin du budget de … s »), et la cause observée (« saturation 503 persistante » vs
+   « quota 429 … RESOURCE_EXHAUSTED ») — jamais « tous les modèles et toutes les clés » à tort.
+   Un budget dépassé avant tout repli indique explicitement que le repli n'a pas eu lieu ; les
+   autres erreurs détaillent les derniers échecs sans révéler de clé.
 
 `GET /api/config` expose la chaîne réellement active dans `gemini_modeles`.
 
