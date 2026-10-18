@@ -680,6 +680,7 @@ class _FausseSessionGemini:
 
     appels: list[str] = []
     details_appels: list[dict] = []
+    instants_appels: list[float | None] = []
     timeouts_requete: list[float | None] = []
     timeouts_effectifs: list[float | None] = []
     timeouts_session: list = []
@@ -703,6 +704,8 @@ class _FausseSessionGemini:
         cle = (headers or {}).get("x-goog-api-key", "")
         type(self).appels.append(modele)
         type(self).details_appels.append({"modele": modele, "cle": cle})
+        horloge = type(self).horloge
+        type(self).instants_appels.append(horloge.monotonic() if horloge is not None else None)
         type(self).timeouts_requete.append(getattr(timeout, "total", None))
         timeout_effectif = timeout if timeout is not None else self._timeout_session
         type(self).timeouts_effectifs.append(getattr(timeout_effectif, "total", None))
@@ -744,6 +747,7 @@ def gemini_simule(monkeypatch):
     """Isole les appels Gemini : pas de réseau, pas d'attente réelle."""
     _FausseSessionGemini.appels = []
     _FausseSessionGemini.details_appels = []
+    _FausseSessionGemini.instants_appels = []
     _FausseSessionGemini.timeouts_requete = []
     _FausseSessionGemini.timeouts_effectifs = []
     _FausseSessionGemini.timeouts_session = []
@@ -766,17 +770,17 @@ def test_gemini_repli_est_atteignable_apres_timeouts_et_respecte_le_budget(gemin
     monkeypatch.setattr(app.random, "sample", lambda valeurs, _nombre: list(valeurs))
     gemini_simule.horloge = horloge
 
-    # Le scénario de retries reste rapide : cinq timeouts simulés, puis réponse du modèle suivant.
+    # Round-robin : un timeout simulé sur le premier modèle et la tentative suivante
+    # vise déjà le modèle de secours — on ne martèle plus le couple en échec.
     gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash")] = [
-        _TIMEOUT_GEMINI_IMMEDIAT for _ in range(5)
+        _TIMEOUT_GEMINI_IMMEDIAT,
     ]
     gemini_simule.reponses_par_modele = {
         "gemini-2.5-flash-lite": (200, REPONSE_GEMINI_OK),
     }
     texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
     assert texte == "réponse modèle de secours"
-    assert gemini_simule.appels[:5] == ["gemini-2.5-flash"] * 5
-    assert gemini_simule.appels[5] == "gemini-2.5-flash-lite"
+    assert gemini_simule.appels == ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
     # Rejoue la régression avec une fausse session qui utilise le timeout de session si
     # timeout=... n'est pas fourni (ancien code), et celui de requête sinon (nouveau code).
@@ -872,8 +876,10 @@ def test_chaine_de_modeles_par_defaut_et_variable_denvironnement(monkeypatch):
     assert "| `GEMINI_TIMEOUT_SECONDES` | `200` |" in readme
 
 
-def test_gemini_503_bascule_sur_le_modele_suivant(gemini_simule):
-    """Le premier modèle est saturé (503) : le suivant prend le relais automatiquement."""
+def test_gemini_503_rotation_une_seule_tentative_par_modele(gemini_simule):
+    """Round-robin : le premier modèle est saturé (503 permanent), la tentative
+    suivante vise immédiatement le modèle suivant — UNE SEULE tentative sur chaque
+    modèle avant le succès (on n'attend plus cinq échecs du couple saturé)."""
     gemini_simule.reponses_par_modele = {
         "gemini-2.5-flash": (503, REPONSE_GEMINI_503),
         "gemini-2.5-flash-lite": (200, REPONSE_GEMINI_OK),
@@ -882,9 +888,9 @@ def test_gemini_503_bascule_sur_le_modele_suivant(gemini_simule):
     texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
 
     assert texte == "réponse modèle de secours"
-    # 5 tentatives sur le modèle saturé, puis succès immédiat sur le modèle de secours.
-    assert gemini_simule.appels.count("gemini-2.5-flash") == app.GEMINI_TENTATIVES_PAR_MODELE
-    assert gemini_simule.appels[-1] == "gemini-2.5-flash-lite"
+    assert gemini_simule.appels == ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    assert gemini_simule.appels.count("gemini-2.5-flash") == 1
+    assert gemini_simule.appels.count("gemini-2.5-flash-lite") == 1
 
 
 def test_gemini_429_bascule_aussi_sur_le_modele_suivant(gemini_simule):
@@ -895,12 +901,15 @@ def test_gemini_429_bascule_aussi_sur_le_modele_suivant(gemini_simule):
     }
     texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
     assert texte == "réponse modèle de secours"
-    assert gemini_simule.appels[-1] == "gemini-2.0-flash"
+    # Rotation : une tentative par modèle, dans l'ordre de la chaîne.
+    assert gemini_simule.appels == [
+        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"
+    ]
 
 
 def test_gemini_503_total_donne_un_message_clair_en_francais(gemini_simule):
-    """Tous les modèles et toutes les clés saturés : message explicite qui porte le
-    nombre de tentatives réellement effectuées, sans trace brute ni clé."""
+    """Tous les modèles et toutes les clés saturés : message explicite qui porte les
+    tentatives réellement effectuées par modèle, sans trace brute ni clé."""
     gemini_simule.reponses_par_modele = {
         "gemini-2.5-flash": (503, REPONSE_GEMINI_503),
         "gemini-2.5-flash-lite": (503, REPONSE_GEMINI_503),
@@ -911,12 +920,21 @@ def test_gemini_503_total_donne_un_message_clair_en_francais(gemini_simule):
         asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
 
     tentatives = 3 * app.GEMINI_TENTATIVES_PAR_MODELE
-    assert str(erreur.value) == app.GEMINI_MESSAGE_SATURE.format(tentatives=tentatives)
+    detail = (
+        "gemini-2.5-flash ×5, gemini-2.5-flash-lite ×5, gemini-2.0-flash ×5"
+    )
+    assert str(erreur.value) == app.GEMINI_MESSAGE_SATURE.format(
+        tentatives=tentatives, detail=detail, cause="saturation 503 persistante"
+    )
     assert str(erreur.value).startswith(f"Gemini indisponible après {tentatives} tentatives")
     assert "Réessaie dans quelques minutes" in str(erreur.value)
     assert "cle-de-test" not in str(erreur.value)
-    # 3 modèles × 5 tentatives : le backoff exponentiel est bien appliqué par modèle.
+    # 3 modèles × 5 tentatives : chaque couple a reçu ses cinq tentatives en rotation.
     assert len(gemini_simule.appels) == tentatives
+    # Rotation vérifiée : le premier tour visite les trois modèles, un par un.
+    assert gemini_simule.appels[:3] == [
+        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"
+    ]
 
 
 def test_gemini_erreur_definitive_ne_declenche_pas_cinq_tentatives(gemini_simule):
@@ -971,8 +989,9 @@ def test_gemini_alloue_un_timeout_positif_a_chaque_couple(gemini_simule, monkeyp
     with pytest.raises(app.ErreurApp):
         asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
 
-    # 200 s × 65 % pour le premier couple ; la réserve donne ici 20 s à chacun des cinq autres.
-    assert gemini_simule.timeouts_requete == pytest.approx([130.0, 20.0, 20.0, 20.0, 20.0, 20.0])
+    # Chaque requête garde au plus 65 % du budget (130 s) : la rotation, qui visite
+    # tout de suite le couple suivant, conserve toujours 35 % pour la suite.
+    assert gemini_simule.timeouts_requete == pytest.approx([130.0] * 6)
     assert all(timeout is not None and timeout > 0 for timeout in gemini_simule.timeouts_requete)
     assert len(gemini_simule.details_appels) == 6
     assert gemini_simule.timeouts_session[-1].total is None
@@ -994,7 +1013,12 @@ def test_gemini_refus_safety_est_definitif_sans_repli(gemini_simule):
     assert "Toutes les clés Gemini ont échoué" not in str(erreur.value)
 
 
-def test_gemini_retry_after_prime_sur_le_backoff(gemini_simule, monkeypatch):
+def test_gemini_retry_after_est_honore_jusqua_sa_date_pendant_la_rotation(
+    gemini_simule, monkeypatch
+):
+    """Un Retry-After Google est honoré jusqu'à sa date RÉELLE, sans jitter ; pendant
+    le refroidissement du couple, la rotation visite les autres modèles au lieu de
+    rester bloquée sur le couple en quota."""
     horloge = _HorlogeGemini()
     monkeypatch.setattr(app, "time", horloge)
     gemini_simule.horloge = horloge
@@ -1006,11 +1030,13 @@ def test_gemini_retry_after_prime_sur_le_backoff(gemini_simule, monkeypatch):
         horloge.avancer(secondes)
 
     monkeypatch.setattr(app.asyncio, "sleep", sommeil_simule)
+    # Le 1er couple épuise son quota (429 + Retry-After: 9) puis réussit ; les deux
+    # autres modèles restent saturés en 503 « high demand » (défaut de la fixture).
     gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash")] = [
         _ScenarioReponseGemini(
             429,
             '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}',
-            headers={"Retry-After": "7"},
+            headers={"Retry-After": "9"},
         ),
         _ScenarioReponseGemini(200, REPONSE_GEMINI_OK),
     ]
@@ -1018,8 +1044,84 @@ def test_gemini_retry_after_prime_sur_le_backoff(gemini_simule, monkeypatch):
     texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
 
     assert texte == "réponse modèle de secours"
-    assert pauses == [7.0]
-    assert gemini_simule.appels == ["gemini-2.5-flash", "gemini-2.5-flash"]
+    # Rotation : les deux autres modèles ont été visités pendant le refroidissement.
+    modeles_vus = [appel["modele"] for appel in gemini_simule.details_appels]
+    assert modeles_vus[:3] == [
+        "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"
+    ]
+    assert gemini_simule.appels[-1] == "gemini-2.5-flash"
+    # Le Retry-After est honoré à la date exacte : la seconde tentative du couple
+    # retombe exactement 9,0 s après la première — aucune déformation par le jitter.
+    instants_flash = [
+        instant
+        for appel, instant in zip(gemini_simule.details_appels, gemini_simule.instants_appels)
+        if appel["modele"] == "gemini-2.5-flash"
+    ]
+    assert instants_flash == pytest.approx([0.0, 9.0])
+    # ... sans pause unique bloquante de 9 s : la rotation a consulté les autres couples.
+    assert pauses and all(0.0 < pause < 9.0 for pause in pauses)
+    assert sum(pauses) == pytest.approx(9.0)
+
+
+def test_gemini_retry_after_40_est_respecte_exactement_puis_succes(gemini_simule, monkeypatch):
+    """429 avec Retry-After: 40 sur un couple unique : la pause vaut ≈ 40 s exactement
+    (aucun jitter sur Retry-After), puis l'appel suivant aboutit."""
+    horloge = _HorlogeGemini()
+    monkeypatch.setattr(app, "time", horloge)
+    gemini_simule.horloge = horloge
+    app.CONFIG.gemini_modeles = ["gemini-2.5-flash"]
+    pauses = []
+
+    async def sommeil_simule(secondes):
+        pauses.append(secondes)
+        horloge.avancer(secondes)
+
+    monkeypatch.setattr(app.asyncio, "sleep", sommeil_simule)
+    gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash")] = [
+        _ScenarioReponseGemini(
+            429,
+            '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}',
+            headers={"Retry-After": "40"},
+        ),
+        _ScenarioReponseGemini(200, REPONSE_GEMINI_OK),
+    ]
+
+    texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+
+    assert texte == "réponse modèle de secours"
+    assert pauses == [40.0]
+    assert gemini_simule.instants_appels == pytest.approx([0.0, 40.0])
+
+
+def test_gemini_backoff_exponentiel_garde_son_jitter(gemini_simule, monkeypatch):
+    """Sans Retry-After, la pause d'un couple suit le backoff (base × 1±jitter) :
+    exponentielle (2 puis 4 s) et réellement déformée par le jitter."""
+    horloge = _HorlogeGemini()
+    monkeypatch.setattr(app, "time", horloge)
+    gemini_simule.horloge = horloge
+    app.CONFIG.gemini_modeles = ["gemini-2.5-flash"]
+    monkeypatch.setattr(app, "GEMINI_BACKOFF", (2, 4, 8, 16))
+    # Jitter injecté de façon déterministe : toujours +50 %.
+    monkeypatch.setattr(app.random, "uniform", lambda _borne_min, borne_max: borne_max)
+    pauses = []
+
+    async def sommeil_simule(secondes):
+        pauses.append(secondes)
+        horloge.avancer(secondes)
+
+    monkeypatch.setattr(app.asyncio, "sleep", sommeil_simule)
+    gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash")] = [
+        _ScenarioReponseGemini(503, REPONSE_GEMINI_503),
+        _ScenarioReponseGemini(503, REPONSE_GEMINI_503),
+        _ScenarioReponseGemini(200, REPONSE_GEMINI_OK),
+    ]
+
+    texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
+
+    assert texte == "réponse modèle de secours"
+    # 2 s × 1,5 puis 4 s × 1,5 : progression exponentielle + jitter ±50 % appliqué.
+    assert pauses == [3.0, 6.0]
+    assert gemini_simule.appels == ["gemini-2.5-flash"] * 3
 
 
 def test_empreinte_cle_gemini_est_stable_et_ne_revele_pas_la_cle():
@@ -1043,7 +1145,9 @@ def test_gemini_messages_distinguent_saturation_epuisement_et_delai(gemini_simul
     with pytest.raises(app.ErreurGeminiIndisponible) as erreur_sature:
         asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
     assert str(erreur_sature.value) == app.GEMINI_MESSAGE_SATURE.format(
-        tentatives=len(app.CONFIG.gemini_modeles) * app.GEMINI_TENTATIVES_PAR_MODELE
+        tentatives=len(app.CONFIG.gemini_modeles) * app.GEMINI_TENTATIVES_PAR_MODELE,
+        detail="gemini-2.5-flash ×5, gemini-2.5-flash-lite ×5, gemini-2.0-flash ×5",
+        cause="saturation 503 persistante",
     )
 
     # Erreurs définitives HTTP ordinaires : c'est un épuisement, pas une saturation ni un délai.
@@ -1102,9 +1206,9 @@ def _script_gemini_json(hook: str = "Hook test 503") -> str:
 
 
 def test_gemini_503_puis_200_le_travail_rst_finit_complete(client, monkeypatch, gemini_simule):
-    """Scénario métier : Gemini renvoie d'abord 503 (surcharge), le retry retente avec
-    backoff et obtient 200 — le travail RsT doit finir « completed », jamais échouer
-    sur le premier 503."""
+    """Scénario métier : Gemini renvoie 503 « high demand » sur le premier modèle, la
+    rotation obtient 200 sur le modèle suivant — le travail RsT doit finir
+    « completed », jamais échouer sur le 503 du premier modèle."""
 
     async def donnees_tikwm(_session, chemin, params):
         if chemin == "/":
@@ -1146,19 +1250,19 @@ def test_gemini_503_puis_200_le_travail_rst_finit_complete(client, monkeypatch, 
 
     monkeypatch.setattr(app, "livrer_script_et_voix", livraison_fake)
 
-    # File d'attente sur le premier modèle : 503, puis 200 avec le script demandé.
-    # Les appels suivants (extraction des noms) lisent `reponses_par_modele`.
-    gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash")] = [
-        (503, REPONSE_GEMINI_503),
-        (200, _reponse_gemini_texte(_script_gemini_json())),
-    ]
+    # gemini-2.5-flash est saturé en permanence (503 « high demand ») ; grâce à la
+    # rotation, le modèle suivant sert d'abord le script, puis l'extraction des noms.
     gemini_simule.reponses_par_modele = {
-        "gemini-2.5-flash": (
+        "gemini-2.5-flash": (503, REPONSE_GEMINI_503),
+        "gemini-2.5-flash-lite": (
             200, _reponse_gemini_texte(json.dumps(
                 {"noms": ["gâteau", "chocolat", "recette"]}, ensure_ascii=False
             )),
         ),
     }
+    gemini_simule.reponses_en_file[("cle-de-test", "gemini-2.5-flash-lite")] = [
+        (200, _reponse_gemini_texte(_script_gemini_json())),
+    ]
 
     response = client.post("/api/jobs/rst", json={
         "lien": "https://www.tiktok.com/@chef/video/301",
@@ -1166,8 +1270,9 @@ def test_gemini_503_puis_200_le_travail_rst_finit_complete(client, monkeypatch, 
     assert response.status_code == 202, response.text
     job = _attendre_job(client, response.json()["job_id"])
     assert job["status"] == "completed", job.get("error")
-    # Le 503 initial a bien été retenté (même modèle) avant le 200 qui a abouti.
-    assert gemini_simule.appels[:2] == ["gemini-2.5-flash", "gemini-2.5-flash"]
+    # Round-robin : UNE SEULE tentative sur le modèle saturé, puis succès immédiat sur
+    # le modèle suivant — le travail ne reste plus bloqué cinq tentatives sur 2.5-flash.
+    assert gemini_simule.appels[:2] == ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
     assert job["script"]["hook"] == "Hook test 503"
     assert job["fournisseur_texte"] == "Gemini"
 
@@ -1176,8 +1281,8 @@ def test_rst_gemini_503_systematique_echoue_apres_retries_avec_message_explicite
     client, monkeypatch, gemini_simule
 ):
     """Scénario métier : Gemini renvoie 503 sans interruption. Chaque couple
-    clé/modèle reçoit ses5 tentatives (backoff + jitter), puis le travail échoue
-    avec « Gemini indisponible après N tentatives » — jamais un échec silencieux."""
+    clé/modèle reçoit ses 5 tentatives en rotation (backoff + jitter), puis le travail
+    échoue avec « Gemini indisponible après N tentatives » — jamais un échec silencieux."""
 
     async def donnees_tikwm(_session, chemin, params):
         if chemin == "/":
@@ -1213,9 +1318,13 @@ def test_rst_gemini_503_systematique_echoue_apres_retries_avec_message_explicite
     tentatives = len(app.CONFIG.gemini_modeles) * app.GEMINI_TENTATIVES_PAR_MODELE
     assert job["status"] == "failed"
     assert f"Gemini indisponible après {tentatives} tentatives" in job["error"]
-    assert "saturation 503/429" in job["error"]
+    assert "saturation 503" in job["error"]
+    # Le message honnête nomme chaque modèle réellement essayé (×5 en rotation).
+    assert "gemini-2.5-flash ×5" in job["error"]
+    assert "gemini-2.5-flash-lite ×5" in job["error"]
+    assert "gemini-2.0-flash ×5" in job["error"]
     assert "Réessaie dans quelques minutes" in job["error"]
-    # Les retries ont réellement eu lieu :5 tentatives par modèle de la chaîne.
+    # Les retries ont réellement eu lieu : 5 tentatives par modèle de la chaîne.
     assert gemini_simule.appels.count("gemini-2.5-flash") == app.GEMINI_TENTATIVES_PAR_MODELE
     assert len(gemini_simule.appels) == tentatives
 
@@ -1223,8 +1332,9 @@ def test_rst_gemini_503_systematique_echoue_apres_retries_avec_message_explicite
 def test_gemini_429_retry_after_est_respecte_et_le_backoff_prend_un_jitter(
     gemini_simule, monkeypatch
 ):
-    """Un Retry-After Google est respecté tel quel (sans jitter) ; les pauses de
-    backoff exponentiel, elles, sont réellement déformées par le jitter."""
+    """Un Retry-After Google est honoré tel quel (sans jitter) ; l'échec suivant du
+    même couple retombe sur le backoff exponentiel, lui réellement déformé par le
+    jitter — la rotation visite les autres modèles pendant les deux refroidissements."""
     horloge = _HorlogeGemini()
     monkeypatch.setattr(app, "time", horloge)
     gemini_simule.horloge = horloge
@@ -1249,12 +1359,23 @@ def test_gemini_429_retry_after_est_respecte_et_le_backoff_prend_un_jitter(
     texte = asyncio.run(app._appel_gemini_brut([{"text": "bonjour"}], temperature=0.5))
 
     assert texte == "réponse modèle de secours"
-    assert gemini_simule.appels == ["gemini-2.5-flash"] * 3
-    # Le délai demandé par Google prime et n'est jamais déformé par le jitter.
-    assert pauses[0] == 9.0
-    # La tentative suivante retombe sur le backoff exponentiel, avec jitter.
+    instants_flash = [
+        instant
+        for appel, instant in zip(gemini_simule.details_appels, gemini_simule.instants_appels)
+        if appel["modele"] == "gemini-2.5-flash"
+    ]
+    assert len(instants_flash) == 3
+    # Le délai demandé par Google prime et n'est jamais déformé : 9,0 s exactement.
+    assert instants_flash[:2] == pytest.approx([0.0, 9.0])
+    # Le 503 suivant retombe sur le backoff de 2e tentative (4 s × 1±0,5 de jitter).
     base = app.GEMINI_BACKOFF[1]
-    assert base * (1 - app.GEMINI_JITTER_MAX) <= pauses[1] <= base * (1 + app.GEMINI_JITTER_MAX)
+    attente_backoff = instants_flash[2] - instants_flash[1]
+    assert base * (1 - app.GEMINI_JITTER_MAX) <= attente_backoff <= base * (1 + app.GEMINI_JITTER_MAX)
+    # Rotation : les autres modèles ont été consultés pendant les refroidissements.
+    modeles_vus = {appel["modele"] for appel in gemini_simule.details_appels}
+    assert modeles_vus == {"gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"}
+    assert gemini_simule.appels[0] == "gemini-2.5-flash"
+    assert gemini_simule.appels[-1] == "gemini-2.5-flash"
 
 
 def test_gemini_budget_parametre_est_la_seule_echeance_des_retries(gemini_simule, monkeypatch):
@@ -1275,6 +1396,38 @@ def test_gemini_budget_parametre_est_la_seule_echeance_des_retries(gemini_simule
     assert str(erreur.value).startswith("Délai Gemini dépassé (30s)")
     assert horloge.monotonic() <= 30.0
     assert gemini_simule.appels == ["gemini-2.5-flash"]
+
+
+def test_gemini_rotation_coupee_par_le_budget_donne_un_message_honnete(
+    gemini_simule, monkeypatch
+):
+    """Quand le budget coupe la rotation, le message cite les modèles réellement
+    essayés avec leurs comptes, les modèles NON essayés, la cause observée et le
+    budget de l'appel — jamais « tous les modèles et toutes les clés » à tort."""
+    horloge = _HorlogeGemini()
+    monkeypatch.setattr(app, "time", horloge)
+    monkeypatch.setattr(app.random, "sample", lambda valeurs, _nombre: list(valeurs))
+    gemini_simule.horloge = horloge
+    # Deux modèles saturés très lents (12 s par réponse 503) : le budget de 24 s se
+    # termine exactement après le 2e échec, avant la première visite du 3e modèle.
+    gemini_simule.reponses_par_modele = {
+        "gemini-2.5-flash": _ScenarioReponseGemini(503, REPONSE_GEMINI_503, delai=12.0),
+        "gemini-2.5-flash-lite": _ScenarioReponseGemini(503, REPONSE_GEMINI_503, delai=12.0),
+    }
+
+    with pytest.raises(app.ErreurGeminiIndisponible) as erreur:
+        asyncio.run(app._appel_gemini_brut(
+            [{"text": "bonjour"}], temperature=0.5, budget=24.0
+        ))
+
+    assert gemini_simule.appels == ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    assert horloge.monotonic() == pytest.approx(24.0)
+    assert str(erreur.value) == (
+        "Gemini indisponible après 2 tentatives (gemini-2.5-flash ×1, "
+        "gemini-2.5-flash-lite ×1 ; gemini-2.0-flash non essayé avant la fin du "
+        "budget de 24 s) — saturation 503 persistante. Réessaie dans quelques minutes."
+    )
+    assert "cle-de-test" not in str(erreur.value)
 
 
 def test_controle_qualite_gemini_indisponible_echoue_le_travail_pas_un_rejet(

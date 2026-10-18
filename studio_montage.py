@@ -315,18 +315,29 @@ SEUIL_ESTIMATION_RISQUE = 1140  # au-delà, le lancement exige une confirmation
 
 # CONTRÔLE QUALITÉ FINAL : chaque plan retenu est relu UNE SECONDE FOIS par Gemini sur
 # un extrait de sa fenêtre exacte. Ce contrôle est obligatoire — un plan non confirmé
-# n'est jamais monté. ~18 s d'appel par plan, extrait FFmpeg compris.
+# n'est jamais monté. ~18 s d'appel par plan, extrait FFmpeg compris : c'est le coût
+# NOMINAL utilisé par l'estimation (SECONDES_CONTROLE_QUALITE_PLAN), pas le plafond.
 SECONDES_CONTROLE_QUALITE_PLAN = 18.0
 # Durée typique d'un plan de corps : c'est le « plancher plein » appliqué par
 # selectionner_plan, pas le plafond absolu. Elle sert à compter les plans à vérifier.
 DUREE_PLAN_QUALITE = 4.5
 # Tours de sélection et de relecture maximum avant l'échec final, détaillé.
 TOURS_MAX_CONTROLE_QUALITE = 3
-# Borne haute d'un appel de relecture : le coût typique est ~18 s, ce plafond évite
-# qu'un appel bloqué par la saturation Gemini consomme toute la fenêtre du job. Ce
-# budget passe tel quel à l'appel Gemini (retries inclus) : c'est la seule échéance
-# pilotante, comptabilisée dans la limite globale du travail.
-DELAI_CONTROLE_QUALITE_PLAN = 75.0
+# Borne haute d'un appel de relecture : le coût typique reste ~18 s, mais la salve des
+# contrôles qualité arrive juste après les analyses vidéo (gros consommateurs de
+# tokens) et peut traverser une fenêtre de saturation Gemini. Le budget couvre donc une
+# rotation complète sur les couples clé/modèle avec un Retry-After de 60 s réellement
+# honoré, sans qu'un appel bloqué consomme toute la fenêtre du job. Ce budget passe tel
+# quel à l'appel Gemini (retries inclus) : c'est la seule échéance pilotante,
+# comptabilisée dans la limite globale du travail de 30 min — jamais une double
+# échéance. rapporteur.timeout le borne encore par le temps réellement restant du job.
+DELAI_CONTROLE_QUALITE_PLAN = 150.0
+# Pause d'éclipsage avant la SECONDE PASSE du contrôle qualité final quand la première
+# a échoué par indisponibilité Gemini (503/429 après retries) : une fenêtre de quota
+# minute ou une surcharge a ainsi le temps de se résorber. La seconde passe n'a lieu
+# que sur indisponibilité, jamais sur un verdict de rejet ; pause et seconde passe
+# restent comptabilisées dans la limite globale du travail.
+DELAI_SECONDE_PASSE_QUALITE = 30.0
 # Marge hors budget (attente du sémaphore, marge réseau) ajoutée à la borne de
 # sécurité `asyncio.wait_for` qui entoure chaque appel Gemini : elle ne doit jamais
 # couper un retry en cours, sinon la double échéance défaite silencieusement l'appel.
@@ -356,8 +367,9 @@ def estimer_duree_traitement(
     total_analyse = total + min(duree_reference, config.duree_max_source)
     # Aperçus 6 fps + uploads/latence Gemini + téléchargements + export vertical ~30 s.
     # Sur Render Free, une analyse Gemini complète peut prendre ~60 s quand l'API
-    # sature (réessais 2/4/8/16 s). On réserve donc 30 s d'analyse + 8 s de
-    # transfert/latence par source au lieu de sous-estimer à 10 s par analyse.
+    # sature (rotation clé/modèle : backoff 1/2/4/8 s, Retry-After honoré jusqu'à 60 s).
+    # On réserve donc 30 s d'analyse + 8 s de transfert/latence par source au lieu de
+    # sous-estimer à 10 s par analyse.
     # Le contrôle qualité final s'ajoute : il relit chaque plan retenu une seconde fois.
     controle_qualite = estimer_plans_qualite(config) * SECONDES_CONTROLE_QUALITE_PLAN
     secondes = (
@@ -1345,6 +1357,51 @@ async def controler_qualite_plan(
     )
 
 
+async def controler_qualite_plan_avec_seconde_passe(
+    plan: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    analyses: dict[str, list[dict[str, Any]]],
+    metadonnees: dict[str, dict[str, Any]],
+    style: StyleReference,
+    sources: dict[str, Path],
+    config: ConfigurationMontage,
+    rapporteur: Rapporteur,
+    appel_gemini: AppelGemini,
+    intensite_transitions: int = 2,
+    tours_max: int = TOURS_MAX_CONTROLE_QUALITE,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Relance UNE FOIS le contrôle qualité final s'il a échoué par indisponibilité.
+
+    Une ErreurGeminiIndisponible (503/429 après les retries) signale une fenêtre de
+    quota ou une surcharge — pas un verdict : après DELAI_SECONDE_PASSE_QUALITE
+    secondes d'éclipsage, la relecture complète est retentée une seule fois. La pause
+    et la seconde passe restent comptabilisées dans la limite globale du travail (le
+    délai global de 30 min continue de courir ; checkpoint et budgets bornent tout).
+    Toute autre issue — succès, rejets détaillés, annulation, limite globale — remonte
+    telle quelle, sans seconde passe.
+    """
+    try:
+        return await controler_qualite_plan(
+            plan, segments, analyses, metadonnees, style, sources, config,
+            rapporteur, appel_gemini, intensite_transitions, tours_max=tours_max,
+        )
+    except ErreurGeminiIndisponible:
+        pause = float(rapporteur.timeout(DELAI_SECONDE_PASSE_QUALITE))
+        rapporteur.update(
+            "validating", 80,
+            f"Gemini saturé pendant la relecture : seconde passe de contrôle qualité "
+            f"dans {pause:.0f} s",
+        )
+        if pause > 0.0:
+            await asyncio.sleep(pause)
+        # Une seconde indisponibilité remonte telle quelle : échec clair, jamais de
+        # plan non validé monté ni de « 0 plan valide » silencieux.
+        return await controler_qualite_plan(
+            plan, segments, analyses, metadonnees, style, sources, config,
+            rapporteur, appel_gemini, intensite_transitions, tours_max=tours_max,
+        )
+
+
 # --------------------------------------------------------------------------------------
 # ASS/libass et export final unique
 # --------------------------------------------------------------------------------------
@@ -1849,8 +1906,9 @@ async def construire_montage_professionnel(
             ) from exc
         # CONTRÔLE QUALITÉ FINAL : chaque plan retenu est relu UNE DEUXIÈME FOIS par
         # Gemini sur un extrait de sa fenêtre exacte. Un plan non confirmé est écarté
-        # avec sa scène et la sélection est relancée — jamais monté.
-        plan, plan_verification = await controler_qualite_plan(
+        # avec sa scène et la sélection est relancée — jamais monté. Une indisponibilité
+        # Gemini déclenche une seconde passe après une courte pause d'éclipsage.
+        plan, plan_verification = await controler_qualite_plan_avec_seconde_passe(
             plan, segments, analyses, metadonnees, style_reference, sources, config,
             rapporteur, appel_gemini, intensite_transitions,
         )
