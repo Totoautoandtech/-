@@ -92,11 +92,26 @@ class Rapporteur:
         self._est_annule = est_annule
         self._temps_restant = temps_restant
         self.etape = "initialisation"
+        self._statut = "running"
+        self._progression = 0
 
     def update(self, statut: str, progression: int, detail: str, **extras: Any) -> None:
         self.etape = detail
-        self._mise_a_jour(statut=statut, progress=max(0, min(100, int(progression))), detail=detail, **extras)
+        self._statut = statut
+        self._progression = max(0, min(100, int(progression)))
+        self._mise_a_jour(statut=statut, progress=self._progression, detail=detail, **extras)
         self.checkpoint()
+
+    def message(self, detail: str) -> None:
+        """Émet une information transitoire sans changer l'étape ni la progression.
+
+        Utilisé pour les bascules clé/modèle Gemini : le message reste visible dans
+        la progression jusqu'au prochain rapport d'étape, sans écraser le pourcentage.
+        """
+        self.etape = detail
+        self._mise_a_jour(
+            statut=self._statut, progress=self._progression, detail=detail
+        )
 
     def checkpoint(self) -> None:
         if self._est_annule():
@@ -344,6 +359,10 @@ DELAI_SECONDE_PASSE_QUALITE = 30.0
 MARGE_APPEL_GEMINI = 60.0
 # Un extrait de vérification couvre quelques secondes : la limite mémoire est basse.
 TAILLE_MAX_EXTRAIT_VERIFICATION = 4 * 1024 * 1024
+# Nombre maximum de plans vérifiés dans un même appel Gemini. Regrouper les plans
+# réduit le nombre d'appels (un par plan → un par lot), ce qui préserve le quota
+# Gemini : un montage consomme ainsi une salve d'appels au lieu d'une salve par plan.
+TAILLE_LOT_VERIFICATION = 4
 
 
 def estimer_plans_qualite(config: ConfigurationMontage) -> int:
@@ -467,6 +486,32 @@ RÈGLE DU DOUTE ABSOLUE : au moindre doute, le drapeau passe à true. Le doute e
 - hors_sujet : le plan ne montre pas exactement le sujet annoncé par le texte du script.
   La beauté, le cadrage et l'esthétique ne remplacent jamais la correspondance.
 N'invente rien, n'ajoute aucune clé et ne commente pas en dehors du JSON."""
+
+
+PROMPT_VERIFICATION_GROUPE = """Tu es le contrôleur qualité FINAL d'un montage TikTok.
+Tu reçois plusieurs extraits EXACTS des fenêtres qui vont réellement être montées
+dans la vidéo. Chaque extrait correspond à un plan (index) de la liste ci-dessous.
+Texte du script que chaque plan doit illustrer :
+{plans}
+Retourne UNIQUEMENT un tableau JSON strict, un objet par plan, dans l'ordre des indices :
+[{{"conforme":false,"personnes_visibles":false,"watermark":false,"logo_ajoute":false,
+"autre_element_superpose":false,"texte_non_sous_titre":false,"flou_ou_illisible":false,
+"hors_sujet":false,"raisons":[]}}]
+Un plan n'est conforme QUE SI les sept drapeaux valent false. Écris les raisons en français,
+courtes et concrètes.
+RÈGLE DU DOUTE ABSOLUE : au moindre doute, le drapeau passe à true. Le doute exclut le plan.
+- personnes_visibles : une personne, même partiellement cadrée, une main, un visage, un
+  reflet ou une silhouette suffisent.
+- watermark : filigrane, bandeau, «@…» ou pseudo d'auteur incrusté par la plateforme.
+- logo_ajoute : logo ajouté ou incrusté à l'image. L'emblème physique normal du produit
+  ou du véhicule filmé n'en est pas un.
+- autre_element_superpose : sticker, emoji, bouton, badge, chrono, bordure ou décoration.
+- texte_non_sous_titre : tout texte qui n'est PAS la transcription des paroles dites dans
+  l'extrait. Les vrais sous-titres TikTok qui recopient les paroles sont AUTORISÉS ; un
+  titre, une légende, une phrase écrite ou une typographie décorative ne le sont pas.
+- flou_ou_illisible : image floue, trop sombre, pixellisée ou sans sujet identifiable.
+- hors_sujet : le plan ne montre pas exactement le sujet annoncé par le texte du script.
+N'invente rien, n'ajoute aucune clé et ne commente pas en dehors du tableau JSON."""
 
 
 class ReponseVerification(BaseModel):
@@ -1261,6 +1306,174 @@ async def verifier_conformite_extrait(
     return verdict
 
 
+async def verifier_conformite_extraits(
+    plan: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    analyses: dict[str, list[dict[str, Any]]],
+    metadonnees: dict[str, dict[str, Any]],
+    sources: dict[str, Path],
+    config: ConfigurationMontage,
+    rapporteur: Rapporteur,
+    appel_gemini: AppelGemini,
+    tour: int = 1,
+) -> list[dict[str, Any]]:
+    """Vérifie TOUS les plans en un seul appel Gemini (ou le moins d'appels possible).
+
+    Un plan non validé n'est jamais monté : fail-closed. L'indisponibilité Gemini
+    remonte comme ErreurGeminiIndisponible (jamais confondue avec un rejet qualité).
+    Les extraits sont groupés en lots de `TAILLE_LOT_VERIFICATION` plans maximum,
+    ce qui réduit fortement le nombre d'appels Gemini par rapport à un appel par plan.
+    """
+    if not plan:
+        return []
+    # 1. Extraire + encoder chaque clip ; un clip impossible écarte le plan seul.
+    extraits: list[tuple[Path, str, dict[str, Any], dict[str, Any]]] = []
+    verdicts: list[dict[str, Any]] = []
+    for clip in plan:
+        source = str(clip.get("source", ""))
+        url = str(metadonnees.get(source, {}).get("url") or "").strip()
+        debut = max(0.0, float(clip.get("debut", 0.0)))
+        duree = max(DUREE_MIN_PLAN, float(clip.get("duree", 0.0)))
+        verdict: dict[str, Any] = {
+            "index": int(clip.get("id", 0)),
+            "source": source,
+            "url": url,
+            "debut": round(debut, 3),
+            "fin": round(debut + duree, 3),
+            "duree": round(duree, 3),
+            "hook": bool(clip.get("hook")),
+            "tour": int(tour),
+            "conforme": False,
+            "raisons": [],
+        }
+        if not url:
+            verdict["raisons"] = ["URL source inconnue : provenance du plan impossible"]
+            verdicts.append(verdict)
+            continue
+        chemin = sources.get(source)
+        if chemin is None or not chemin.is_file():
+            verdict["raisons"] = ["source téléchargée introuvable : contrôle qualité impossible"]
+            verdicts.append(verdict)
+            continue
+        extrait = chemin.with_name(f"{chemin.stem}_verif_{int(round(debut * 1000))}.mp4")
+        try:
+            try:
+                await creer_extrait_verification(chemin, extrait, debut, duree, config, rapporteur)
+            except (TravailAnnule, asyncio.CancelledError):
+                raise
+            except ErreurMontage as exc:
+                if "Limite globale dépassée" in str(exc):
+                    raise
+                verdict["raisons"] = [f"extrait de vérification impossible : {exc}"]
+                verdicts.append(verdict)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                verdict["raisons"] = [
+                    f"extrait de vérification impossible : {exc or type(exc).__name__}"
+                ]
+                verdicts.append(verdict)
+                continue
+            contenu = await asyncio.to_thread(extrait.read_bytes)
+            video_b64 = base64.b64encode(contenu).decode("ascii")
+            del contenu
+            extraits.append((extrait, video_b64, verdict, clip))
+            verdicts.append(verdict)
+        except (TravailAnnule, asyncio.CancelledError):
+            raise
+
+    # 2. Grouper les extraits exploitables en lots, puis un appel Gemini par lot.
+    try:
+        lots: list[list[tuple[Path, str, dict[str, Any], dict[str, Any]]]] = []
+        lot_actuel: list[tuple[Path, str, dict[str, Any], dict[str, Any]]] = []
+        for element in extraits:
+            lot_actuel.append(element)
+            if len(lot_actuel) >= TAILLE_LOT_VERIFICATION:
+                lots.append(lot_actuel)
+                lot_actuel = []
+        if lot_actuel:
+            lots.append(lot_actuel)
+        for lot in lots:
+            await _verifier_lot_conformite(lot, config, rapporteur, appel_gemini, tour)
+    finally:
+        for extrait, _b64, _v, _c in extraits:
+            extrait.unlink(missing_ok=True)
+    return verdicts
+
+
+async def _verifier_lot_conformite(
+    lot: list[tuple[Path, str, dict[str, Any], dict[str, Any]]],
+    config: ConfigurationMontage,
+    rapporteur: Rapporteur,
+    appel_gemini: AppelGemini,
+    tour: int,
+) -> None:
+    """Vérifie un lot de plans en un seul appel Gemini et remplit les verdicts."""
+    plans_info = []
+    for position, (_extrait, _b64, verdict, clip) in enumerate(lot):
+        plans_info.append({
+            "index": position,
+            "texte": _texte_attendu_plan(clip),
+            "debut": round(float(verdict.get("debut", 0.0)), 2),
+            "fin": round(float(verdict.get("fin", 0.0)), 2),
+        })
+    prompt = PROMPT_VERIFICATION_GROUPE.format(
+        plans=json.dumps(plans_info, ensure_ascii=False)
+    )
+    parts: list[dict[str, Any]] = [
+        {"inline_data": {"mime_type": "video/mp4", "data": b64}}
+        for _extrait, b64, _v, _c in lot
+    ]
+    parts.append({"text": prompt})
+    budget_appel = float(rapporteur.timeout(
+        min(float(config.delai_gemini), DELAI_CONTROLE_QUALITE_PLAN)
+    ))
+    verdicts = [verdict for _e, _b, verdict, _c in lot]
+    try:
+        brut = await asyncio.wait_for(
+            appel_gemini(parts, temperature=0.0, json_mode=True, budget=budget_appel),
+            timeout=budget_appel + MARGE_APPEL_GEMINI,
+        )
+    except asyncio.TimeoutError as exc:
+        for verdict in verdicts:
+            verdict["raisons"] = ["Gemini indisponible : délai dépassé, plan non validé"]
+        raise ErreurGeminiIndisponible(
+            "Gemini indisponible : délai dépassé pendant le contrôle qualité d'un lot "
+            f"de {len(lot)} plan(s) — plans non validés, aucun plan non conforme monté."
+        ) from exc
+    except (TravailAnnule, asyncio.CancelledError):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if not getattr(exc, "indisponible", False):
+            raise
+        for verdict in verdicts:
+            verdict["raisons"] = [f"Gemini indisponible : {exc}"]
+        raise ErreurGeminiIndisponible(str(exc)) from exc
+
+    # Fail-closed : un tableau illisible ou mal dimensionné écarte tous les plans du lot.
+    try:
+        objet = json.loads(brut.strip().removeprefix("```json").removesuffix("```").strip())
+        if not isinstance(objet, list) or len(objet) != len(verdicts):
+            raise ValueError("tableau de verdicts invalide")
+    except Exception as exc:  # noqa: BLE001
+        for verdict in verdicts:
+            verdict["raisons"] = [
+                f"contrôle qualité final illisible : {exc or type(exc).__name__}"
+            ]
+        return
+    for verdict, element in zip(verdicts, objet):
+        try:
+            analyse = ReponseVerification.model_validate(element).model_dump()
+        except Exception as exc:  # noqa: BLE001
+            verdict["raisons"] = [
+                f"contrôle qualité final illisible : {exc or type(exc).__name__}"
+            ]
+            continue
+        raisons = [motif for cle, motif in MOTIFS_VERIFICATION if analyse.get(cle)]
+        raisons.extend(str(r).strip() for r in analyse.get("raisons") or [] if str(r).strip())
+        verdict["raisons"] = raisons
+        verdict["conforme"] = bool(analyse.get("conforme")) and not raisons
+
+
 def _retirer_scenes_du_plan(
     analyses: dict[str, list[dict[str, Any]]],
     source: str,
@@ -1315,18 +1528,18 @@ async def controler_qualite_plan(
     """
     derniers_rejets: list[dict[str, Any]] = []
     for tour in range(1, max(1, int(tours_max)) + 1):
-        verdicts: list[dict[str, Any]] = []
-        for position, clip in enumerate(plan, 1):
-            rapporteur.checkpoint()
-            source = str(clip.get("source", ""))
-            rapporteur.update(
-                "validating", 76 + int(6 * (position - 1) / max(1, len(plan))),
-                f"Contrôle qualité strict du plan {position}/{len(plan)} (tour {tour})",
-            )
-            verdicts.append(await verifier_conformite_extrait(
-                clip, sources.get(source), str(metadonnees.get(source, {}).get("url") or ""),
-                config, rapporteur, appel_gemini, tour,
-            ))
+        rapporteur.checkpoint()
+        rapporteur.update(
+            "validating", 76 + int(6 * (tour - 1) / max(1, tours_max)),
+            f"Contrôle qualité strict de {len(plan)} plan(s) en un seul appel (tour {tour})",
+        )
+        # Regroupement : un seul appel Gemini pour tous les plans du tour (au lieu d'un
+        # appel par plan). Fail-closed : un plan non validé n'est jamais monté ;
+        # l'indisponibilité Gemini remonte telle quelle (jamais confondue avec un rejet).
+        verdicts = await verifier_conformite_extraits(
+            plan, segments, analyses, metadonnees, sources, config, rapporteur,
+            appel_gemini, tour,
+        )
         rejets = [verdict for verdict in verdicts if not verdict["conforme"]]
         if not rejets:
             return plan, verdicts

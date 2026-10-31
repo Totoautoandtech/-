@@ -545,8 +545,10 @@ def test_export_final_utilise_les_sources_selectionnees_pas_la_reference(tmp_pat
             raise AssertionError(f"Commande FFmpeg inattendue : {etape}")
         return b"", b""
 
-    async def gemini_controle(_parts, **_kwargs):
-        return _verdict_valide()
+    async def gemini_controle(parts, **_kwargs):
+        # Un verdict par plan : le prompt contient autant de vidéos que de plans.
+        nombre = len(parts) - 1
+        return json.dumps([json.loads(_verdict_valide()) for _ in range(max(1, nombre))])
 
     monkeypatch.setattr(montage, "sonder_video", sonder_simule)
     monkeypatch.setattr(montage, "analyser_video", analyser_source)
@@ -683,10 +685,19 @@ def test_le_controle_qualite_final_ecarte_les_plans_refuses_et_revalide(tmp_path
     debut_vus: list[float] = []
 
     async def appel_gemini(parts, **_kwargs):
-        # Le contrôleur reçoit le texte du prompt : il y lit les timestamps exacts.
-        debut = float(re.search(r"début ([0-9.]+) s", parts[1]["text"]).group(1))
-        debut_vus.append(debut)
-        return _verdict_refuse() if debut < 5.0 else _verdict_valide()
+        # Le contrôleur reçoit le texte du prompt (dernier élément) : il y lit les
+        # plans un par un, puis renvoie un verdict pour chacun.
+        texte = parts[-1]["text"]
+        plans_texte = texte.split("Texte du script que chaque plan doit illustrer :")[1].split("\nRetourne")[0].strip()
+        plans = json.loads(plans_texte)
+        verdicts = []
+        for plan in plans:
+            debut = float(plan["debut"])
+            debut_vus.append(debut)
+            verdicts.append(
+                json.loads(_verdict_refuse()) if debut < 5.0 else json.loads(_verdict_valide())
+            )
+        return json.dumps(verdicts)
 
     plan_initial = montage.selectionner_plan(
         segments, analyses, metadata, montage.STYLE_DEFAUT
@@ -764,13 +775,16 @@ def test_echec_du_controle_qualite_est_detaille_avec_url_et_timestamps(tmp_path,
     analyses, metadata, sources = _sources_controle(tmp_path, segments, nombre=2, scenes=2)
     plan_initial = montage.selectionner_plan(segments, analyses, metadata, montage.STYLE_DEFAUT)
 
-    async def gemini_toujours_refuse(_parts, **_kwargs):
-        return json.dumps({
+    async def gemini_toujours_refuse(parts, **_kwargs):
+        # Un verdict de refus par plan : le prompt contient autant de vidéos que de plans.
+        nombre = len(parts) - 1
+        verdict = {
             "conforme": False, "personnes_visibles": False, "watermark": True,
             "logo_ajoute": False, "autre_element_superpose": False,
             "texte_non_sous_titre": False, "flou_ou_illisible": False,
             "hors_sujet": False, "raisons": ["filigrane incrusté"],
-        })
+        }
+        return json.dumps([verdict for _ in range(max(1, nombre))])
 
     # Un seul tour : la sélection est relancée puis le budget de tours est épuisé.
     with pytest.raises(montage.ErreurMontage) as excinfo:
@@ -785,6 +799,91 @@ def test_echec_du_controle_qualite_est_detaille_avec_url_et_timestamps(tmp_path,
     assert "https://www.tiktok.com/@demo/video/" in message
     assert " s → " in message
     assert "filigrane incrusté" in message
+
+
+def test_la_validation_de_plans_est_regroupee_en_lots(tmp_path, monkeypatch):
+    """5 plans validés en 2 appels Gemini (lot de 4 puis lot de 1), pas 5 appels.
+
+    La regroupement est le point de l'économie : un appel par plan multiplie les
+    appels Gemini et consume le quota journalier gratuit. Ici, 5 plans → 2 appels.
+    """
+    _installer_extrait(monkeypatch)
+    segments = montage.creer_segments_script(
+        "Accroche percutante", "Une phrase complète. Une autre phrase."
+    )
+    analyses, metadata, sources = _sources_controle(tmp_path, segments, nombre=5, scenes=3)
+
+    appels: list[int] = []
+
+    async def appel_gemini(parts, **_kwargs):
+        # Un appel par lot : on compte le nombre de vidéos envoyées dans le lot.
+        appels.append(len(parts) - 1)
+        return json.dumps([json.loads(_verdict_valide()) for _ in range(len(parts) - 1)])
+
+    plan = [
+        {"source": f"source_{index}", "debut": float(index * 10), "fin": float(index * 10 + 10),
+         "texte": "texte du plan"}
+        for index in range(5)
+    ]
+
+    verdicts = asyncio.run(montage.verifier_conformite_extraits(
+        plan, segments, analyses, metadata, sources, _config(tmp_path),
+        _reporter(), appel_gemini, tour=1,
+    ))
+    assert len(verdicts) == 5
+    # TAILLE_LOT_VERIFICATION = 4 → 5 plans en 2 lots : [4, 1].
+    assert appels == [4, 1], appels
+    assert all(verdict["conforme"] for verdict in verdicts)
+    assert montage.TAILLE_LOT_VERIFICATION == 4
+
+
+def test_la_validation_de_plans_est_fail_closed_sur_json_invalide(tmp_path, monkeypatch):
+    """Un tableau de verdicts illisible exclut tous les plans : aucun n'est monté."""
+    _installer_extrait(monkeypatch)
+    segments = montage.creer_segments_script("Accroche", "Phrase complète.")
+    analyses, metadata, sources = _sources_controle(tmp_path, segments, nombre=2, scenes=2)
+
+    async def appel_gemini(_parts, **_kwargs):
+        return "pas un tableau de verdicts"  # illisible
+
+    plan = [
+        {"source": f"source_{index}", "debut": float(index * 10), "fin": float(index * 10 + 10),
+         "texte": "texte"}
+        for index in range(2)
+    ]
+    verdicts = asyncio.run(montage.verifier_conformite_extraits(
+        plan, segments, analyses, metadata, sources, _config(tmp_path),
+        _reporter(), appel_gemini, tour=1,
+    ))
+    # Fail-closed : aucun plan n'est validé → tous écartés avec une raison explicite.
+    assert verdicts
+    assert all(not verdict["conforme"] for verdict in verdicts)
+    assert all("illisible" in " ".join(verdict["raisons"]) for verdict in verdicts)
+
+
+def test_la_validation_de_plans_remonte_l_indisponibilite_gemini(tmp_path, monkeypatch):
+    """Une indisponibilité Gemini pendant un lot remonte ErreurGeminiIndisponible.
+
+    Jamais confondue avec un rejet : un plan n'est pas écarté pour une raison
+    externe. Le montage s'arrête en échec clair (fail-closed sur l'accès).
+    """
+    _installer_extrait(monkeypatch)
+    segments = montage.creer_segments_script("Accroche", "Phrase complète.")
+    analyses, metadata, sources = _sources_controle(tmp_path, segments, nombre=2, scenes=2)
+
+    async def appel_gemini(_parts, **_kwargs):
+        raise montage.ErreurGeminiIndisponible("Gemini saturé (503 persistante).")
+
+    plan = [
+        {"source": f"source_{index}", "debut": float(index * 10), "fin": float(index * 10 + 10),
+         "texte": "texte"}
+        for index in range(2)
+    ]
+    with pytest.raises(montage.ErreurGeminiIndisponible):
+        asyncio.run(montage.verifier_conformite_extraits(
+            plan, segments, analyses, metadata, sources, _config(tmp_path),
+            _reporter(), appel_gemini, tour=1,
+        ))
 
 
 # ======================================================================================
