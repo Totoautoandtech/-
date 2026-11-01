@@ -179,9 +179,20 @@ VOIX_OFF_TEXTE_MAX = 4000
 # compteur recommence réellement. Rien n'est inventé si l'API ne dit rien.
 FOURNISSEURS_TEXTE = ("gemini", "groq", "mistral")
 LIBELLES_FOURNISSEURS_TEXTE = {"gemini": "Gemini", "groq": "Groq", "mistral": "Mistral"}
+# Chaîne de modèles par fournisseur de texte (Groq / Mistral). Le premier est le
+# modèle principal ; les suivants servent de repli quand le premier est introuvable
+# (404 « modèle supprimé ») ou temporairement saturé (429/5xx). Un ID invalide ne
+# doit jamais faire tomber l'appel : on passe au modèle suivant, puis au fournisseur
+# suivant, avec un message clair.
+#
+# Groq a arrêté « llama-3.3-70b-versatile » le 16/08/2026 : il renvoie désormais un
+# 404 systématique. Le défaut est donc openai/gpt-oss-120b, avec qwen/qwen3.6-27b en
+# repli. Ces chaînes sont reconfigurables via GROQ_MODEL / MISTRAL_MODEL.
+MODELES_GROQ_DEFAUT = ("openai/gpt-oss-120b", "qwen/qwen3.6-27b")
+MODELES_MISTRAL_DEFAUT = ("mistral-small-latest",)
 MODELES_FOURNISSEURS_TEXTE = {
-    "groq": "llama-3.3-70b-versatile",
-    "mistral": "mistral-small-latest",
+    "groq": MODELES_GROQ_DEFAUT[0],
+    "mistral": MODELES_MISTRAL_DEFAUT[0],
 }
 URLS_FOURNISSEURS_TEXTE = {
     "groq": "https://api.groq.com/openai/v1/chat/completions",
@@ -205,6 +216,26 @@ def _purer_ordre_fournisseurs_texte(brut: str) -> list[str]:
         if nom in FOURNISSEURS_TEXTE and nom not in ordre:
             ordre.append(nom)
     return ordre
+
+
+def _chaine_modeles_fournisseur(
+    defaut: tuple[str, ...], modele_explicite: str
+) -> tuple[str, ...]:
+    """Chaîne de modèles : le modèle explicite en tête, puis les défauts de repli.
+
+    `GROQ_MODEL` / `MISTRAL_MODEL` peuvent placer un modèle en tête de chaîne sans
+    casser les replis : les modèles par défaut qui ne sont pas déjà présents sont
+    appends après. L'ordre est préservé et les doublons éliminés. Une chaîne vide
+    (impossible ici) retombe sur le défaut complet.
+    """
+    modele = str(modele_explicite or "").strip()
+    chaine: list[str] = []
+    if modele:
+        chaine.append(modele)
+    for modele_defaut in defaut:
+        if modele_defaut not in chaine:
+            chaine.append(modele_defaut)
+    return tuple(chaine) or defaut
 
 
 @dataclass
@@ -237,6 +268,10 @@ class Config:
     rst_sources_max: int
     groq_api_key: str
     mistral_api_key: str
+    groq_model: str
+    groq_modeles: list[str]
+    mistral_model: str
+    mistral_modeles: list[str]
     fournisseurs_texte_ordre: list[str]
 
     @classmethod
@@ -327,6 +362,10 @@ class Config:
             rst_sources_max=entier("RST_SOURCES_MAX", 20, 5, 20),
             groq_api_key=_env("GROQ_API_KEY"),
             mistral_api_key=_env("MISTRAL_API_KEY"),
+            groq_model=_chaine_modeles_fournisseur(MODELES_GROQ_DEFAUT, _env("GROQ_MODEL"))[0],
+            groq_modeles=list(_chaine_modeles_fournisseur(MODELES_GROQ_DEFAUT, _env("GROQ_MODEL"))),
+            mistral_model=_chaine_modeles_fournisseur(MODELES_MISTRAL_DEFAUT, _env("MISTRAL_MODEL"))[0],
+            mistral_modeles=list(_chaine_modeles_fournisseur(MODELES_MISTRAL_DEFAUT, _env("MISTRAL_MODEL"))),
             fournisseurs_texte_ordre=ordre_texte,
         )
 
@@ -826,6 +865,50 @@ def _empreinte_cle(cle: str) -> str:
     return hashlib.sha256(cle.encode("utf-8")).hexdigest()[:6]
 
 
+# État de la rotation clé/modèle Gemini, consultable via /api/fournisseurs-texte.
+# Seules l'empreinte (6 caractères) et le numéro de clé sont conservés : la clé en
+# clair n'est jamais stockée, ni dans l'UI, ni dans les journaux, ni dans un test.
+ETAT_ROTATION_GEMINI: dict[str, Any] = {
+    "nb_cles": 0,
+    "derniere_cle_index": None,
+    "derniere_cle_empreinte": None,
+    "dernier_basculement_unix": None,
+    "cause": "",
+    "tentatives": 0,
+}
+
+
+def _consigner_rotation_gemini(
+    *,
+    empreinte: str,
+    index: int,
+    cause: str,
+    total_cles: int,
+    modele: str = "",
+) -> None:
+    """Enregistre un basculement clé/modèle, sans jamais stocker la clé.
+
+    `empreinte` est déjà calculée (6 caractères) : on ne reçoit jamais la clé en clair.
+    `cause` est une phrase courte en français (quota 429 / saturation 503 / 404…).
+    La date du basculement et l'index de la clé utilisée par la dernière tentative
+    sont consultables via l'endpoint public.
+    """
+    ETAT_ROTATION_GEMINI.update({
+        "nb_cles": max(0, int(total_cles)),
+        "derniere_cle_index": int(index),
+        "derniere_cle_empreinte": empreinte,
+        "dernier_basculement_unix": time.time(),
+        "cause": cause[:200],
+    })
+
+
+def _emetre_message_rotation(message: str, rapporteur: Optional["Rapporteur"]) -> None:
+    """Journalise et affiche une bascule clé/modèle, sans jamais exposer la clé."""
+    logger.info("[Gemini] %s", message)
+    if rapporteur is not None:
+        rapporteur.message(message)
+
+
 def _pause_reessai(entete: Any) -> float:
     """Parse Retry-After (secondes ou date HTTP) et borne la pause à 60 secondes."""
     if entete is None:
@@ -904,6 +987,15 @@ def _modeles_gemini() -> list[str]:
     return list(CONFIG.gemini_modeles) or [CONFIG.gemini_model]
 
 
+def _modeles_fournisseur_texte(nom: str) -> list[str]:
+    """Chaîne de modèles pour Groq / Mistral, depuis la configuration."""
+    if nom == "groq":
+        return list(CONFIG.groq_modeles) or [CONFIG.groq_model]
+    if nom == "mistral":
+        return list(CONFIG.mistral_modeles) or [CONFIG.mistral_model]
+    return []
+
+
 def _raison_erreur_gemini(exc: Exception, cles: list[str]) -> str:
     if isinstance(exc, asyncio.TimeoutError):
         raison = "délai de requête dépassé"
@@ -948,8 +1040,14 @@ def _detail_rotation_gemini(
     return detail
 
 
-def _cause_indisponibilite_gemini(statuts_vus: set[int], saturation_vue: bool) -> str:
-    """Distingue le quota (429 RESOURCE_EXHAUSTED) d'une surcharge (503 UNAVAILABLE)."""
+def _cause_indisponibilite_gemini(
+    statuts_vus: set[int], saturation_vue: bool, reset_unix: Optional[float] = None,
+) -> str:
+    """Distingue quota journalier (RPD), quota minute (RPM) et saturation 503.
+
+    Le reset communiqué par l'API (en-tête x-ratelimit-reset-requests ou corps) décide
+    entre RPD et RPM. Sans reset, on ne prétend rien : « quota 429 ».
+    """
     quota_vu = 429 in statuts_vus
     surcharge_vue = 503 in statuts_vus
     if surcharge_vue and quota_vu:
@@ -957,6 +1055,13 @@ def _cause_indisponibilite_gemini(statuts_vus: set[int], saturation_vue: bool) -
     if surcharge_vue:
         return "saturation 503 persistante"
     if quota_vu:
+        if reset_unix is not None:
+            reset_dans = reset_unix - time.time()
+            if reset_dans <= 60:
+                return "quota minute atteint (429 RPM) persistant"
+            if reset_dans > 3600:
+                return "quota journalier atteint (429 RPD) persistant"
+            return f"quota 429 persistant (fenêtre de réinitialisation dans {reset_dans:.0f} s)"
         return "quota 429 persistant (RESOURCE_EXHAUSTED)"
     if saturation_vue:
         return "saturation persistante signalée par Gemini"
@@ -966,6 +1071,7 @@ def _cause_indisponibilite_gemini(statuts_vus: set[int], saturation_vue: bool) -
 async def _appel_gemini_brut(
     parts: list[dict], *, temperature: float, system: Optional[str] = None,
     json_mode: bool = False, budget: Optional[float] = None,
+    rapporteur: Optional["Rapporteur"] = None,
 ) -> str:
     """Appelle Gemini en ROUND-ROBIN sur les couples clé/modèle, Retry-After honoré.
 
@@ -989,6 +1095,15 @@ async def _appel_gemini_brut(
     cles = CONFIG.gemini_api_keys
     if not cles:
         raise ErreurApp("GEMINI_API_KEYS n'est pas configuré sur le serveur.")
+
+    numero_cle = {cle: index + 1 for index, cle in enumerate(cles)}
+    statuts_par_cle: dict[int, set[int]] = {}
+    dernier_reset_iso: Optional[str] = None
+    dernier_reset_unix: Optional[float] = None
+    dernier_couple: tuple[int, str] | None = None
+    dernier_cle_numero = 0
+    dernier_empreinte = ""
+    couple_limite = ""
 
     modeles = _modeles_gemini()
     couples = [(cle, modele) for cle in random.sample(cles, len(cles)) for modele in modeles]
@@ -1075,6 +1190,25 @@ async def _appel_gemini_brut(
 
                 choisi = min(prets, key=lambda index: (index - rang_tentative) % nb_couples)
                 cle, modele = couples[choisi]
+                cle_numero = numero_cle.get(cle, 0)
+                empreinte = _empreinte_cle(cle)
+                couple_courant = (cle_numero, modele)
+                if couple_courant != dernier_couple:
+                    if couple_limite:
+                        message = (
+                            f"Gemini : clé n°{dernier_cle_numero} ({dernier_empreinte}) "
+                            f"limitée ({couple_limite}), passage à la clé n°{cle_numero}"
+                        )
+                    else:
+                        message = (
+                            f"Gemini : clé n°{cle_numero} ({empreinte}) — "
+                            f"nouvelle tentative sur {modele}"
+                        )
+                    _emetre_message_rotation(message, rapporteur)
+                    dernier_couple = couple_courant
+                    dernier_cle_numero = cle_numero
+                    dernier_empreinte = empreinte
+                    couple_limite = ""
                 timeout_total = min(duree_appel, fin_totale - time.monotonic())
                 if timeout_total <= 0.0:
                     coupe_par_horloge = True
@@ -1109,8 +1243,16 @@ async def _appel_gemini_brut(
                         retry_after = entetes.get("Retry-After")
                         if retry_after is None:
                             retry_after = entetes.get("retry-after")
+                        dernier_reset_iso, dernier_reset_unix = _reset_quatre_vingt_deux(
+                            entetes, texte
+                        )
+                        label = _classer_erreur_quota(resp.status, entetes, texte)
+                        message = f"Gemini a répondu {resp.status}"
+                        if label:
+                            message += f" ({label})"
+                        message += f" : {texte[:200]}"
                         erreur = ErreurGemini(
-                            f"Gemini a répondu {resp.status} : {texte[:200]}",
+                            message,
                             statut=resp.status,
                             saturation=_est_saturation_gemini(resp.status, texte),
                             pause=_pause_reessai(retry_after),
@@ -1127,6 +1269,7 @@ async def _appel_gemini_brut(
                     statut = int(getattr(exc, "statut", 0) or 0)
                     if statut:
                         statuts_vus.add(statut)
+                        statuts_par_cle.setdefault(cle_numero, set()).add(statut)
                     sature = bool(getattr(exc, "saturation", False))
                     saturation_vue = saturation_vue or sature
 
@@ -1149,6 +1292,9 @@ async def _appel_gemini_brut(
                         retentes_vues = True
                     if not reessayable:
                         couples_vivants[choisi] = False
+                        couple_limite = (
+                            f"statut {statut or 'transport/délai'} non reessayable"
+                        )
                         logger.warning(
                             "[Gemini] %s (empreinte clé %s), tentative %s/%s — "
                             "statut %s, abandon du couple : %s",
@@ -1190,6 +1336,14 @@ async def _appel_gemini_brut(
                         origine_pause,
                     )
                     if tentative_couple >= GEMINI_TENTATIVES_PAR_MODELE:
+                        if statut == 429:
+                            couple_limite = "quota 429"
+                        elif statut == 503:
+                            couple_limite = "saturation 503"
+                        elif statut:
+                            couple_limite = f"statut {statut}"
+                        else:
+                            couple_limite = "erreur réseau/délai"
                         logger.warning(
                             "[Gemini] couple modèle %s / empreinte clé %s épuisé.",
                             modele,
@@ -1207,7 +1361,33 @@ async def _appel_gemini_brut(
     detail = _detail_rotation_gemini(
         ordre_modeles, tentatives_par_modele, budget_total, coupe_par_horloge
     )
-    cause = _cause_indisponibilite_gemini(statuts_vus, saturation_vue)
+    cause = _cause_indisponibilite_gemini(
+        statuts_vus, saturation_vue, dernier_reset_unix
+    )
+
+    # Résumé honnête de la rotation clé/modèle, visible dans la progression du travail.
+    if cles:
+        cles_vu_429 = sum(1 for s in statuts_par_cle.values() if 429 in s)
+        cles_vu_503 = sum(1 for s in statuts_par_cle.values() if 503 in s)
+        parties = []
+        if cles_vu_429:
+            parties.append(f"{cles_vu_429} sur {len(cles)} ont répondu 429")
+        if cles_vu_503:
+            parties.append(f"{cles_vu_503} sur {len(cles)} ont répondu 503")
+        if not parties:
+            parties.append(f"{len(cles)} clés essayées, aucune 429/503 explicite")
+        _emetre_message_rotation(
+            f"Gemini : toutes les clés ont été essayées, {'; '.join(parties)}",
+            rapporteur,
+        )
+        if dernier_cle_numero > 0:
+            _consigner_rotation_gemini(
+                empreinte=dernier_empreinte,
+                index=dernier_cle_numero - 1,
+                cause=cause,
+                total_cles=len(cles),
+                modele=dernier_couple[1] if dernier_couple else "",
+            )
     if saturation_vue:
         raise ErreurGeminiIndisponible(
             GEMINI_MESSAGE_SATURE.format(
@@ -1363,6 +1543,77 @@ def _noter_erreur_fournisseur(fournisseur: str, message: str) -> None:
     QUOTAS_FOURNISSEURS[fournisseur] = etat
 
 
+def _texte_erreur_corps(corps: str) -> str:
+    """Message d'erreur du corps JSON (Groq/Mistral/Gemini), sinon une chaîne vide."""
+    if not corps:
+        return ""
+    try:
+        donnees = json.loads(corps)
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not isinstance(donnees, dict):
+        return ""
+    erreur = donnees.get("error")
+    if isinstance(erreur, dict):
+        message = erreur.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    elif isinstance(erreur, str) and erreur.strip():
+        return erreur.strip()
+    return ""
+
+
+def _reset_quatre_vingt_deux(
+    entetes: Any, corps: str
+) -> tuple[Optional[str], Optional[float]]:
+    """Reset de la fenêtre de quota depuis les en-têtes x-ratelimit-* ou le corps.
+
+    Gemini communique le reset dans `x-ratelimit-reset-requests` ou dans le corps
+    (`error.details[].metadata.quota_reset`). Groq/Mistral utilisent les mêmes
+    en-têtes. Rien n'est inventé : un reset absent retourne (None, None).
+    """
+    reset_iso, reset_unix = _date_reset(
+        _entete_insensible(entetes, "x-ratelimit-reset-requests")
+    )
+    if reset_iso is None and corps:
+        try:
+            donnees = json.loads(corps)
+            if isinstance(donnees, dict):
+                details = donnees.get("error", {}).get("details")
+                if isinstance(details, list):
+                    for detail in details:
+                        if not isinstance(detail, dict):
+                            continue
+                        meta = detail.get("metadata")
+                        if isinstance(meta, dict) and meta.get("quota_reset"):
+                            reset_iso, reset_unix = _date_reset(meta.get("quota_reset"))
+                            break
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+    return reset_iso, reset_unix
+
+
+def _classer_erreur_quota(statut: int, entetes: Any, corps: str) -> str:
+    """Label honnête d'une erreur quota/saturation, basé sur les données réelles.
+
+    Distingue le quota journalier (RPD) du quota minute (RPM) d'une saturation 503.
+    Rien n'est inventé : sans en-tête de reset, un 429 reste « quota 429 ».
+    """
+    if statut == 503:
+        return "saturation 503"
+    if statut != 429:
+        return ""
+    reset_iso, reset_unix = _reset_quatre_vingt_deux(entetes, corps)
+    if reset_unix is None:
+        return "quota 429"
+    reset_dans = reset_unix - time.time()
+    if reset_dans <= 60:
+        return "quota minute atteint (429 RPM)"
+    if reset_dans > 3600:
+        return "quota journalier atteint (429 RPD)"
+    return f"quota 429 (fenêtre de réinitialisation dans {reset_dans:.0f} s)"
+
+
 def _fournisseur_configure(nom: str) -> bool:
     """La clé de ce fournisseur est-elle réellement présente côté serveur ?"""
     if nom == "gemini":
@@ -1425,98 +1676,145 @@ async def _appel_openai_compatible(
 ) -> str:
     """Appel Groq ou Mistral (API compatible OpenAI), clé strictement côté serveur.
 
-    Jusqu'à `FOURNISSEURS_TEXTE_TENTATIVES` tentatives. La pause avant retente suit
-    l'ordre : Retry-After de l'API, puis le reset communiqué s'il n'y en a pas, puis
-    le backoff borné — un reset n'est jamais traité comme un simple Retry-After.
+    Chaîne de modèles : le premier modèle est essayé en priorité. Un 404 « modèle
+    introuvable » ou une saturation persistante le fait passer au modèle suivant, puis
+    — à épuisement de la chaîne — au fournisseur suivant. Un ID invalide ne fait
+    jamais tomber l'appel sans message : le modèle exact est nommé, puis on retombe.
+
+    Jusqu'à `FOURNISSEURS_TEXTE_TENTATIVES` tentatives par modèle. La pause avant
+    retente suit l'ordre : Retry-After de l'API, puis le reset communiqué, puis le
+    backoff borné — un reset n'est jamais traité comme un simple Retry-After.
     """
     cle = CONFIG.groq_api_key if fournisseur == "groq" else CONFIG.mistral_api_key
     libelle = LIBELLES_FOURNISSEURS_TEXTE[fournisseur]
     url = URLS_FOURNISSEURS_TEXTE[fournisseur]
-    payload: dict[str, Any] = {
-        "model": MODELES_FOURNISSEURS_TEXTE[fournisseur],
-        "messages": messages,
-        "temperature": temperature,
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
+    chaine = _modeles_fournisseur_texte(fournisseur)
 
     debut = time.monotonic()
     echecs: list[str] = []
+    modeles_essayes: list[str] = []
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, connect=15)
     ) as session:
-        for tentative in range(1, FOURNISSEURS_TEXTE_TENTATIVES + 1):
-            restant = budget - (time.monotonic() - debut)
-            if restant <= 1.0:
-                break
-            timeout_total = min(120.0, restant)
-            try:
-                async with session.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {cle}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(
-                        total=timeout_total, connect=min(15.0, timeout_total)
-                    ),
-                ) as resp:
-                    texte = await resp.text()
-                    entetes = getattr(resp, "headers", {})
-                    _enregistrer_quota(fournisseur, entetes, texte)
-                    if resp.status == 200:
-                        contenu = _extraire_contenu_openai(texte)
-                        if not contenu:
-                            raise ErreurFournisseurTexte(
-                                f"{libelle} a répondu sans texte exploitable.",
-                                statut=200, temporaire=False,
-                            )
-                        return contenu
-                    if resp.status in (401, 403):
-                        variable = (
-                            "GROQ_API_KEY" if fournisseur == "groq" else "MISTRAL_API_KEY"
-                        )
-                        raise ErreurFournisseurTexte(
-                            f"{libelle} a refusé la clé ({resp.status}) : vérifie "
-                            f"{variable} sur le serveur. {texte[:160]}",
-                            statut=resp.status, temporaire=False,
-                        )
-                    temporaire = resp.status in (429, 500, 502, 503, 504)
-                    erreur = ErreurFournisseurTexte(
-                        f"{libelle} a répondu {resp.status} : {texte[:160]}",
-                        statut=resp.status, temporaire=temporaire,
-                    )
-                    erreur.retry_after = _pause_reessai(
-                        _entete_insensible(entetes, "Retry-After", "retry-after")
-                    )
-                    raise erreur
-            except asyncio.CancelledError:
-                raise
-            except ErreurFournisseurTexte as exc:
-                echecs.append(str(exc))
-                _noter_erreur_fournisseur(fournisseur, str(exc))
-                if not exc.temporaire:
-                    raise
-                if tentative >= FOURNISSEURS_TEXTE_TENTATIVES:
-                    break
-                await _pause_fournisseur(fournisseur, tentative, budget, debut, exc)
-            except Exception as exc:  # noqa: BLE001 — erreurs de transport
-                raison = _raison_erreur_fournisseur(cle, exc)
-                echecs.append(raison)
-                _noter_erreur_fournisseur(fournisseur, raison)
-                if tentative >= FOURNISSEURS_TEXTE_TENTATIVES:
-                    break
+        for modele in chaine:
+            modeles_essayes.append(modele)
+            payload: dict[str, Any] = {
+                "model": modele,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
+            for tentative in range(1, FOURNISSEURS_TEXTE_TENTATIVES + 1):
                 restant = budget - (time.monotonic() - debut)
                 if restant <= 1.0:
                     break
-                pause = FOURNISSEURS_TEXTE_BACKOFF[
-                    min(tentative - 1, len(FOURNISSEURS_TEXTE_BACKOFF) - 1)
-                ]
-                if pause < restant:
-                    await asyncio.sleep(pause)
+                timeout_total = min(120.0, restant)
+                try:
+                    async with session.post(
+                        url,
+                        headers={
+                            "Authorization": f"Bearer {cle}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(
+                            total=timeout_total, connect=min(15.0, timeout_total)
+                        ),
+                    ) as resp:
+                        texte = await resp.text()
+                        entetes = getattr(resp, "headers", {})
+                        _enregistrer_quota(fournisseur, entetes, texte)
+                        if resp.status == 200:
+                            contenu = _extraire_contenu_openai(texte)
+                            if not contenu:
+                                raise ErreurFournisseurTexte(
+                                    f"{libelle} a répondu sans texte exploitable.",
+                                    statut=200, temporaire=False,
+                                )
+                            return contenu
+                        if resp.status in (401, 403):
+                            variable = (
+                                "GROQ_API_KEY" if fournisseur == "groq" else "MISTRAL_API_KEY"
+                            )
+                            raise ErreurFournisseurTexte(
+                                f"{libelle} a refusé la clé ({resp.status}) : vérifie "
+                                f"{variable} sur le serveur. {texte[:160]}",
+                                statut=resp.status, temporaire=False,
+                            )
+                        if resp.status == 404:
+                            detail = _texte_erreur_corps(texte) or texte[:160]
+                            raise ErreurFournisseurTexte(
+                                f"{libelle} a répondu 404 : le modèle « {modele} » est "
+                                f"introuvable. {detail}",
+                                statut=404, temporaire=False,
+                            )
+                        temporaire = resp.status in (429, 500, 502, 503, 504)
+                        label = _classer_erreur_quota(resp.status, entetes, texte)
+                        message = f"{libelle} a répondu {resp.status}"
+                        if label:
+                            message += f" ({label})"
+                        message += f" : {texte[:160]}"
+                        erreur = ErreurFournisseurTexte(
+                            message, statut=resp.status, temporaire=temporaire,
+                        )
+                        erreur.retry_after = _pause_reessai(
+                            _entete_insensible(entetes, "Retry-After", "retry-after")
+                        )
+                        raise erreur
+                except asyncio.CancelledError:
+                    raise
+                except ErreurFournisseurTexte as exc:
+                    echecs.append(str(exc))
+                    _noter_erreur_fournisseur(fournisseur, str(exc))
+                    if exc.statut == 404:
+                        # Modèle invalide ou supprimé : le message clair est déjà
+                        # enregistré ; on passe au modèle suivant sans retente.
+                        logger.warning(
+                            "[%s] modèle « %s » introuvable (404) : passage au modèle "
+                            "suivant. %s",
+                            libelle, modele, str(exc)[:200],
+                        )
+                        break
+                    if not exc.temporaire:
+                        raise
+                    if exc.statut == 429:
+                        # Le quota est lié à la clé, pas au modèle : changer de modèle
+                        # ne résoudra rien. On retend le même modèle jusqu'à épuisement,
+                        # puis on laisse le routeur basculer vers le fournisseur suivant.
+                        if tentative >= FOURNISSEURS_TEXTE_TENTATIVES:
+                            raise ErreurFournisseurTexte(
+                                f"{libelle} indisponible : quota épuisé après "
+                                f"{FOURNISSEURS_TEXTE_TENTATIVES} tentative(s) sur "
+                                f"« {modele} ». Derniers échecs : "
+                                f"{' | '.join(echecs[-3:])}",
+                                statut=429, temporaire=True,
+                            )
+                        await _pause_fournisseur(fournisseur, tentative, budget, debut, exc)
+                        continue
+                    # 5xx : saturation/temporaire, retry puis modèle suivant si épuisé.
+                    if tentative >= FOURNISSEURS_TEXTE_TENTATIVES:
+                        break
+                    await _pause_fournisseur(fournisseur, tentative, budget, debut, exc)
+                except Exception as exc:  # noqa: BLE001 — erreurs de transport
+                    raison = _raison_erreur_fournisseur(cle, exc)
+                    echecs.append(raison)
+                    _noter_erreur_fournisseur(fournisseur, raison)
+                    if tentative >= FOURNISSEURS_TEXTE_TENTATIVES:
+                        break
+                    restant = budget - (time.monotonic() - debut)
+                    if restant <= 1.0:
+                        break
+                    pause = FOURNISSEURS_TEXTE_BACKOFF[
+                        min(tentative - 1, len(FOURNISSEURS_TEXTE_BACKOFF) - 1)
+                    ]
+                    if pause < restant:
+                        await asyncio.sleep(pause)
+    # Tous les modèles de ce fournisseur ont échoué : message honnête, avec les
+    # modèles réellement essayés et la cause observée (404 / quota / saturation).
+    detail = ", ".join(f"« {m} »" for m in modeles_essayes) or "aucun modèle"
     raise ErreurFournisseurTexte(
-        f"{libelle} indisponible après {FOURNISSEURS_TEXTE_TENTATIVES} tentative(s). "
+        f"{libelle} indisponible (modèles essayés : {detail}). "
         f"Derniers échecs : {' | '.join(echecs[-3:])}",
         statut=0, temporaire=True,
     )
@@ -3640,6 +3938,7 @@ async def _produire_rst(
     )
 
     resolution = "1080" if (requete.mode == "qualite" and CONFIG.autoriser_export_1080) else "720"
+    rapporteur = _rapporteur_decale(contexte, 45.0, 0.45)
     resultat = await construire_montage_professionnel(
         liens=[candidate["url"] for candidate in selectionnees],
         # La vidéo de départ sert de RÉFÉRENCE DE STYLE (rythme, durée des plans,
@@ -3652,10 +3951,10 @@ async def _produire_rst(
         resolution=resolution,
         style_sous_titres="classique",
         config=configuration,
-        rapporteur=_rapporteur_decale(contexte, 45.0, 0.45),
+        rapporteur=rapporteur,
         resolveur=_resoudre_video_tiktok,
         telechargeur=_telecharger_fichier,
-        appel_gemini=_appel_gemini_brut,
+        appel_gemini=lambda *args, **kw: _appel_gemini_brut(*args, rapporteur=rapporteur, **kw),
         intensite_transitions=requete.intensite_transitions,
         voix_off=_resoudre_voix_off(session_id, requete.voix_off),
     )
@@ -4371,15 +4670,16 @@ async def _produire_sst(requete: "RequeteSst", contexte: "ContexteJob", session_
             found_videos=trouves, search_queries=recherches, recherches=recherches,
             noms_saisis=noms, plafond_reel=plafond_reel,
         )
+        rapporteur = _rapporteur_decale(contexte, 48.0, 0.45)
         resultat = await construire_montage_professionnel(
             liens=[candidate["url"] for candidate in selectionnees],
             lien_reference=lien,
             reference_optionnelle=False,
             hook=script["hook"], corps=script["corps"], resolution="720",
             style_sous_titres="classique", config=configuration,
-            rapporteur=_rapporteur_decale(contexte, 48.0, 0.45),
+            rapporteur=rapporteur,
             resolveur=_resoudre_video_tiktok, telechargeur=_telecharger_fichier,
-            appel_gemini=_appel_gemini_brut,
+            appel_gemini=lambda *args, **kw: _appel_gemini_brut(*args, rapporteur=rapporteur, **kw),
             intensite_transitions=requete.intensite_transitions,
             voix_off=_resoudre_voix_off(session_id, requete.voix_off),
         )
@@ -4889,6 +5189,7 @@ async def _produire_montage(
     # Elle reste une source de contenu puisqu'elle figure explicitement dans `liens_videos`;
     # une référence distincte n'est jamais ajoutée à cette liste ni à l'export FFmpeg.
     lien_reference = requete.lien_reference_style.strip() or requete.liens_videos[0]
+    rapporteur = contexte.rapporteur()
     resultat = await construire_montage_professionnel(
         liens=requete.liens_videos,
         lien_reference=lien_reference,
@@ -4897,10 +5198,10 @@ async def _produire_montage(
         resolution=requete.resolution,
         style_sous_titres=requete.style,
         config=_configuration_montage(requete.mode),
-        rapporteur=contexte.rapporteur(),
+        rapporteur=rapporteur,
         resolveur=_resoudre_video_tiktok,
         telechargeur=_telecharger_fichier,
-        appel_gemini=_appel_gemini_brut,
+        appel_gemini=lambda *args, **kw: _appel_gemini_brut(*args, rapporteur=rapporteur, **kw),
         intensite_transitions=requete.intensite_transitions,
         voix_off=voix_off,
     )
@@ -5102,6 +5403,22 @@ async def sante() -> dict[str, Any]:
         "max_source_seconds": CONFIG.duree_max_source,
         # Synthèse vocale gratuite et sans clé : on signale seulement si le module est là.
         "voix_off_generee_disponible": importlib.util.find_spec("edge_tts") is not None,
+        # Clés Gemini : on expose le NUMÉRO et l'empreinte, jamais la clé en clair.
+        "gemini_cles": len(CONFIG.gemini_api_keys),
+        "rotation_gemini": {
+            "nb_cles": ETAT_ROTATION_GEMINI.get("nb_cles", 0),
+            "derniere_cle_index": ETAT_ROTATION_GEMINI.get("derniere_cle_index"),
+            "derniere_cle_empreinte": ETAT_ROTATION_GEMINI.get("derniere_cle_empreinte"),
+            "dernier_basculement_iso": (
+                datetime.fromtimestamp(
+                    float(ETAT_ROTATION_GEMINI["dernier_basculement_unix"]),
+                    tz=timezone.utc,
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                if ETAT_ROTATION_GEMINI.get("dernier_basculement_unix") is not None
+                else None
+            ),
+            "cause": ETAT_ROTATION_GEMINI.get("cause", ""),
+        },
     }
 
 
@@ -5186,18 +5503,30 @@ async def etat_fournisseurs_texte() -> dict[str, Any]:
         quota = None
         if etat is not None and (etat.restant is not None or etat.limite is not None):
             quota = {"restant": etat.restant, "limite": etat.limite}
+        chaine = _modeles_fournisseur_texte(nom) if nom != "gemini" else _modeles_gemini()
         fournisseurs.append({
             "nom": nom,
             "libelle": LIBELLES_FOURNISSEURS_TEXTE[nom],
             "configure": _fournisseur_configure(nom),
+            "modele": chaine[0] if chaine else None,
+            "modeles": chaine,
             "quota_communiquee": quota,
             "fenetre_reinitialisee": etat.reset_iso if etat is not None else None,
             "maj_unix": round(etat.maj_unix, 1) if etat is not None else None,
             "derniere_erreur": (etat.derniere_erreur if etat is not None else "")[:200],
         })
+    # État de la rotation clé/modèle Gemini : jamais la clé, seulement empreinte + index.
+    etat_rotation = dict(ETAT_ROTATION_GEMINI)
+    if etat_rotation.get("dernier_basculement_unix") is not None:
+        etat_rotation["dernier_basculement_iso"] = datetime.fromtimestamp(
+            float(etat_rotation["dernier_basculement_unix"]), tz=timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        etat_rotation["dernier_basculement_iso"] = None
     return {
         "ordre": [fournisseur["nom"] for fournisseur in fournisseurs],
         "fournisseurs": fournisseurs,
+        "rotation_gemini": etat_rotation,
     }
 
 

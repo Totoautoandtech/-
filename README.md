@@ -89,7 +89,7 @@ Le mode **Montage multi-source** accepte de 1 à 20 liens TikTok (un par ligne).
 
 Pendant le travail, les téléchargements sont séquentiels. Les aperçus couvrent **toute la durée autorisée** à environ 360p/6 FPS, sans audio, et sont supprimés juste après l'analyse. Une seule analyse Gemini est lancée par défaut (`2` maximum configurable). Les originaux, jamais les aperçus, alimentent un graphe FFmpeg final en 720 × 1280, 24 FPS, H.264/yuv420p. L'accroche utilise des plans de 0,6 à 1,5 s ; les scènes principales visent 4,5 à 5,5 s.
 
-**Contrôle qualité final.** Après la sélection, chaque plan retenu est relu **une deuxième fois** par Gemini sur un extrait de sa fenêtre exacte (720p, sans audio, quelques secondes). Un plan n'est monté que si sept drapeaux valent `false` : personne visible, watermark, logo ajouté, sticker/pseudo/bouton, texte qui n'est pas un vrai sous-titre TikTok, image illisible, sujet différent du script. Un plan non confirmé est écarté **avec sa scène**, et la sélection est relancée ; au bout de trois tours, le travail échoue avec le détail de chaque refus (URL, timestamps, raisons). Un contrôle impossible — réponse illisible, appel en timeout, source introuvable — écarte le plan comme un refus : mieux vaut un travail en échec qu'une vidéo non conforme. Le verdict de chaque plan est publié dans `plan_verification` du résultat.
+**Contrôle qualité final.** Après la sélection, chaque plan retenu est relu **une deuxième fois** par Gemini sur un extrait de sa fenêtre exacte (720p, sans audio, quelques secondes). Un plan n'est monté que si sept drapeaux valent `false` : personne visible, watermark, logo ajouté, sticker/pseudo/bouton, texte qui n'est pas un vrai sous-titre TikTok, image illisible, sujet différent du script. Un plan non confirmé est écarté **avec sa scène**, et la sélection est relancée ; au bout de trois tours, le travail échoue avec le détail de chaque refus (URL, timestamps, raisons). Un contrôle impossible — réponse illisible, appel en timeout, source introuvable — écarte le plan comme un refus : mieux vaut un travail en échec qu'une vidéo non conforme. Le verdict de chaque plan est publié dans `plan_verification` du résultat. **Les plans d'un même tour sont vérifiés en un seul appel Gemini** (groupés par lots de 4 plans maximum, `TAILLE_LOT_VERIFICATION`) : un appel par plan multiplierait les appels et consommerait le quota journalier gratuit de Gemini (20 requêtes/jour, 5/min sur la clé gratuite).
 
 Une référence de style reproduit aussi fidèlement que possible le rythme, les coupes, les zooms et les sous-titres ASS. Une référence distincte n'alimente jamais les images du rendu ; elle n'est exportée que si elle figure aussi explicitement dans la liste des sources. Sans référence distincte, la première source sert également à analyser le style, mais demeure une source de contenu puisqu'elle a été sélectionnée comme telle.
 
@@ -124,6 +124,8 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 |---|---:|---|
 | `GEMINI_MODEL` | `gemini-2.5-flash` | modèle Gemini principal |
 | `GEMINI_MODELES` | `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash` | chaîne de modèles de secours, essayés dans l'ordre en cas de 503 / 429 |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | modèle Groq principal (repli `qwen/qwen3.6-27b` ; `llama-3.3-70b-versatile` est arrêté depuis 16/08/2026 et renvoie 404) |
+| `MISTRAL_MODEL` | `mistral-small-latest` | modèle Mistral principal |
 | `DUREE_CIBLE_SECONDES` | `30` | ancienne durée indicative du script ; l'export final est toujours prolongé et vérifié à 61 s minimum |
 | `DUREE_MAX_SOURCE_SECONDES` | `180` | limite annoncée et appliquée par source/référence |
 | `JOB_TIMEOUT_SECONDES` | `1800` | limite globale, soit 30 min (bornée à 60..3600) |
@@ -192,10 +194,17 @@ vient d'échouer :
 5. **Messages honnêtes** — après épuisement, le message public nomme les modèles réellement
    essayés avec leurs comptes (`gemini-2.5-flash ×2, gemini-2.5-flash-lite ×1`), les modèles
    **non essayés** quand le budget a coupé la rotation (« gemini-2.0-flash non essayé avant la
-   fin du budget de … s »), et la cause observée (« saturation 503 persistante » vs
-   « quota 429 … RESOURCE_EXHAUSTED ») — jamais « tous les modèles et toutes les clés » à tort.
+   fin du budget de … s »), et la cause observée : un 503 est nommé « saturation 503 persistante »,
+   un 429 est distingué en **quota minute** (429 RPM, `Retry-After` ≤ 60 s) ou **quota journalier**
+   (429 RPD, `Retry-After` > 3600 s), avec la fenêtre de réinitialisation réelle — jamais
+   « tous les modèles et toutes les clés » à tort.
    Un budget dépassé avant tout repli indique explicitement que le repli n'a pas eu lieu ; les
    autres erreurs détaillent les derniers échecs sans révéler de clé.
+6. **Visibilité de la rotation** — `GET /api/fournisseurs-texte` et `GET /api/sante` exposent
+   l'état réel de la rotation clé/modèle Gemini : nombre de clés configurées, dernière clé essayée
+   (empreinte SHA-256 courte, jamais la clé), heure du dernier basculement et cause. L'interface
+   **Paramètres → Fournisseurs IA** affiche ces informations en direct, sans jamais révéler de
+   clé en clair.
 
 `GET /api/config` expose la chaîne réellement active dans `gemini_modeles`.
 
@@ -233,7 +242,8 @@ fournisseurs :
   propres quotas publics, sans promesse de volume.
 
 `GET /api/fournisseurs-texte` expose l'état réel (ordre, clés présentes, quotas
-communiqués, dernière erreur) utilisé par la carte Paramètres.
+communiqués, dernière erreur, chaîne de modèles par fournisseur, rotation Gemini)
+utilisé par la carte Paramètres.
 
 ## IA vidéo : une idée → une vidéo
 

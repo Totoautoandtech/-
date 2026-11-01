@@ -21,6 +21,13 @@ services:
         sync: false
       - key: MISTRAL_API_KEY
         sync: false
+      # Modèle Groq principal. « llama-3.3-70b-versatile » est arrêté depuis 16/08/2026
+      # (renvoie 404) : le défaut est openai/gpt-oss-120b, avec qwen/qwen3.6-27b en repli
+      # (configurable via GROQ_MODEL). MISTRAL_MODEL garde mistral-small-latest.
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-120b
+      - key: MISTRAL_MODEL
+        value: mistral-small-latest
       - key: FOURNISSEURS_TEXTE_ORDRE
         value: gemini,groq,mistral
       - key: GEMINI_MODEL

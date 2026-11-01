@@ -1634,6 +1634,9 @@
       nom.append(el('i', f.configure ? '' : 'off'), document.createTextNode(`${index + 1}. ${f.libelle}`));
       item.append(nom);
       const meta = [f.configure ? 'clé présente sur le serveur' : 'non configuré (clé absente)'];
+      if (Array.isArray(f.modeles) && f.modeles.length) {
+        meta.push(`modèle : ${f.modeles[0]}${f.modeles.length > 1 ? ` (+ repli ${f.modeles.slice(1).join(', ')})` : ''}`);
+      }
       meta.push(f.quota_communiquee
         ? `quota communiqué : ${f.quota_communiquee.restant ?? 'n/d'} / ${f.quota_communiquee.limite ?? 'n/d'} requêtes`
         : 'quota non communiqué par l’API');
@@ -1642,6 +1645,23 @@
       if (f.derniere_erreur) item.append(el('p', 'fournisseur-erreur', f.derniere_erreur));
       cont.append(item);
     });
+    // État de la rotation clé/modèle Gemini : empreinte + numéro, jamais la clé.
+    const rot = data.rotation_gemini || {};
+    if (rot.nb_cles || rot.derniere_cle_index !== null || rot.derniere_cle_index === 0) {
+      const item = el('div', 'fournisseur-item');
+      const nom = el('span', 'fournisseur-nom fournisseur-tete');
+      nom.append(el('i', ''), document.createTextNode('Rotation Gemini'));
+      item.append(nom);
+      const parties = [`${rot.nb_cles ?? 0} clés configurées`];
+      if (rot.derniere_cle_index !== null && rot.derniere_cle_index !== undefined) {
+        const emp = rot.derniere_cle_empreinte || '?';
+        parties.push(`dernière tentative : clé n°${rot.derniere_cle_index + 1} (${emp})`);
+      }
+      if (rot.dernier_basculement_iso) parties.push(`dernier basculement à ${fmtHeureLocale(rot.dernier_basculement_iso)}`);
+      if (rot.cause) parties.push(rot.cause);
+      item.append(el('span', 'fournisseur-meta', parties.join(' · ')));
+      cont.append(item);
+    }
   }
 
   async function loadFournisseurs() {
