@@ -469,8 +469,8 @@ Texte du script que ce plan doit illustrer : {segment}
 Retourne UNIQUEMENT cet objet JSON strict :
 {{"conforme":false,"personnes_visibles":false,"watermark":false,"logo_ajoute":false,
 "autre_element_superpose":false,"texte_non_sous_titre":false,"flou_ou_illisible":false,
-"hors_sujet":false,"raisons":[]}}
-Un plan n'est conforme QUE SI les sept drapeaux valent false. Écris les raisons en français,
+"hors_sujet":false,"action_absente":false,"raisons":[]}}
+Un plan n'est conforme QUE SI les huit drapeaux valent false. Écris les raisons en français,
 courtes et concrètes.
 RÈGLE DU DOUTE ABSOLUE : au moindre doute, le drapeau passe à true. Le doute exclut le plan.
 - personnes_visibles : une personne, même partiellement cadrée, une main, un visage, un
@@ -479,12 +479,16 @@ RÈGLE DU DOUTE ABSOLUE : au moindre doute, le drapeau passe à true. Le doute e
 - logo_ajoute : logo ajouté ou incrusté à l'image. L'emblème physique normal du produit
   ou du véhicule filmé n'en est pas un.
 - autre_element_superpose : sticker, emoji, bouton, badge, chrono, bordure ou décoration.
-- texte_non_sous_titre : tout texte qui n'est PAS la transcription des paroles dites dans
-  l'extrait. Les vrais sous-titres TikTok qui recopient les paroles sont AUTORISÉS ; un
-  titre, une légende, une phrase écrite ou une typographie décorative ne le sont pas.
+- texte_non_sous_titre : tout texte visible sur l'image — titre, surtitre, légende, emoji
+  textuel, filigrane, call-to-action, typographie décorative — est INTERDIT. Aucun texte
+  n'est permis sur la vidéo source : le script et les sous-titres sont livrés en pièce
+  jointe, jamais incrustés dans l'extrait.
 - flou_ou_illisible : image floue, trop sombre, pixellisée ou sans sujet identifiable.
 - hors_sujet : le plan ne montre pas exactement le sujet annoncé par le texte du script.
   La beauté, le cadrage et l'esthétique ne remplacent jamais la correspondance.
+- action_absente : le sujet est visible mais ne fait PAS l'action attendue. Une voiture
+  garée au lieu de rouler, une personne immobile au lieu d'agir, un produit posé sur une
+  table au lieu d'être utilisé : le plan est rejeté même si le sujet est bien présent.
 N'invente rien, n'ajoute aucune clé et ne commente pas en dehors du JSON."""
 
 
@@ -496,8 +500,8 @@ Texte du script que chaque plan doit illustrer :
 Retourne UNIQUEMENT un tableau JSON strict, un objet par plan, dans l'ordre des indices :
 [{{"conforme":false,"personnes_visibles":false,"watermark":false,"logo_ajoute":false,
 "autre_element_superpose":false,"texte_non_sous_titre":false,"flou_ou_illisible":false,
-"hors_sujet":false,"raisons":[]}}]
-Un plan n'est conforme QUE SI les sept drapeaux valent false. Écris les raisons en français,
+"hors_sujet":false,"action_absente":false,"raisons":[]}}]
+Un plan n'est conforme QUE SI les huit drapeaux valent false. Écris les raisons en français,
 courtes et concrètes.
 RÈGLE DU DOUTE ABSOLUE : au moindre doute, le drapeau passe à true. Le doute exclut le plan.
 - personnes_visibles : une personne, même partiellement cadrée, une main, un visage, un
@@ -506,11 +510,13 @@ RÈGLE DU DOUTE ABSOLUE : au moindre doute, le drapeau passe à true. Le doute e
 - logo_ajoute : logo ajouté ou incrusté à l'image. L'emblème physique normal du produit
   ou du véhicule filmé n'en est pas un.
 - autre_element_superpose : sticker, emoji, bouton, badge, chrono, bordure ou décoration.
-- texte_non_sous_titre : tout texte qui n'est PAS la transcription des paroles dites dans
-  l'extrait. Les vrais sous-titres TikTok qui recopient les paroles sont AUTORISÉS ; un
-  titre, une légende, une phrase écrite ou une typographie décorative ne le sont pas.
+- texte_non_sous_titre : tout texte visible sur l'image — titre, surtitre, légende, emoji
+  textuel, filigrane, call-to-action, typographie décorative — est INTERDIT. Aucun texte
+  n'est permis sur la vidéo source.
 - flou_ou_illisible : image floue, trop sombre, pixellisée ou sans sujet identifiable.
 - hors_sujet : le plan ne montre pas exactement le sujet annoncé par le texte du script.
+- action_absente : le sujet est visible mais ne fait PAS l'action attendue. Une voiture
+  garée au lieu de rouler : le plan est rejeté même si le sujet est bien présent.
 N'invente rien, n'ajoute aucune clé et ne commente pas en dehors du tableau JSON."""
 
 
@@ -531,6 +537,7 @@ class ReponseVerification(BaseModel):
     texte_non_sous_titre: bool = True
     flou_ou_illisible: bool = True
     hors_sujet: bool = True
+    action_absente: bool = True
     raisons: list[str] = Field(default_factory=list, max_length=12)
 
 
@@ -539,9 +546,10 @@ MOTIFS_VERIFICATION: tuple[tuple[str, str], ...] = (
     ("watermark", "un watermark, un bandeau ou un pseudo d'auteur est incrusté"),
     ("logo_ajoute", "un logo ajouté ou incrusté à l'image est visible"),
     ("autre_element_superpose", "un sticker, un pseudo, un bouton ou une décoration est superposé"),
-    ("texte_non_sous_titre", "du texte qui n'est pas un vrai sous-titre TikTok est visible"),
+    ("texte_non_sous_titre", "du texte visible sur la vidéo source est interdit (titre, emoji, légende, call-to-action)"),
     ("flou_ou_illisible", "l'image est trop floue, trop sombre ou sans sujet identifiable"),
     ("hors_sujet", "le plan ne montre pas le sujet exact demandé par le script"),
+    ("action_absente", "le sujet est visible mais ne fait pas l'action attendue"),
 )
 
 

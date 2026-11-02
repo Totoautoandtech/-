@@ -464,7 +464,7 @@ def _verdict_valide() -> str:
         "conforme": True, "personnes_visibles": False, "watermark": False,
         "logo_ajoute": False, "autre_element_superpose": False,
         "texte_non_sous_titre": False, "flou_ou_illisible": False,
-        "hors_sujet": False, "raisons": [],
+        "hors_sujet": False, "action_absente": False, "raisons": [],
     })
 
 
@@ -637,7 +637,7 @@ def _verdict_refuse() -> str:
         "conforme": False, "personnes_visibles": True, "watermark": False,
         "logo_ajoute": False, "autre_element_superpose": False,
         "texte_non_sous_titre": False, "flou_ou_illisible": False,
-        "hors_sujet": False, "raisons": ["une main est visible dans le cadre"],
+        "hors_sujet": False, "action_absente": False, "raisons": ["une main est visible dans le cadre"],
     })
 
 
@@ -782,7 +782,7 @@ def test_echec_du_controle_qualite_est_detaille_avec_url_et_timestamps(tmp_path,
             "conforme": False, "personnes_visibles": False, "watermark": True,
             "logo_ajoute": False, "autre_element_superpose": False,
             "texte_non_sous_titre": False, "flou_ou_illisible": False,
-            "hors_sujet": False, "raisons": ["filigrane incrusté"],
+            "hors_sujet": False, "action_absente": False, "raisons": ["filigrane incrusté"],
         }
         return json.dumps([verdict for _ in range(max(1, nombre))])
 
