@@ -582,6 +582,44 @@ class ErreurApp(Exception):
     """Erreur métier, affichable telle quelle à l'utilisateur."""
 
 
+def _formater_erreur_copiable(exc: Exception, contexte: Optional["ContexteJob"] = None) -> dict[str, str]:
+    """Formate une erreur en un objet structuré et copiable pour le débogage.
+
+    Chaque erreur contient :
+    - type : classe de l'exception
+    - message : texte complet de l'erreur
+    - detail : résumé court pour l'affichage
+    - copiable : texte pré-formaté pour copier-coller dans un chat IA
+    - etape : dernière étape du job au moment de l'erreur
+    """
+    texte = str(exc)
+    type_erreur = type(exc).__name__
+    etape = ""
+    fournisseur = ""
+    if contexte is not None:
+        etape = str(contexte.derniere_etape or "")
+        fournisseur = str(contexte.job.get("fournisseur_texte", "") or "")
+    for nom in ("Gemini", "Groq", "Mistral"):
+        if nom in texte:
+            fournisseur = fournisseur or nom
+            break
+    detail = texte[:200] if len(texte) > 200 else texte
+    copiable = (
+        f"[{type_erreur}] {texte}\\n"
+        f"Étape : {etape or 'inconnue'}\\n"
+        f"Fournisseur : {fournisseur or 'non spécifié'}\\n"
+        f"Message complet : {texte}"
+    )
+    return {
+        "type": type_erreur,
+        "message": texte,
+        "detail": detail,
+        "copiable": copiable,
+        "etape": etape,
+        "fournisseur": fournisseur,
+    }
+
+
 class ErreurTikwm403(ErreurApp):
     """Erreur 403 renvoyée par TikWM signalant le blocage de la plage IP du serveur."""
 
