@@ -1767,13 +1767,15 @@ async def _appel_openai_compatible(
                 except ErreurFournisseurTexte as exc:
                     echecs.append(str(exc))
                     _noter_erreur_fournisseur(fournisseur, str(exc))
-                    if exc.statut == 404:
-                        # Modèle invalide ou supprimé : le message clair est déjà
-                        # enregistré ; on passe au modèle suivant sans retente.
+                    if exc.statut in (400, 404):
+                        # Modèle invalide, indisponible ou refus de générer le JSON
+                        # (Groq renvoie 400 « Failed to generate JSON ») : ce n'est
+                        # pas une indisponibilité du fournisseur. On passe au modèle
+                        # suivant, puis au fournisseur suivant si tous échouent.
                         logger.warning(
-                            "[%s] modèle « %s » introuvable (404) : passage au modèle "
+                            "[%s] modèle « %s » refusé (%s) : passage au modèle "
                             "suivant. %s",
-                            libelle, modele, str(exc)[:200],
+                            libelle, modele, exc.statut, str(exc)[:200],
                         )
                         break
                     if not exc.temporaire:
