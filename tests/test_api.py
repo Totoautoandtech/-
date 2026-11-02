@@ -1681,15 +1681,15 @@ def test_interface_contient_rst_multiple_et_voix_off():
     assert "job-card" in js and "found-bloc" in js
     assert "rst-liens" in js and "parseRstLinks" in js
 
-    # Design éditorial : système de polices sans dépendance externe, thème
-    # clair/sombre avec [data-theme=dark] fond sombre chaud, logo static/logo.jpg.
-    assert "fonts.googleapis.com" not in html
-    assert "Georgia" in css or "Inter" in css
+    # Design approuvé : police Outfit via Google Fonts (preconnect), thème clair/sombre
+    # avec [data-theme=dark] fond noir, glassmorphism, logo static/logo.jpg.
+    assert "fonts.googleapis.com" in html
+    assert "Outfit" in html or "Outfit" in css
     assert "-apple-system" in css
-    assert "preconnect" not in html
+    assert "preconnect" in html
     assert "logo.jpg" in html
     assert '[data-theme="dark"]' in css or "[data-theme=dark]" in css
-    assert "--bg:#15140f" in css or "--bg: #15140f" in css
+    assert "--bg:#000000" in css or "--bg: #000000" in css
 
 
 # ======================================================================================
@@ -3928,7 +3928,7 @@ def test_interface_presente_fournisseurs_texte_et_theme_noir():
     assert 'data-theme-choix="auto"' in index
     # Le thème noir est une variante complète des variables, fond noir pur.
     assert '[data-theme="noir"]' in styles
-    assert "--bg:#15140f" in styles or "--bg: #15140f" in styles
+    assert "--bg: #000000" in styles
     # Le JS pose l'attribut de thème et suit le système en « auto ».
     assert "appliquerTheme" in js and "prefers-color-scheme" in js
     assert "fournisseurs-texte" in js
