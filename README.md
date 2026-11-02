@@ -21,12 +21,17 @@ La barre latérale contient **Créer**, **Entraînement IA**, **Mes créations**
    Tout supprimer). Chaque lien lance **son propre travail** `POST /api/jobs/rst` et dispose d'une
    carte de suivi indépendante (progression, annulation, bouton Voir) ainsi que de son propre bloc
    « Vidéos trouvées par RsT ». Le suivi de tous ces travaux reprend après actualisation de la page.
-   Pour chaque lien, le pipeline **TOP N** : RsT lit la légende réelle, rédige le script, puis demande
-   à l'IA les **3 ou 5 noms** réellement cités (personnes, lieux, marques, œuvres…) — choix fait dans
-   l'interface. **Chaque nom donne lieu à sa propre recherche TikTok**, les candidates sont réparties
+   Pour chaque lien, le pipeline **RsT** : RsT lit la légende réelle, fait extraire par l'IA le
+   **sujet visuel principal** (objet/véhicule/produit + action : « voiture qui roule », pas juste
+   « voiture garée ») et rédige le script. La recherche TikTok se fait **directement par sujet**,
+   pas par les publications du compte : une hiérarchie de repli cherche le sujet exact + action,
+   puis la marque qui roule, puis la catégorie. Si aucun sujet n'est reconnaissable, RsT retombe
+   sur le TOP N classique (3 ou 5 noms-clés extraits de la légende, choix fait dans l'interface).
+   **Chaque nom donne lieu à sa propre recherche TikTok**, les candidates sont réparties
    nom par nom (tour de rôle) pour qu'aucun nom n'écrase les autres, puis RsT retient jusqu'à 20 bonnes
    sources dans les limites de durée et de temps Render et lance le montage en **plans de 5 s maximum**.
-   La recherche explore les publications du créateur de départ et chaque nom du TOP N à travers une
+   La recherche explore TikTok par sujet visuel (sujet exact + action → marque + action → catégorie),
+   puis chaque nom du TOP N à travers une
    **chaîne publique multi-sources** tolérante aux plages IP cloud : TikWM d'abord, puis — si ses
    endpoints de recherche répondent 403 depuis Render — les moteurs publics **SearXNG** (instances
    `opnxng.com` et `search.inetol.net`, qui agrègent Google/Bing/DuckDuckGo depuis leur propre
@@ -89,7 +94,7 @@ Le mode **Montage multi-source** accepte de 1 à 20 liens TikTok (un par ligne).
 
 Pendant le travail, les téléchargements sont séquentiels. Les aperçus couvrent **toute la durée autorisée** à environ 360p/6 FPS, sans audio, et sont supprimés juste après l'analyse. Une seule analyse Gemini est lancée par défaut (`2` maximum configurable). Les originaux, jamais les aperçus, alimentent un graphe FFmpeg final en 720 × 1280, 24 FPS, H.264/yuv420p. L'accroche utilise des plans de 0,6 à 1,5 s ; les scènes principales visent 4,5 à 5,5 s.
 
-**Contrôle qualité final.** Après la sélection, chaque plan retenu est relu **une deuxième fois** par Gemini sur un extrait de sa fenêtre exacte (720p, sans audio, quelques secondes). Un plan n'est monté que si sept drapeaux valent `false` : personne visible, watermark, logo ajouté, sticker/pseudo/bouton, texte qui n'est pas un vrai sous-titre TikTok, image illisible, sujet différent du script. Un plan non confirmé est écarté **avec sa scène**, et la sélection est relancée ; au bout de trois tours, le travail échoue avec le détail de chaque refus (URL, timestamps, raisons). Un contrôle impossible — réponse illisible, appel en timeout, source introuvable — écarte le plan comme un refus : mieux vaut un travail en échec qu'une vidéo non conforme. Le verdict de chaque plan est publié dans `plan_verification` du résultat. **Les plans d'un même tour sont vérifiés en un seul appel Gemini** (groupés par lots de 4 plans maximum, `TAILLE_LOT_VERIFICATION`) : un appel par plan multiplierait les appels et consommerait le quota journalier gratuit de Gemini (20 requêtes/jour, 5/min sur la clé gratuite).
+**Contrôle qualité final.** Après la sélection, chaque plan retenu est relu **une deuxième fois** par Gemini sur un extrait de sa fenêtre exacte (720p, sans audio, quelques secondes). Un plan n'est monté que si huit drapeaux valent `false` : personne visible, watermark, logo ajouté, sticker/pseudo/bouton, **tout texte visible (titre, légende, emoji, call-to-action — le script est livré en pièce jointe, jamais incrusté)**, image illisible, sujet différent du script, **sujet présent mais pas en action (voiture garée au lieu de rouler)**. Un plan non confirmé est écarté **avec sa scène**, et la sélection est relancée ; au bout de trois tours, le travail échoue avec le détail de chaque refus (URL, timestamps, raisons). Un contrôle impossible — réponse illisible, appel en timeout, source introuvable — écarte le plan comme un refus : mieux vaut un travail en échec qu'une vidéo non conforme. Le verdict de chaque plan est publié dans `plan_verification` du résultat. **Les plans d'un même tour sont vérifiés en un seul appel Gemini** (groupés par lots de 4 plans maximum, `TAILLE_LOT_VERIFICATION`) : un appel par plan multiplierait les appels et consommerait le quota journalier gratuit de Gemini (20 requêtes/jour, 5/min sur la clé gratuite).
 
 Une référence de style reproduit aussi fidèlement que possible le rythme, les coupes, les zooms et les sous-titres ASS. Une référence distincte n'alimente jamais les images du rendu ; elle n'est exportée que si elle figure aussi explicitement dans la liste des sources. Sans référence distincte, la première source sert également à analyser le style, mais demeure une source de contenu puisqu'elle a été sélectionnée comme telle.
 

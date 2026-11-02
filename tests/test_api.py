@@ -359,42 +359,51 @@ def _attendre_job(client, job_id, delai=30.0):
 
 def test_rst_trouve_de_vraies_videos_puis_monte(client, monkeypatch):
     appels = []
+    appels_search = []
 
     async def donnees_tikwm(_session, chemin, params):
         appels.append((chemin, dict(params)))
+        premier_search = not appels_search
+        if chemin == "/feed/search":
+            appels_search.append(dict(params))
         if chemin == "/":
             return {
                 "id": "111", "title": "Recette de pancakes faciles #cuisine #food",
                 "duration": 21, "author": {"unique_id": "chef", "nickname": "Chef"},
             }
         if chemin == "/user/posts":
-            videos = [{
-                # La vidéo de départ ne doit jamais devenir candidate.
-                "video_id": "111", "title": "seed", "duration": 21,
-                "author": {"unique_id": "chef"},
-            }]
-            for i in range(12):
-                videos.append({
-                    "video_id": f"1{i + 12}", "title": f"Recette numéro {i}",
-                    "duration": 12 + i % 5, "author": {"unique_id": "chef"},
-                })
-            videos.append({"video_id": "900", "title": "trop long", "duration": 400, "author": {"unique_id": "chef"}})
-            videos.append({"video_id": "901", "title": "trop court", "duration": 2, "author": {"unique_id": "chef"}})
-            videos.append({"video_id": "902", "title": "durée inconnue", "duration": None, "author": {"unique_id": "chef"}})
-            return {"videos": videos}
+            # Flux RsT nouveau : on ne cherche plus les publications du compte,
+            # mais directement par sujet. Ce mock reste pour la sécurité.
+            return {"videos": []}
         if chemin == "/feed/search":
             # Chaque nom du TOP N ramène ses propres vidéos, jamais les mêmes.
             mot = params["keywords"]
-            return {"videos": [
+            videos = [
                 {"video_id": f"2{abs(hash(mot)) % 900:03d}{i}", "title": f"{mot} {i}",
                  "duration": 14 + i % 3, "author": {"unique_id": f"auteur_{i}"}}
-                for i in range(4)
-            ]}
+                for i in range(8)
+            ]
+            # Vidéos hors durée : ajoutées une fois pour le premier mot-clé cherché.
+            if premier_search:
+                videos.extend([
+                    {"video_id": "900", "title": "trop long", "duration": 400,
+                     "author": {"unique_id": "auteur_x"}},
+                    {"video_id": "901", "title": "trop court", "duration": 2,
+                     "author": {"unique_id": "auteur_x"}},
+                    {"video_id": "902", "title": "durée inconnue", "duration": None,
+                     "author": {"unique_id": "auteur_x"}},
+                ])
+            return {"videos": videos}
         raise AssertionError(f"endpoint TikWM inattendu : {chemin}")
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
+    # Le sujet visuel est extrait par IA ; dans ce test on ne le simule pas pour
+    # garder le flux TOP N classique (la recherche par sujet est testée séparément).
+    async def extraire_sujet_vide(*_args, **_kw):
+        return ({"sujet": "", "requetes": []}, app.ResultatTexte(texte="{}", fournisseur="groq"))
+    monkeypatch.setattr(app, "extraire_sujet_rst", extraire_sujet_vide)
 
     async def script(_texte, *_args):
         return (
@@ -517,13 +526,22 @@ def test_rst_ecarte_les_videos_generiques_pour_un_sujet_telephone(client, monkey
                 "duration": 21, "author": {"unique_id": "actu"},
             }
         if chemin == "/user/posts":
-            return {"videos": [*telephone, *generiques]}
-        if chemin == "/feed/search":
+            # Flux RsT nouveau : on ne cherche plus les publications du compte.
             return {"videos": []}
+        if chemin == "/feed/search":
+            # Recherche par sujet : retourne les vidéos téléphone et génériques
+            # pour que le filtre de pertinence puisse les trier.
+            return {"videos": [*telephone, *generiques]}
         raise AssertionError(f"endpoint TikWM inattendu : {chemin}")
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
+    # Le sujet visuel est « téléphone » : la recherche TikTok se fait par sujet,
+    # pas par publications du compte.
+    async def extraire_sujet_telephone(*_args, **_kw):
+        return ({"sujet": "téléphone", "action": "tenir en main", "marque": "",
+                 "requetes": ["téléphone"]}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
+    monkeypatch.setattr(app, "extraire_sujet_rst", extraire_sujet_telephone)
 
     async def script(_texte, *_args):
         return ({"hook": "Hook téléphone", "corps": "Corps du script téléphone.",
@@ -575,6 +593,10 @@ def test_rst_aucune_video_trouvee_echoue_honnetement(client, monkeypatch):
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
+    # Le sujet visuel n'est pas identifiable : pas de recherche par sujet.
+    async def extraire_sujet_vide(*_args, **_kw):
+        return ({"sujet": "", "requetes": []}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
+    monkeypatch.setattr(app, "extraire_sujet_rst", extraire_sujet_vide)
 
     async def script(_texte, *_args):
         return ({"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "rare"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
@@ -1217,17 +1239,21 @@ def test_gemini_503_puis_200_le_travail_rst_finit_complete(client, monkeypatch, 
                 "duration": 20, "author": {"unique_id": "chef", "nickname": "Chef"},
             }
         if chemin == "/user/posts":
+            return {"videos": []}
+        if chemin == "/feed/search":
             return {"videos": [
                 {"video_id": f"3{i:02d}", "title": f"Gâteau numéro {i}",
                  "duration": 12 + i, "author": {"unique_id": "chef"}}
                 for i in range(1, 5)
             ]}
-        if chemin == "/feed/search":
-            return {"videos": []}
         raise AssertionError(f"endpoint TikWM inattendu : {chemin}")
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
+    # Le sujet visuel n'est pas identifiable : pas de recherche par sujet.
+    async def extraire_sujet_vide(*_args, **_kw):
+        return ({"sujet": "", "requetes": []}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
+    monkeypatch.setattr(app, "extraire_sujet_rst", extraire_sujet_vide)
     # Gemini seul écrit le script : le scénario503→200 doit passer par ses retries.
     monkeypatch.setattr(app.CONFIG, "groq_api_key", "")
     monkeypatch.setattr(app.CONFIG, "mistral_api_key", "")
@@ -1504,7 +1530,7 @@ def test_controle_qualite_rejet_valide_exclut_le_plan_sans_echec_de_travail(
             "conforme": False, "personnes_visibles": True, "watermark": False,
             "logo_ajoute": False, "autre_element_superpose": False,
             "texte_non_sous_titre": False, "flou_ou_illisible": False,
-            "hors_sujet": False, "raisons": ["une main est visible dans le cadre"],
+            "hors_sujet": False, "action_absente": False, "raisons": ["une main est visible dans le cadre"],
         })
 
     verdict = asyncio.run(studio_montage.verifier_conformite_extrait(
@@ -1791,6 +1817,10 @@ def test_rst_cinq_noms_lance_cinq_recherches_et_couvre_chaque_nom(client, monkey
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
     # Aucune source publique n'est contactée dans les tests unitaires.
     monkeypatch.setattr(app, "_decouvrir_publique", decouverte_publique_vide)
+    # Pas de sujet visuel identifiable : la recherche se fait par TOP N.
+    async def extraire_sujet_vide(*_args, **_kw):
+        return ({"sujet": "", "requetes": []}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
+    monkeypatch.setattr(app, "extraire_sujet_rst", extraire_sujet_vide)
 
     async def script(_texte, *_args):
         return ({"hook": "Hook", "corps": "Corps.", "mot_cle_broll": "football"}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
@@ -1820,8 +1850,8 @@ def test_rst_cinq_noms_lance_cinq_recherches_et_couvre_chaque_nom(client, monkey
 
     assert job["nombre_noms"] == 5
     assert job["noms"] == noms_ia
-    # Le fil de l'auteur ouvre la marche, puis une recherche par nom, dans l'ordre.
-    assert job["search_queries"] == ["@foot", *noms_ia]
+    # Recherche TikTok directe par nom (pas les publications du compte).
+    assert job["search_queries"] == list(noms_ia)
     assert sorted(job["noms_couverts"]) == sorted(noms_ia)  # aucun nom laissé de côté
     # Le montage RsT impose des plans de 5 s maximum, la vidéo de départ sert de
     # référence de style, et le mode pertinence visuelle stricte est actif.
@@ -2341,6 +2371,10 @@ def test_rst_bascule_sur_les_sources_publiques_si_tikwm_recherche_repond_403(cli
         raise AssertionError(f"Chemin TikWM inattendu : {chemin}")
 
     monkeypatch.setattr(app, "_donnees_tikwm", donnees_tikwm)
+    # Pas de sujet visuel identifiable : pas de recherche par sujet.
+    async def extraire_sujet_vide(*_args, **_kw):
+        return ({"sujet": "", "requetes": []}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
+    monkeypatch.setattr(app, "extraire_sujet_rst", extraire_sujet_vide)
 
     async def decouvrir_moteur(_session, moteur, *, auteur="", requete="", limite=20):
         appels_moteurs.append({"moteur": moteur, "auteur": auteur, "requete": requete})
@@ -2405,24 +2439,23 @@ def test_rst_bascule_sur_les_sources_publiques_si_tikwm_recherche_repond_403(cli
 
     # La chaîne publique a bien été utilisée : DuckDuckGo a répondu pour l'auteur
     # et pour chaque nom du TOP N.
-    assert any(a.get("auteur") == "techreview" for a in appels_moteurs)
+    assert any(a.get("requete") or a.get("auteur") for a in appels_moteurs)
     assert any(a.get("requete") == "Galaxy A56" for a in appels_moteurs)
     assert any(a.get("requete") == "Honor Magic 7 Pro" for a in appels_moteurs)
 
     # Chaque candidate porte son origine réelle (source + mode + recherche).
     trouvees = job["found_videos"]
-    assert len(trouvees) == 3
+    assert len(trouvees) == 2
     assert {v["origin"] for v in trouvees} == {
-        "DuckDuckGo via relais : publications de @techreview",
         "DuckDuckGo : recherche « Galaxy A56 »",
         "DuckDuckGo via relais de traduction : recherche « Honor Magic 7 Pro »",
     }
     # Les métadonnées viennent de TikWM /api/, jamais de la source de découverte.
-    assert {v["duration"] for v in trouvees} == {18.0, 16.0, 22.0}
+    assert {v["duration"] for v in trouvees} == {16.0, 22.0}
 
     # Chaque lien découvert a été revalidé par TikWM /api/ (la vidéo de départ incluse).
     validations = [params for chemin, params in appels_tikwm if chemin == "/"]
-    assert len(validations) == 4
+    assert len(validations) == 3
 
     # Après le premier 403, les endpoints de recherche TikWM ne sont plus réessayés.
     appels_search = [c for c, _ in appels_tikwm if c in {"/user/posts", "/feed/search"}]
@@ -3487,25 +3520,25 @@ def test_les_prompts_exigent_le_doute_et_la_vraie_transcription(client):
     assert "texte_sous_titres = false" in analyse
     for drapeau in ("personne_visible", "logo_visible", "autre_element_superpose", "watermark"):
         assert drapeau in analyse
-    # Les sept drapeaux doivent tous être remplis : un drapeau absent vaut « présent ».
+    # Les drapeaux d'analyse doivent tous être remplis : un drapeau absent vaut « présent ».
     assert "Remplis TOUJOURS les sept drapeaux" in analyse
 
     verification = studio_montage.PROMPT_VERIFICATION
     assert "début {debut:.2f} s" in verification
     for drapeau in (
         "personnes_visibles", "watermark", "logo_ajoute", "autre_element_superpose",
-        "texte_non_sous_titre", "flou_ou_illisible", "hors_sujet",
+        "texte_non_sous_titre", "flou_ou_illisible", "hors_sujet", "action_absente",
     ):
         assert drapeau in verification
-    # Un plan sans les sept drapeaux à false est refusé.
-    assert "QUE SI les sept drapeaux valent false" in verification
+    # Un plan sans les huit drapeaux à false est refusé.
+    assert "QUE SI les huit drapeaux valent false" in verification
 
     # Réponse incomplète : chaque drapeau d'interdiction vaut « élément présent ».
     vide = studio_montage.ReponseVerification.model_validate({})
     assert vide.conforme is False
     assert vide.personnes_visibles and vide.watermark and vide.logo_ajoute
     assert vide.autre_element_superpose and vide.texte_non_sous_titre
-    assert vide.flou_ou_illisible and vide.hors_sujet
+    assert vide.flou_ou_illisible and vide.hors_sujet and vide.action_absente
 
 
 def test_sst_reduit_les_sources_sous_la_limite_de_temps_comme_rst(client, monkeypatch):

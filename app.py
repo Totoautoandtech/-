@@ -2006,6 +2006,27 @@ async def generer_script(source_texte: str, fournisseur: str = "auto") -> tuple[
     return script, resultat
 
 
+PROMPT_SUJET_RST = (
+    "Tu analyses une vidéo TikTok de départ pour en extraire le SUJET VISUEL PRINCIPAL "
+    "à chercher pour le montage. Ton rôle est d'identifier ce qui est réellement filmé "
+    "(objet, véhicule, produit, animal, scène) et comment il est filmé (en action ou statique). "
+    "Réponds UNIQUEMENT avec un JSON valide, sans texte avant/après, sans balises markdown, "
+    "avec exactement quatre clés :\n"
+    '- "sujet" : l\'objet/véhicule/produit principal filmé (2 à 40 caractères), sans hashtag. '
+    "Exemple : « corvette c7 », « smartphone », « café », « chat ». Si le sujet est abstrait, "
+    "retiens le sujet visuel concret le plus proche.\n"
+    '- "action" : comment le sujet est filmé : « roule », « tourne », « ouvre », « saute », '
+    "« statique », « utilisé », etc. Si le sujet bouge, indique l'action réelle.\n"
+    '- "marque" : la marque ou le modèle du sujet si identifiable (2 à 40 caractères), '
+    "sinon une chaîne vide. Exemple : « chevrolet corvette ».\n"
+    '- "requetes" : un tableau de 3 requêtes de recherche TikTok, classées de la plus '
+    "précise à la plus générale : sujet exact + action, marque + action, catégorie + action. "
+    "Chaque requête fait 2 à 40 caractères, sans hashtag, utilisable tel quel.\n"
+    "N'invente jamais un sujet qui ne serait pas filmé dans la vidéo : si le sujet est "
+    "abstrait, retiens le sujet visuel concret le plus proche. Réponds strictement avec ce JSON."
+)
+
+
 PROMPT_NOMS_RST = (
     "Tu analyses la légende d'une vidéo TikTok. Ton rôle est d'en extraire les NOMS "
     "réellement évoqués : personnes, personnages, lieux, marques, équipes, œuvres, objets "
@@ -2056,6 +2077,51 @@ def borner_nombre_noms_rst(valeur: Any) -> int:
     except (TypeError, ValueError):
         return RST_NOMS_DEFAUT
     return demande if demande in RST_NOMS_CHOIX else RST_NOMS_DEFAUT
+
+
+async def extraire_sujet_rst(
+    legende: str, mot_cle_broll: str = "", fournisseur: str = "auto",
+) -> tuple[dict, Optional[ResultatTexte]]:
+    """Extrait le sujet visuel principal (objet/véhicule + action) de la vidéo source.
+
+    Le nouveau prompt identifie le sujet réellement filmé (objet/véhicule/produit),
+    l'action (comment il est filmé) et propose une hiérarchie de requêtes de recherche
+    de la plus précise à la plus générale : sujet exact + action, marque + action,
+    catégorie + action. Fail-closed : si rien n'est reconnaissable, on retombe sur
+    les mots-clés réellement présents dans la légende. Aucun sujet n'est inventé.
+    """
+    sujet: dict = {"sujet": "", "action": "", "marque": "", "requetes": []}
+    resultat: Optional[ResultatTexte] = None
+    try:
+        resultat = await appel_texte_fournisseur(
+            system=PROMPT_SUJET_RST, user=legende,
+            temperature=0.2, json_mode=True, fournisseur=fournisseur,
+        )
+        donnees = _parser_json(resultat.texte)
+        if isinstance(donnees, dict):
+            requetes = [
+                str(q).strip()[:40] for q in (donnees.get("requetes") or [])
+                if str(q).strip()
+            ][:3]
+            sujet = {
+                "sujet": str(donnees.get("sujet") or "").strip()[:40],
+                "action": str(donnees.get("action") or "").strip()[:40],
+                "marque": str(donnees.get("marque") or "").strip()[:40],
+                "requetes": requetes,
+            }
+    except (ErreurApp, ErreurMontage) as exc:
+        logger.warning("[RsT] extraction du sujet visuel par l'IA indisponible : %s", exc)
+        resultat = None
+
+    # Repli honnête : si le sujet est vide, on retombe sur les mots-clés de la légende.
+    if not sujet.get("sujet"):
+        mots = _extraire_mots_cles_rst(legende, mot_cle_broll, limite=3)
+        if mots:
+            sujet = {
+                "sujet": mots[0], "action": "", "marque": "",
+                "requetes": [m for m in mots[:3]],
+            }
+    return sujet, resultat
 
 
 async def extraire_noms_rst(
@@ -3670,9 +3736,25 @@ async def _produire_rst(
             statut="analysing", progress=20,
             detail=(
                 f"{len(noms)} nom(s) à chercher : {', '.join(noms)}" if noms
-                else "Aucun nom exploitable — recherche élargie à l'auteur"
+                else "Aucun nom exploitable — recherche par sujet visuel"
             ),
             noms=noms, nombre_noms=nombre_noms,
+        )
+
+        # Sujet VISUEL : identifie l'objet/véhicule réellement filmé et son action.
+        # La recherche se fait directement sur TikTok par sujet (pas par publications du compte).
+        sujet, resultat_sujet = await extraire_sujet_rst(
+            legende, script.get("mot_cle_broll", ""), requete.fournisseur
+        )
+        _noter_fournisseur_texte(contexte, resultat_sujet)
+        contexte.update(
+            statut="analysing", progress=21,
+            detail=(
+                f"Sujet visuel : {sujet.get('sujet', '?')}"
+                + (f" (action : {sujet.get('action', '?')})" if sujet.get("action") else "")
+                + (f" — marque : {sujet.get('marque', '?')}" if sujet.get("marque") else "")
+            ),
+            sujet=sujet,
         )
 
         requetes_reelles: list[str] = []
@@ -3720,49 +3802,70 @@ async def _produire_rst(
             contexte.update(
                 statut="searching", progress=progression, detail=detail,
                 found_videos=list(candidats.values()), search_queries=list(requetes_reelles),
-                noms=noms,
+                noms=noms, sujet=sujet,
             )
 
-        # 1) Les autres publications réelles du créateur de la vidéo de départ.
-        if auteur:
-            requetes_reelles.append(f"@{auteur}")
-            contexte.update(statut="searching", progress=24, detail=f"Publications de @{auteur}")
+        # 1) Recherche DIRECTE sur TikTok par SUJET VISUEL (pas les publications du compte).
+        # Hiérarchie de repli : sujet exact + action → marque + action → catégorie + action.
+        # Les hashtags ne servent à rien : on cherche par sujet concret, pas par mot-clé abstrait.
+        sujet_recherche = sujet.get("requetes") or []
+        if not sujet_recherche and sujet.get("sujet"):
+            sujet_recherche = [sujet["sujet"]]
+        if not sujet_recherche:
+            echecs_recherche.append("aucun sujet visuel identifiable")
+
+        libelles_hierarchie = ["sujet exact + action", "marque + action", "catégorie + action"]
+        for index_requete, requete_sujet in enumerate(sujet_recherche):
+            if len(candidats) >= CONFIG.rst_candidats_max:
+                echecs_recherche.append(f"« {requete_sujet} » : quota de candidates déjà atteint")
+                continue
+            requetes_reelles.append(requete_sujet)
+            libelle = libelles_hierarchie[index_requete] if index_requete < 3 else "recherche élargie"
+            progression = 24 + int(5 * index_requete)
+            contexte.update(
+                statut="searching", progress=progression,
+                detail=f"Recherche TikTok par sujet ({libelle}) : « {requete_sujet} »",
+                sujet=sujet,
+            )
             nouvelles = 0
             if not tikwm_recherche_bloquee:
                 try:
                     await asyncio.sleep(1.0)  # cadence respectueuse de l'API publique TikWM
-                    publications = await _donnees_tikwm(
-                        session, "/user/posts",
-                        {"unique_id": auteur, "count": str(min(CONFIG.rst_candidats_max, 40))},
+                    resultats = await _donnees_tikwm(
+                        session, "/feed/search",
+                        {"keywords": requete_sujet, "count": str(min(CONFIG.rst_candidats_max, 20))},
                     )
                     nouvelles = await accumuler(
-                        publications.get("videos") or [], f"publications de @{auteur}"
+                        resultats.get("videos") or [], f"recherche « {requete_sujet} »", requete_sujet
                     )
                 except ErreurTikwm403:
-                    logger.warning("[RsT] TikWM /user/posts bloqué (403) : découverte publique pour @%s", auteur)
+                    logger.warning("[RsT] TikWM /feed/search bloqué (403) : découverte publique pour « %s »", requete_sujet)
                     tikwm_recherche_bloquee = True
                 except ErreurApp as exc:
-                    logger.warning("[RsT] publications de @%s indisponibles : %s", auteur, exc)
-                    echecs_recherche.append(f"@{auteur} : {exc}")
+                    logger.warning("[RsT] recherche « %s » indisponible : %s", requete_sujet, exc)
+                    echecs_recherche.append(f"« {requete_sujet} » : {exc}")
 
-            # TikWM bloqué (403) ou fil de l'auteur vide : la chaîne publique prend
-            # le relais (moteurs de recherche, archive web, miroir Urlebird).
+            # TikWM bloqué (403) ou aucun résultat : la chaîne publique prend le relais.
             if tikwm_recherche_bloquee or nouvelles == 0:
                 contexte.update(
-                    statut="searching", progress=26,
-                    detail=f"Recherche publique : publications de @{auteur}",
+                    statut="searching", progress=progression,
+                    detail=f"Recherche publique par sujet ({libelle}) : « {requete_sujet} »",
+                    sujet=sujet,
                 )
                 liens_publiques = await _decouvrir_publique(
-                    session, auteur=auteur, limite=min(CONFIG.rst_candidats_max, 40),
+                    session, requete=requete_sujet, limite=min(CONFIG.rst_candidats_max, 20),
                     etat=etat_sources,
                 )
                 nouvelles += await valider_et_accumuler(
-                    liens_publiques, limite_nouvelles=min(CONFIG.rst_candidats_max, 40)
+                    liens_publiques, requete_sujet, limite_nouvelles=min(CONFIG.rst_candidats_max, 20)
                 )
 
-            if nouvelles == 0 and not any(e.startswith(f"@{auteur}") for e in echecs_recherche):
-                echecs_recherche.append(f"@{auteur} : aucune autre publication")
-            publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", 30)
+            if nouvelles == 0 and not any(e.startswith(f"« {requete_sujet} »") for e in echecs_recherche):
+                echecs_recherche.append(f"« {requete_sujet} » : aucun résultat")
+            publier(f"{len(candidats)} vidéo(s) réellement trouvée(s)", progression)
+            # Si le sujet exact a ramené des vidéos, les replis plus larges ne sont pas nécessaires.
+            if nouvelles > 0 and index_requete == 0:
+                break
 
         # 2) Une recherche TikTok par nom du TOP N, dans l'ordre d'importance.
         # Chaque nom reçoit sa part du quota pour qu'aucun n'écrase les autres.
@@ -3876,7 +3979,7 @@ async def _produire_rst(
     contexte.update(
         statut="searching", progress=42,
         detail=f"{len(trouves)} vidéo(s) trouvée(s) — sélection des meilleures sources",
-        found_videos=trouves, search_queries=requetes_reelles, noms=noms,
+        found_videos=trouves, search_queries=requetes_reelles, noms=noms, sujet=sujet,
     )
     if not trouves:
         # Recherche vide : on dit exactement ce qui a été tenté et ce que ça a donné.
@@ -3933,7 +4036,7 @@ async def _produire_rst(
             f"{len(selectionnees)} candidate(s) en validation sur {len(trouves)} trouvée(s)"
             + (f" — {len(noms_couverts)}/{len(noms)} nom(s) couvert(s)" if noms else "")
         ),
-        found_videos=trouves, search_queries=requetes_reelles, noms=noms,
+        found_videos=trouves, search_queries=requetes_reelles, noms=noms, sujet=sujet,
         plafond_reel=plafond_reel,
     )
 
