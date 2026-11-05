@@ -783,9 +783,10 @@ async def _extraire_texte_page(session: aiohttp.ClientSession, url: str) -> str:
     url = _valider_url(url)
 
     async def _appel():
-        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-            if resp.status != 200:
-                raise ErreurApp(f"Page inaccessible ({resp.status})")
+        try:
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status != 200:
+                    raise ErreurApp(f"Page inaccessible ({resp.status})")
             morceaux: list[bytes] = []
             total = 0
             async for bloc in resp.content.iter_chunked(64 * 1024):
@@ -795,6 +796,11 @@ async def _extraire_texte_page(session: aiohttp.ClientSession, url: str) -> str:
                 morceaux.append(bloc[:restant])
                 total += min(len(bloc), restant)
             return b"".join(morceaux).decode(resp.charset or "utf-8", errors="replace")
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+            raise ErreurApp(
+                "Page inaccessible depuis le serveur. Vérifie la connectivité "
+                "ou réessaie plus tard."
+            ) from exc
 
     html = await _avec_retry(_appel, tentatives=2, etape="récupération de la page")
     soup = await asyncio.to_thread(BeautifulSoup, html, "html.parser")
@@ -2302,11 +2308,17 @@ async def chercher_broll(mot_cle: str, duree_visee: float) -> list[str]:
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
         async def _appel():
-            async with session.get(url, headers=headers, params=params) as resp:
-                if resp.status != 200:
-                    texte = await resp.text()
-                    raise ErreurApp(f"Pexels a répondu {resp.status} : {texte[:200]}")
-                return await resp.json()
+            try:
+                async with session.get(url, headers=headers, params=params) as resp:
+                    if resp.status != 200:
+                        texte = await resp.text()
+                        raise ErreurApp(f"Pexels a répondu {resp.status} : {texte[:200]}")
+                    return await resp.json()
+            except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+                raise ErreurApp(
+                    "Pexels inaccessible depuis le serveur. Vérifie la connectivité "
+                    "ou réessaie plus tard."
+                ) from exc
 
         donnees = await _avec_retry(_appel, etape=f"recherche Pexels « {mot_cle} »")
 
