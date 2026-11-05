@@ -2990,15 +2990,21 @@ async def _donnees_tikwm(session: aiohttp.ClientSession, chemin: str, params: di
     url = f"https://www.tikwm.com/api{chemin}"
 
     async def _appel():
-        async with session.get(url, params=params, headers=ENTETES_TIKWM) as resp:
-            if resp.status == 403:
-                raise ErreurTikwm403(f"TikWM inaccessible (403)")
-            if resp.status != 200:
-                raise ErreurApp(f"TikWM inaccessible ({resp.status})")
-            try:
-                return await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
-                raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        try:
+            async with session.get(url, params=params, headers=ENTETES_TIKWM) as resp:
+                if resp.status == 403:
+                    raise ErreurTikwm403("TikWM inaccessible (403)")
+                if resp.status != 200:
+                    raise ErreurApp(f"TikWM inaccessible ({resp.status})")
+                try:
+                    return await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                    raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+            raise ErreurApp(
+                "TikWM inaccessible depuis le serveur. Vérifie la connectivité "
+                "ou réessaie plus tard."
+            ) from exc
 
     donnees = await _avec_retry(_appel, tentatives=2, etape=f"TikWM {chemin}")
     if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
