@@ -5420,23 +5420,30 @@ async def _executer_job(job_id: str, fabrique, session_id: str) -> None:
             error="Travail annulé à la demande de l’utilisateur.",
         )
     except asyncio.TimeoutError:
+        message_erreur = (
+            f"Le travail a dépassé la limite globale de {CONFIG.delai_job // 60} min "
+            f"{CONFIG.delai_job % 60:02d} pendant « {contexte.derniere_etape} ». "
+            "Augmente JOB_TIMEOUT_SECONDES sur l'hébergeur (jusqu'à 3600 s) "
+            "ou réduis le nombre ou la durée des sources."
+        )
+        erreur_detail = _formater_erreur_copiable(asyncio.TimeoutError(message_erreur), contexte)
         contexte.update(
-            statut="failed",
-            detail=f"Limite globale atteinte pendant « {contexte.derniere_etape} »",
-            error=(
-                f"Le travail a dépassé la limite globale de {CONFIG.delai_job // 60} min "
-                f"{CONFIG.delai_job % 60:02d} pendant « {contexte.derniere_etape} ». "
-                "Augmente JOB_TIMEOUT_SECONDES sur l'hébergeur (jusqu'à 3600 s) "
-                "ou réduis le nombre ou la durée des sources."
-            ),
+            statut="failed", detail=erreur_detail["detail"],
+            error=message_erreur, error_detail=erreur_detail,
         )
     except (ErreurApp, ErreurMontage) as exc:
-        contexte.update(statut="failed", detail="Travail interrompu", error=str(exc))
+        erreur_detail = _formater_erreur_copiable(exc, contexte)
+        contexte.update(
+            statut="failed", detail=erreur_detail["detail"],
+            error=str(exc), error_detail=erreur_detail,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[%s] erreur inattendue", job_id)
+        message_erreur = f"Erreur inattendue pendant « {contexte.derniere_etape} » : {exc}"
+        erreur_detail = _formater_erreur_copiable(exc, contexte)
         contexte.update(
-            statut="failed", detail="Erreur serveur détaillée",
-            error=f"Erreur inattendue pendant « {contexte.derniere_etape} » : {exc}",
+            statut="failed", detail=erreur_detail["detail"],
+            error=message_erreur, error_detail=erreur_detail,
         )
     finally:
         JOB_TASKS.pop(job_id, None)
@@ -6277,7 +6284,7 @@ async def historique_jobs(request: Request):
     positions = {identifiant: position + 1 for position, identifiant in enumerate(file_ids)}
     champs = {
         "job_id", "type", "title", "batch_id", "batch_index", "batch_total",
-        "status", "progress", "detail", "url", "error", "drive",
+        "status", "progress", "detail", "url", "error", "error_detail", "drive",
         "created_at_unix", "updated_at_unix", "elapsed_seconds", "reference_warning",
     }
     historique = []
