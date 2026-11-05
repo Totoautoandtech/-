@@ -722,6 +722,11 @@ async def _resoudre_video_tiktok(session: aiohttp.ClientSession, url: str) -> st
                         raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
         except asyncio.TimeoutError as exc:
             raise ErreurApp(f"TikWM n’a pas répondu sous {CONFIG.delai_tikwm} secondes.") from exc
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+            raise ErreurApp(
+                "TikWM inaccessible depuis le serveur. Vérifie la connectivité "
+                "ou réessaie plus tard."
+            ) from exc
         if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
             message = donnees.get("msg", "réponse invalide") if isinstance(donnees, dict) else "réponse invalide"
             raise ErreurApp(f"TikWM : {message}")
@@ -748,13 +753,19 @@ async def _extraire_texte_tiktok(session: aiohttp.ClientSession, url: str) -> st
     url = _valider_url(url, "Lien TikTok")
 
     async def _appel():
-        async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
-            if resp.status != 200:
-                raise ErreurApp(f"TikWM inaccessible ({resp.status})")
-            try:
-                donnees = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
-                raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        try:
+            async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
+                if resp.status != 200:
+                    raise ErreurApp(f"TikWM inaccessible ({resp.status})")
+                try:
+                    donnees = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                    raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+            raise ErreurApp(
+                "TikWM inaccessible depuis le serveur. Vérifie la connectivité "
+                "ou réessaie plus tard."
+            ) from exc
         if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
             message = donnees.get("msg", "réponse invalide") if isinstance(donnees, dict) else "réponse invalide"
             raise ErreurApp(f"TikWM : {message}")
