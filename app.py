@@ -605,9 +605,9 @@ def _formater_erreur_copiable(exc: Exception, contexte: Optional["ContexteJob"] 
             break
     detail = texte[:200] if len(texte) > 200 else texte
     copiable = (
-        f"[{type_erreur}] {texte}\\n"
-        f"Étape : {etape or 'inconnue'}\\n"
-        f"Fournisseur : {fournisseur or 'non spécifié'}\\n"
+        f"[{type_erreur}] {texte}\n"
+        f"Étape : {etape or 'inconnue'}\n"
+        f"Fournisseur : {fournisseur or 'non spécifié'}\n"
         f"Message complet : {texte}"
     )
     return {
@@ -722,6 +722,11 @@ async def _resoudre_video_tiktok(session: aiohttp.ClientSession, url: str) -> st
                         raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
         except asyncio.TimeoutError as exc:
             raise ErreurApp(f"TikWM n’a pas répondu sous {CONFIG.delai_tikwm} secondes.") from exc
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+            raise ErreurApp(
+                "TikWM inaccessible depuis le serveur. Vérifie la connectivité "
+                "ou réessaie plus tard."
+            ) from exc
         if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
             message = donnees.get("msg", "réponse invalide") if isinstance(donnees, dict) else "réponse invalide"
             raise ErreurApp(f"TikWM : {message}")
@@ -748,13 +753,19 @@ async def _extraire_texte_tiktok(session: aiohttp.ClientSession, url: str) -> st
     url = _valider_url(url, "Lien TikTok")
 
     async def _appel():
-        async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
-            if resp.status != 200:
-                raise ErreurApp(f"TikWM inaccessible ({resp.status})")
-            try:
-                donnees = await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
-                raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        try:
+            async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
+                if resp.status != 200:
+                    raise ErreurApp(f"TikWM inaccessible ({resp.status})")
+                try:
+                    donnees = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                    raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+            raise ErreurApp(
+                "TikWM inaccessible depuis le serveur. Vérifie la connectivité "
+                "ou réessaie plus tard."
+            ) from exc
         if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
             message = donnees.get("msg", "réponse invalide") if isinstance(donnees, dict) else "réponse invalide"
             raise ErreurApp(f"TikWM : {message}")
@@ -772,9 +783,10 @@ async def _extraire_texte_page(session: aiohttp.ClientSession, url: str) -> str:
     url = _valider_url(url)
 
     async def _appel():
-        async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-            if resp.status != 200:
-                raise ErreurApp(f"Page inaccessible ({resp.status})")
+        try:
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status != 200:
+                    raise ErreurApp(f"Page inaccessible ({resp.status})")
             morceaux: list[bytes] = []
             total = 0
             async for bloc in resp.content.iter_chunked(64 * 1024):
@@ -784,6 +796,11 @@ async def _extraire_texte_page(session: aiohttp.ClientSession, url: str) -> str:
                 morceaux.append(bloc[:restant])
                 total += min(len(bloc), restant)
             return b"".join(morceaux).decode(resp.charset or "utf-8", errors="replace")
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+            raise ErreurApp(
+                "Page inaccessible depuis le serveur. Vérifie la connectivité "
+                "ou réessaie plus tard."
+            ) from exc
 
     html = await _avec_retry(_appel, tentatives=2, etape="récupération de la page")
     soup = await asyncio.to_thread(BeautifulSoup, html, "html.parser")
@@ -2291,11 +2308,17 @@ async def chercher_broll(mot_cle: str, duree_visee: float) -> list[str]:
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
         async def _appel():
-            async with session.get(url, headers=headers, params=params) as resp:
-                if resp.status != 200:
-                    texte = await resp.text()
-                    raise ErreurApp(f"Pexels a répondu {resp.status} : {texte[:200]}")
-                return await resp.json()
+            try:
+                async with session.get(url, headers=headers, params=params) as resp:
+                    if resp.status != 200:
+                        texte = await resp.text()
+                        raise ErreurApp(f"Pexels a répondu {resp.status} : {texte[:200]}")
+                    return await resp.json()
+            except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+                raise ErreurApp(
+                    "Pexels inaccessible depuis le serveur. Vérifie la connectivité "
+                    "ou réessaie plus tard."
+                ) from exc
 
         donnees = await _avec_retry(_appel, etape=f"recherche Pexels « {mot_cle} »")
 
@@ -2990,15 +3013,21 @@ async def _donnees_tikwm(session: aiohttp.ClientSession, chemin: str, params: di
     url = f"https://www.tikwm.com/api{chemin}"
 
     async def _appel():
-        async with session.get(url, params=params, headers=ENTETES_TIKWM) as resp:
-            if resp.status == 403:
-                raise ErreurTikwm403(f"TikWM inaccessible (403)")
-            if resp.status != 200:
-                raise ErreurApp(f"TikWM inaccessible ({resp.status})")
-            try:
-                return await resp.json(content_type=None)
-            except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
-                raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        try:
+            async with session.get(url, params=params, headers=ENTETES_TIKWM) as resp:
+                if resp.status == 403:
+                    raise ErreurTikwm403("TikWM inaccessible (403)")
+                if resp.status != 200:
+                    raise ErreurApp(f"TikWM inaccessible ({resp.status})")
+                try:
+                    return await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, json.JSONDecodeError) as exc:
+                    raise ErreurApp("TikWM a renvoyé une réponse invalide.") from exc
+        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, aiohttp.ClientError) as exc:
+            raise ErreurApp(
+                "TikWM inaccessible depuis le serveur. Vérifie la connectivité "
+                "ou réessaie plus tard."
+            ) from exc
 
     donnees = await _avec_retry(_appel, tentatives=2, etape=f"TikWM {chemin}")
     if not isinstance(donnees, dict) or donnees.get("code") != 0 or "data" not in donnees:
@@ -5420,23 +5449,35 @@ async def _executer_job(job_id: str, fabrique, session_id: str) -> None:
             error="Travail annulé à la demande de l’utilisateur.",
         )
     except asyncio.TimeoutError:
+        exc = asyncio.TimeoutError(
+            f"Le travail a dépassé la limite globale de {CONFIG.delai_job // 60} min "
+            f"{CONFIG.delai_job % 60:02d} pendant « {contexte.derniere_etape} ». "
+            "Augmente JOB_TIMEOUT_SECONDES sur l'hébergeur (jusqu'à 3600 s) "
+            "ou réduis le nombre ou la durée des sources."
+        )
+        erreur_copiable = _formater_erreur_copiable(exc, contexte)
         contexte.update(
             statut="failed",
-            detail=f"Limite globale atteinte pendant « {contexte.derniere_etape} »",
-            error=(
-                f"Le travail a dépassé la limite globale de {CONFIG.delai_job // 60} min "
-                f"{CONFIG.delai_job % 60:02d} pendant « {contexte.derniere_etape} ». "
-                "Augmente JOB_TIMEOUT_SECONDES sur l'hébergeur (jusqu'à 3600 s) "
-                "ou réduis le nombre ou la durée des sources."
-            ),
+            detail=erreur_copiable["detail"],
+            error=str(exc),
+            error_detail=erreur_copiable,
         )
     except (ErreurApp, ErreurMontage) as exc:
-        contexte.update(statut="failed", detail="Travail interrompu", error=str(exc))
+        erreur_copiable = _formater_erreur_copiable(exc, contexte)
+        contexte.update(
+            statut="failed",
+            detail=erreur_copiable["detail"],
+            error=str(exc),
+            error_detail=erreur_copiable,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("[%s] erreur inattendue", job_id)
+        erreur_copiable = _formater_erreur_copiable(exc, contexte)
         contexte.update(
-            statut="failed", detail="Erreur serveur détaillée",
+            statut="failed",
+            detail=erreur_copiable["detail"],
             error=f"Erreur inattendue pendant « {contexte.derniere_etape} » : {exc}",
+            error_detail=erreur_copiable,
         )
     finally:
         JOB_TASKS.pop(job_id, None)
@@ -6277,7 +6318,7 @@ async def historique_jobs(request: Request):
     positions = {identifiant: position + 1 for position, identifiant in enumerate(file_ids)}
     champs = {
         "job_id", "type", "title", "batch_id", "batch_index", "batch_total",
-        "status", "progress", "detail", "url", "error", "drive",
+        "status", "progress", "detail", "url", "error", "error_detail", "drive",
         "created_at_unix", "updated_at_unix", "elapsed_seconds", "reference_warning",
     }
     historique = []
