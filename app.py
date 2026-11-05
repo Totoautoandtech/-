@@ -582,6 +582,44 @@ class ErreurApp(Exception):
     """Erreur métier, affichable telle quelle à l'utilisateur."""
 
 
+def _formater_erreur_copiable(exc: Exception, contexte: Optional["ContexteJob"] = None) -> dict[str, str]:
+    """Formate une erreur en un objet structuré et copiable pour le débogage.
+
+    Chaque erreur contient :
+    - type : classe de l'exception
+    - message : texte complet de l'erreur
+    - detail : résumé court pour l'affichage
+    - copiable : texte pré-formaté pour copier-coller dans un chat IA
+    - etape : dernière étape du job au moment de l'erreur
+    """
+    texte = str(exc)
+    type_erreur = type(exc).__name__
+    etape = ""
+    fournisseur = ""
+    if contexte is not None:
+        etape = str(contexte.derniere_etape or "")
+        fournisseur = str(contexte.job.get("fournisseur_texte", "") or "")
+    for nom in ("Gemini", "Groq", "Mistral"):
+        if nom in texte:
+            fournisseur = fournisseur or nom
+            break
+    detail = texte[:200] if len(texte) > 200 else texte
+    copiable = (
+        f"[{type_erreur}] {texte}\\n"
+        f"Étape : {etape or 'inconnue'}\\n"
+        f"Fournisseur : {fournisseur or 'non spécifié'}\\n"
+        f"Message complet : {texte}"
+    )
+    return {
+        "type": type_erreur,
+        "message": texte,
+        "detail": detail,
+        "copiable": copiable,
+        "etape": etape,
+        "fournisseur": fournisseur,
+    }
+
+
 class ErreurTikwm403(ErreurApp):
     """Erreur 403 renvoyée par TikWM signalant le blocage de la plage IP du serveur."""
 
@@ -1767,13 +1805,15 @@ async def _appel_openai_compatible(
                 except ErreurFournisseurTexte as exc:
                     echecs.append(str(exc))
                     _noter_erreur_fournisseur(fournisseur, str(exc))
-                    if exc.statut == 404:
-                        # Modèle invalide ou supprimé : le message clair est déjà
-                        # enregistré ; on passe au modèle suivant sans retente.
+                    if exc.statut in (400, 404):
+                        # Modèle invalide, indisponible ou refus de générer le JSON
+                        # (Groq renvoie 400 « Failed to generate JSON ») : ce n'est
+                        # pas une indisponibilité du fournisseur. On passe au modèle
+                        # suivant, puis au fournisseur suivant si tous échouent.
                         logger.warning(
-                            "[%s] modèle « %s » introuvable (404) : passage au modèle "
+                            "[%s] modèle « %s » refusé (%s) : passage au modèle "
                             "suivant. %s",
-                            libelle, modele, str(exc)[:200],
+                            libelle, modele, exc.statut, str(exc)[:200],
                         )
                         break
                     if not exc.temporaire:
