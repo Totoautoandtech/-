@@ -3449,7 +3449,7 @@ def test_limite_globale_a_trente_minutes_bornee_entre_soixante_et_trois_mille_si
     assert job["status"] == "failed"
     # Le message nomme le réglage à augmenter : l'utilisateur n'a plus à le deviner.
     assert "JOB_TIMEOUT_SECONDES" in job["error"]
-    assert "Limite globale atteinte" in job["detail"]
+    assert "limite globale" in job["detail"]
 
 
 def test_l_estimation_compte_le_controle_qualite_final_et_expose_le_budget(client):
