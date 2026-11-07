@@ -2809,7 +2809,8 @@ def texte_a_dire(script: dict[str, Any]) -> str:
 
 
 async def synthetiser_voix_off(
-    texte: str, destination: Path, budget: float = EDGE_TTS_DELAI
+    texte: str, destination: Path, budget: float = EDGE_TTS_DELAI,
+    voix: str = EDGE_TTS_VOIX,
 ) -> int:
     """Génère un MP3 avec edge-tts (gratuit, sans clé). Retourne la taille écrite.
 
@@ -2828,7 +2829,7 @@ async def synthetiser_voix_off(
     delai = max(1.0, min(EDGE_TTS_DELAI, float(budget)))
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        communicate = edge_tts.Communicate(propre, EDGE_TTS_VOIX, rate=EDGE_TTS_DEBIT)
+        communicate = edge_tts.Communicate(propre, voix, rate=EDGE_TTS_DEBIT)
         async with asyncio.timeout(delai):
             await communicate.save(str(destination))
     except asyncio.TimeoutError as exc:
@@ -4111,6 +4112,25 @@ async def _produire_rst(
 
     resolution = "1080" if (requete.mode == "qualite" and CONFIG.autoriser_export_1080) else "720"
     rapporteur = _rapporteur_decale(contexte, 45.0, 0.45)
+
+    # Générer la voix off via Edge-TTS si un nom de voix est fourni (pas un hash).
+    voix_off_path = None
+    valeur_voix = str(requete.voix_off or "").strip()
+    if valeur_voix and not re.fullmatch(r"[a-f0-9]{32}(\.[a-z0-9]{1,5})?", valeur_voix):
+        base = uuid.uuid4().hex
+        chemin_mp3 = DOSSIER_VIDEOS / f"{base}.mp3"
+        try:
+            await synthetiser_voix_off(
+                texte_a_dire(script), chemin_mp3, budget=budget_restant,
+                voix=valeur_voix,
+            )
+            voix_off_path = chemin_mp3
+            logger.info("[RsT] voix off générée : %s (%s)", chemin_mp3.name, valeur_voix)
+        except ErreurApp as exc:
+            logger.warning("[RsT] génération voix off échouée : %s", exc)
+    elif valeur_voix:
+        voix_off_path = _resoudre_voix_off(session_id, valeur_voix)
+
     resultat = await construire_montage_professionnel(
         liens=[candidate["url"] for candidate in selectionnees],
         # La vidéo de départ sert de RÉFÉRENCE DE STYLE (rythme, durée des plans,
@@ -4128,7 +4148,7 @@ async def _produire_rst(
         telechargeur=_telecharger_fichier,
         appel_gemini=lambda *args, **kw: _appel_gemini_brut(*args, rapporteur=rapporteur, **kw),
         intensite_transitions=requete.intensite_transitions,
-        voix_off=_resoudre_voix_off(session_id, requete.voix_off),
+        voix_off=voix_off_path,
     )
     # La construction a terminé toutes les validations visuelles nécessaires.
     for candidate in selectionnees:
