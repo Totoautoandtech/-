@@ -2376,7 +2376,7 @@ def test_rst_bascule_sur_les_sources_publiques_si_tikwm_recherche_repond_403(cli
         return ({"sujet": "", "requetes": []}, app.ResultatTexte(texte="{}", fournisseur="gemini"))
     monkeypatch.setattr(app, "extraire_sujet_rst", extraire_sujet_vide)
 
-    async def decouvrir_moteur(_session, moteur, *, auteur="", requete="", limite=20):
+    async def decouvrir_moteur(_session, moteur, *, auteur="", requete="", limite=20, deadline=0.0):
         appels_moteurs.append({"moteur": moteur, "auteur": auteur, "requete": requete})
         if moteur != "duckduckgo":
             return [], "", "aucun résultat"
@@ -2762,7 +2762,7 @@ def test_chaine_publique_bloque_les_sources_en_echec_et_reessaie_la_gagnante(mon
     """Une source bloquée n'est plus tentée ; la source gagnante passe en premier."""
     ordre = []
 
-    async def moteur(_session, nom, *, auteur="", requete="", limite=20):
+    async def moteur(_session, nom, *, auteur="", requete="", limite=20, deadline=0.0):
         ordre.append(nom)
         if nom == "duckduckgo":
             raise app.ErreurApp("403")
@@ -2800,7 +2800,7 @@ def test_chaine_publique_bloque_les_sources_en_echec_et_reessaie_la_gagnante(mon
 def test_chaine_publique_respecte_son_budget_de_temps():
     """Budget épuisé : plus aucune source n'est contactée, la chaîne rend la main."""
 
-    async def moteur(_session, _nom, **_kwargs):
+    async def moteur(_session, _nom, *, deadline=0.0, **_kwargs):
         raise AssertionError("aucune source ne doit être contactée")
 
     app_moteur, app_wayback, app_urlebird = app._decouvrir_moteur, app._decouvrir_wayback, app._source_urlebird
@@ -2816,7 +2816,7 @@ def test_chaine_publique_respecte_son_budget_de_temps():
 def test_diagnostic_sources_rst_rapporte_l_etat_reel_depuis_le_serveur(client, monkeypatch):
     """Le diagnostic /api/rst/sources dit, source par source, ce qui passe depuis
     l'IP du serveur — sans jamais inventer de résultat."""
-    async def moteur(_session, nom, *, auteur="", requete="", limite=20):
+    async def moteur(_session, nom, *, auteur="", requete="", limite=20, deadline=0.0):
         if nom == "duckduckgo":
             return (["https://www.tiktok.com/@tiktok/video/7341000000000000001"],
                     "relais traduction", "relais de traduction : 1 lien")
