@@ -1,0 +1,122 @@
+name: Test RsT Render
+on:
+  workflow_dispatch:
+    inputs:
+      lien:
+        description: 'Lien TikTok'
+        required: true
+        default: 'https://www.tiktok.com/@miku_.auto/video/7631524974112673046'
+      objectif:
+        description: 'Objectif'
+        required: false
+        default: 'top'
+      theme:
+        description: 'Thème'
+        required: false
+        default: 'voiture'
+      duree:
+        description: 'Durée (secondes)'
+        required: false
+        default: '90'
+      voice:
+        description: 'Voix'
+        required: false
+        default: 'fr-FR-DeniseNeural'
+
+jobs:
+  test-rst:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Create RsT job
+        id: create
+        run: |
+          LIEN="${{ github.event.inputs.lien }}"
+          OBJECTIF="${{ github.event.inputs.objectif }}"
+          THEME="${{ github.event.inputs.theme }}"
+          DUREE="${{ github.event.inputs.duree }}"
+          VOICE="${{ github.event.inputs.voice }}"
+
+          echo "=== Création du job RsT ==="
+          echo "Lien: $LIEN"
+          echo "Objectif: $OBJECTIF"
+          echo "Thème: $THEME"
+          echo "Durée: $DUREE"
+          echo "Voix: $VOICE"
+          echo ""
+
+          # Premier appel avec timeout long (réveil du service Render Free)
+          RESPONSE=$(curl -s -c /tmp/cookies.txt --connect-timeout 60 --max-time 120 \
+            -X POST "https://s8-s8rrw8.onrender.com/api/jobs/rst" \
+            -H "Content-Type: application/json" \
+            -d "{\"lien\":\"$LIEN\",\"objectif\":\"$OBJECTIF\",\"theme\":\"$THEME\",\"duree_cible\":$DUREE,\"voice\":\"$VOICE\"}")
+
+          echo "Réponse création: $RESPONSE"
+
+          JOB_ID=$(echo "$RESPONSE" | python3 -c "import json,sys; print(json.load(sys.stdin).get('job_id',''))" 2>/dev/null)
+
+          if [ -z "$JOB_ID" ]; then
+            echo "JOB_ID_EMPTY" >> $GITHUB_OUTPUT
+            echo "Erreur: pas de job_id dans la réponse"
+            exit 1
+          fi
+
+          echo "Job ID: $JOB_ID"
+          echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
+
+      - name: Poll job status
+        if: steps.create.outputs.job_id
+        run: |
+          JOB_ID="${{ steps.create.outputs.job_id }}"
+          echo "=== Poll du job $JOB_ID ==="
+
+          for i in $(seq 1 80); do
+            sleep 30
+            RESPONSE=$(curl -s -b /tmp/cookies.txt --connect-timeout 30 --max-time 60 \
+              "https://s8-s8rrw8.onrender.com/api/jobs/$JOB_ID")
+
+            STATUS=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status','?'))" 2>/dev/null)
+            PROGRESS=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('progress',0))" 2>/dev/null)
+            DETAIL=$(echo "$RESPONSE" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('detail','')[:80])" 2>/dev/null)
+
+            echo "[t+$((i*30))s] $STATUS ($PROGRESS%) — $DETAIL"
+
+            if [ "$STATUS" = "completed" ] || [ "$STATUS" = "failed" ] || [ "$STATUS" = "cancelled" ]; then
+              echo "$RESPONSE" > /tmp/job_result.json
+              echo "FINAL_STATUS=$STATUS" >> $GITHUB_ENV
+              break
+            fi
+          done
+
+      - name: Show full result
+        if: steps.create.outputs.job_id
+        run: |
+          echo "=== RÉSULTAT COMPLET ==="
+          echo ""
+
+          if [ -f /tmp/job_result.json ]; then
+            python3 -c "
+import json
+with open('/tmp/job_result.json') as f:
+    d = json.load(f)
+print('status:', d.get('status'))
+print('progress:', d.get('progress'))
+print('detail:', d.get('detail', ''))
+print()
+ed = d.get('error_detail', {})
+if ed:
+    print('=== ERREUR DÉTAILLÉE ===')
+    for k, v in ed.items():
+        print(f'{k}: {v}')
+else:
+    print('=== SANS ERREUR ===')
+if d.get('url'):
+    print()
+    print('=== VIDÉO ===')
+    print('url:', d['url'])
+if d.get('drive'):
+    print('drive:', d['drive'])
+"
+          else
+            echo "Pas de fichier de résultat"
+          fi
