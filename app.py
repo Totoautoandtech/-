@@ -3323,6 +3323,7 @@ def _serp_vraiment_vide(texte: str) -> bool:
 async def _decouvrir_moteur(
     session: aiohttp.ClientSession, moteur: str, *,
     auteur: str = "", requete: str = "", limite: int = 20,
+    deadline: float = 0.0,
 ) -> tuple[list[str], str, str]:
     """Interroge un moteur en direct puis, si l'IP du serveur est bloquée ou que la
     page reste vide, via deux relais publics : le relais de lecture (r.jina.ai) et
@@ -3344,6 +3345,9 @@ async def _decouvrir_moteur(
     # --- 1) Direct, depuis l'IP du serveur, sur chaque instance du moteur ------
     urls = [modele(q) for modele in modeles]
     for indice, url in enumerate(urls):
+        if deadline and time.monotonic() > deadline:
+            etapes.append("budget de découverte épuisé avant direct")
+            break
         try:
             debut = time.monotonic()
             texte = await _lire_page(session, url, entetes=ENTETES_MOTEURS, delai=DECOUVERTE_DELAI_MOTEUR)
@@ -3372,6 +3376,12 @@ async def _decouvrir_moteur(
 
     # --- 2) Relais de lecture public (r.jina.ai) — première instance -----------
     url = modeles[0](q)
+    if deadline and time.monotonic() > deadline:
+        etapes.append("budget de découverte épuisé avant relais jina")
+        # Si le budget est épuisé, on retourne ce qu'on a
+        if page_recue:
+            return [], "", " ; ".join(etapes)
+        raise ErreurApp("budget de découverte épuisé : " + " ; ".join(etapes))
     try:
         texte = await _lire_page_relais(session, url)
         page_recue = True
@@ -3554,6 +3564,7 @@ async def _decouvrir_publique(
     decouverts: list[dict] = []
     vus: set[str] = set()
     debut_requete = time.monotonic()
+    deadline_check = debut_requete + DECOUVERTE_BUDGET_REQUETE
     for source in sources:
         if source in etat.bloquees:
             continue
@@ -3564,20 +3575,30 @@ async def _decouvrir_publique(
         if time.monotonic() - debut_requete > DECOUVERTE_BUDGET_REQUETE:
             logger.info("[Découverte] budget de requête épuisé : %s non tentée", source)
             break
+        # Vérification plus serrée : le budget doit être respecté même pendant
+        # une source qui prend du temps (relais jina/traduction avec timeouts longs).
         if etat.budget < 15.0:
             logger.info("[Découverte] budget global épuisé : %s non tentée", source)
             break
         debut = time.monotonic()
         try:
             if source == "wayback":
+                if deadline_check and time.monotonic() > debut_requete + DECOUVERTE_BUDGET_REQUETE:
+                    etape_budget = "budget de découverte épuisé avant wayback"
+                    logger.info("[Découverte] %s", etape_budget)
+                    break
                 liens, mode, detail = await _decouvrir_wayback(session, auteur=auteur, limite=limite)
             elif source == "urlebird":
+                if time.monotonic() > debut_requete + DECOUVERTE_BUDGET_REQUETE:
+                    logger.info("[Découverte] budget de découverte épuisé avant urlebird")
+                    break
                 liens, mode, detail = await _source_urlebird(
                     session, auteur=auteur, requete=requete, limite=limite
                 )
             else:
                 liens, mode, detail = await _decouvrir_moteur(
-                    session, source, auteur=auteur, requete=requete, limite=limite
+                    session, source, auteur=auteur, requete=requete, limite=limite,
+                    deadline=debut_requete + DECOUVERTE_BUDGET_REQUETE,
                 )
         except Exception as exc:  # noqa: BLE001 — source bloquée : on passe à la suivante
             etat.bloquees.add(source)
