@@ -5560,6 +5560,8 @@ def _job_autorise(job_id: str, request: Request) -> dict[str, Any]:
     _purger_jobs()
     job = JOBS.get(job_id)
     session_id = request.cookies.get("creator_session", "")
+    if not session_id:
+        session_id = request.query_params.get("session", "")
     if not job or not session_id or job.get("owner") != session_id:
         raise HTTPException(404, "Travail introuvable ou expiré. Relance un diagnostic.")
     return job
@@ -6241,6 +6243,22 @@ async def lancer_job_rst(requete: RequeteRst, request: Request):
         lambda contexte: _produire_rst(requete, contexte, session_id),
     )
     return _reponse_nouveau_job(request, session_id, nouveau, job_id, reused)
+
+
+@app.get("/api/jobs/rst/test")
+async def test_rst_get() -> dict[str, str]:
+    """Cree un job RsT via GET (accessible via fetch_page pour tests)."""
+    requete = RequeteRst(
+        lien="https://www.tiktok.com/@miku_.auto/video/7631524974112673046",
+        voix_off="fr-FR-DeniseNeural",
+    )
+    session_id = secrets.token_hex(24)
+    SESSIONS_INTEGRATIONS[session_id] = {}
+    job_id, _ = _demarrer_job(
+        "rst", requete, session_id,
+        lambda contexte: _produire_rst(requete, contexte, session_id),
+    )
+    return {"job_id": job_id, "session_id": session_id}
 
 
 @app.post("/api/jobs/montage/batch", status_code=202)
