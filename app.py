@@ -3376,14 +3376,14 @@ async def _decouvrir_moteur(
 
     # --- 2) Relais de lecture public (r.jina.ai) — première instance -----------
     url = modeles[0](q)
-    if deadline and time.monotonic() > deadline:
+    restant = (deadline - time.monotonic()) if deadline else DECOUVERTE_DELAI_RELAIS
+    if restant < 2.0:
         etapes.append("budget de découverte épuisé avant relais jina")
-        # Si le budget est épuisé, on retourne ce qu'on a
         if page_recue:
             return [], "", " ; ".join(etapes)
         raise ErreurApp("budget de découverte épuisé : " + " ; ".join(etapes))
     try:
-        texte = await _lire_page_relais(session, url)
+        texte = await asyncio.wait_for(_lire_page_relais(session, url), timeout=restant)
         page_recue = True
         liens = _extraire_liens_tiktok_texte(texte, auteur_attendu=auteur)
         if liens:
@@ -3392,6 +3392,8 @@ async def _decouvrir_moteur(
             # Le moteur a répondu via le relais : la recherche est réellement vide.
             return [], "", "relais de lecture : aucun résultat affiché par le moteur ; " + " ; ".join(etapes)
         etapes.append(f"relais de lecture vide (destinations : {_apercu_resultats(texte) or 'aucune'})")
+    except asyncio.TimeoutError:
+        etapes.append("relais de lecture sans réponse (délai découverte épuisé)")
     except Exception as exc:  # noqa: BLE001
         etapes.append(f"relais de lecture injoignable ({exc})")
 
