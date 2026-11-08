@@ -5464,13 +5464,33 @@ async def _sauvegarde_auto_drive(
         return {"status": "failed", "error": str(exc), "message": "La sauvegarde Drive a échoué."}
 
 
+async def _keep_alive_job(contexte: "ContexteJob") -> None:
+    """Heartbeat : empêche Render Free de suspendre le service pendant un travail.
+
+    Render Free suspend le service après ~15 min d'inactivité, ce qui tue les
+    tâches asyncio en arrière-plan et laisse le job bloqué en « queued ». Un
+    heartbeat régulier maintient le service actif pendant l'exécution du travail.
+    """
+    try:
+        while True:
+            await asyncio.sleep(180)  # 3 minutes — bien sous la limite de 15 min
+            contexte.update(
+                detail=f"Heartbeat keep-alive — {contexte.derniere_etape}",
+            )
+    except asyncio.CancelledError:
+        return
+
+
 async def _executer_job(job_id: str, fabrique, session_id: str) -> None:
     job = JOBS[job_id]
     contexte = ContexteJob(job_id, job)
+    keep_alive_task = None
     try:
         async with JOB_SEMAPHORE:
             contexte.debut = time.monotonic()  # la limite globale commence après la file d'attente
             contexte.update(statut="validating", progress=1, detail="Démarrage et validation")
+            # Keep-alive : empêche Render Free de suspendre le service pendant le travail.
+            keep_alive_task = asyncio.create_task(_keep_alive_job(contexte))
             resultat = await asyncio.wait_for(fabrique(contexte), timeout=CONFIG.delai_job)
             chemin = resultat.pop("path", None)
             if chemin and not isinstance(chemin, Path):
@@ -5521,6 +5541,12 @@ async def _executer_job(job_id: str, fabrique, session_id: str) -> None:
             error_detail=erreur_copiable,
         )
     finally:
+        if keep_alive_task and not keep_alive_task.done():
+            keep_alive_task.cancel()
+            try:
+                await keep_alive_task
+            except asyncio.CancelledError:
+                pass
         JOB_TASKS.pop(job_id, None)
 
 
