@@ -857,6 +857,7 @@ BUDGET_COUPLE_MIN = 20.0
 # à 60 s, puis bornée par le budget total restant de l'appel.
 PAUSE_MAX_RETRY_AFTER = 60.0
 GEMINI_TENTATIVES_PAR_MODELE = 5
+BUDGET_GEMINI_TEXTE = 30.0  # budget max d'une appel texte Gemini avant bascule
 # Backoff exponentiel entre deux tentatives d'un même couple (1 s, 2 s, 4 s, 8 s…),
 # auquel s'ajoute un jitter de ±GEMINI_JITTER_MAX pour éviter que plusieurs travaux ne
 # retentent en rafale au même instant. Un Retry-After renvoyé par Google prime et n'est
@@ -1908,7 +1909,8 @@ async def _pause_fournisseur(
 
 
 async def _appel_gemini_texte(
-    *, system: str, user: str, temperature: float, json_mode: bool
+    *, system: str, user: str, temperature: float, json_mode: bool,
+    budget: Optional[float] = None,
 ) -> str:
     """Gemini pour les tâches de texte (les tâches visuelles passent toujours par
     `_appel_gemini_brut` directement).
@@ -1919,7 +1921,8 @@ async def _appel_gemini_texte(
     """
     try:
         return await _appel_gemini_brut(
-            [{"text": user}], temperature=temperature, system=system, json_mode=json_mode
+            [{"text": user}], temperature=temperature, system=system,
+            json_mode=json_mode, budget=budget,
         )
     except asyncio.CancelledError:
         raise
@@ -1989,7 +1992,8 @@ async def appel_texte_fournisseur(
         try:
             if fourni == "gemini":
                 texte = await _appel_gemini_texte(
-                    system=system, user=user, temperature=temperature, json_mode=json_mode
+                    system=system, user=user, temperature=temperature,
+                    json_mode=json_mode, budget=min(budget, BUDGET_GEMINI_TEXTE),
                 )
             else:
                 texte = await _appel_openai_compatible(
