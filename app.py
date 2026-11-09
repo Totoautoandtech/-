@@ -283,12 +283,16 @@ class Config:
         avec une réponse d'erreur explicite plutôt qu'un crash à l'import du module.
         """
         cles = [c.strip() for c in _env("GEMINI_API_KEYS").split(",") if c.strip()]
-        # Clés individuelles : GEMINI_API_KEY_1, GEMINI_API_KEY_2, … jusqu'à 10.
-        cles += [
-            _env(f"GEMINI_API_KEY_{i}").strip()
-            for i in range(1, 11)
-            if _env(f"GEMINI_API_KEY_{i}").strip()
-        ]
+        # Clés individuelles dans tous les formats possibles.
+        for fmt in ("GEMINI_API_KEY", "GEMINI_API_KEYS"):
+            for i in range(1, 21):
+                cle = _env(f"{fmt}_{i}").strip()
+                if cle and cle not in cles:
+                    cles.append(cle)
+            valeur = _env(fmt).strip()
+            if valeur and valeur not in cles:
+                cles.append(valeur)
+        cles = [c for c in cles if c]
         pexels = _env("PEXELS_API_KEY")
 
         # Ordre des fournisseurs de texte (script, noms) : Gemini reste en tête par
