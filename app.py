@@ -6504,3 +6504,4 @@ async def montage(requete: RequeteMontage, request: Request) -> dict[str, Any]:
         raise HTTPException(504, f"Limite globale dépassée pendant « {contexte.derniere_etape} ».") from exc
     except (ErreurApp, ErreurMontage) as exc:
         raise HTTPException(400, str(exc)) from exc
+# trigger deploy
