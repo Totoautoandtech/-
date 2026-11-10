@@ -1543,12 +1543,26 @@ async def controler_qualite_plan(
             f"Contrôle qualité strict de {len(plan)} plan(s) en un seul appel (tour {tour})",
         )
         # Regroupement : un seul appel Gemini pour tous les plans du tour (au lieu d'un
-        # appel par plan). Fail-closed : un plan non validé n'est jamais monté ;
-        # l'indisponibilité Gemini remonte telle quelle (jamais confondue avec un rejet).
-        verdicts = await verifier_conformite_extraits(
-            plan, segments, analyses, metadonnees, sources, config, rapporteur,
-            appel_gemini, tour,
-        )
+        # appel par plan). Si Gemini est indisponible (429/503/délai), les plans sont
+        # acceptés avec un avertissement au lieu d'échouer — le montage continue.
+        try:
+            verdicts = await verifier_conformite_extraits(
+                plan, segments, analyses, metadonnees, sources, config, rapporteur,
+                appel_gemini, tour,
+            )
+        except ErreurGeminiIndisponible:
+            rapporteur.update(
+                "validating", 81,
+                "Gemini indisponible : plans acceptés sans validation finale",
+            )
+            return plan, [
+                {
+                    "source": p.get("source", ""),
+                    "url": p.get("source_url", ""),
+                    "raisons": ["Gemini indisponible — plan accepté sans validation finale"],
+                }
+                for p in plan
+            ]
         rejets = [verdict for verdict in verdicts if not verdict["conforme"]]
         if not rejets:
             return plan, verdicts
