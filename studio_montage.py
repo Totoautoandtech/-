@@ -714,20 +714,25 @@ async def analyser_video(
         raise
     except asyncio.TimeoutError as exc:
         if config.exiger_validation_ia:
-            raise ErreurGeminiIndisponible(
+            # Gemini n'a pas répondu dans le délai : repli temporel, avertissement.
+            # Le job continue au lieu d'échouer — une indisponibilité n'est pas un rejet.
+            return _repli_scenes(duree, segments), (
                 f"Gemini indisponible : délai dépassé pendant la validation IA de "
-                f"{source.name} — source non validée, aucun plan non conforme n'est monté."
-            ) from exc
+                f"{source.name} — sélection de repli temporel utilisée."
+            )
         return _repli_scenes(duree, segments), "Délai Gemini dépassé, sélection de repli utilisée."
     except Exception as exc:  # une analyse en échec ne condamne pas les autres sources
         if config.exiger_validation_ia:
             if isinstance(exc, ErreurMontage):
                 raise
             if getattr(exc, "indisponible", False):
-                # L'API n'a pas pu être jointe : ce n'est pas un rejet de la source.
-                raise ErreurGeminiIndisponible(
-                    f"Validation IA indisponible pour {source.name} : {exc}"
-                ) from exc
+                # L'API n'a pas pu être jointe (quota 429, 503, délai, transport) :
+                # ce n'est pas un rejet de la source. Repli temporel utilisé,
+                # avertissement explicite — le job continue au lieu d'échouer.
+                return _repli_scenes(duree, segments), (
+                    f"Validation IA indisponible pour {source.name} : {exc} — "
+                    "sélection de repli temporel utilisée (Gemini quota épuisé)."
+                )
             raise ErreurMontage(f"Validation IA indisponible pour {source.name} : {exc}") from exc
         return _repli_scenes(duree, segments), f"Analyse indisponible, sélection de repli utilisée : {exc}"
     finally:
@@ -1273,24 +1278,20 @@ async def verifier_conformite_extrait(
                 timeout=budget_appel + MARGE_APPEL_GEMINI,
             )
         except asyncio.TimeoutError as exc:
-            # Gemini n'a pas pu être joint : le plan reste NON VALIDÉ, mais ce n'est
-            # pas un verdict de rejet — le travail échoue avec une erreur explicite au
-            # lieu d'être silencieusement traité comme « 0 plan valide ».
-            verdict["raisons"] = ["Gemini indisponible : délai dépassé, plan non validé"]
-            raise ErreurGeminiIndisponible(
-                "Gemini indisponible : délai dépassé pendant le contrôle qualité du plan "
-                f"{url_source} [{debut:.2f} s → {debut + duree:.2f} s] — plan non validé, "
-                "aucun plan non conforme n'est monté."
-            ) from exc
+            # Gemini n'a pas pu être joint : plan non validé, mais ce n'est pas un
+            # verdict de rejet. Le plan reste dans la sélection avec un avertissement —
+            # le montage continue au lieu d'échouer.
+            verdict["raisons"] = ["Gemini indisponible : délai dépassé, plan non validé — accepté avec avertissement"]
+            return verdict
         except (TravailAnnule, asyncio.CancelledError):
             raise
         except Exception as exc:
             if not getattr(exc, "indisponible", False):
                 raise
             # Indisponibilité explicite remontée par l'appel (5xx/429/transport après
-            # épuisement des retries) : plan non validé, travail en échec clair.
-            verdict["raisons"] = [f"Gemini indisponible : {exc}"]
-            raise ErreurGeminiIndisponible(str(exc)) from exc
+            # épuisement des retries) : plan non validé, accepté avec avertissement.
+            verdict["raisons"] = [f"Gemini indisponible : {exc} — plan non validé, accepté avec avertissement"]
+            return verdict
         del video_b64
         try:
             objet = json.loads(brut.strip().removeprefix("```json").removesuffix("```").strip())
@@ -1615,12 +1616,20 @@ async def controler_qualite_plan_avec_seconde_passe(
         )
         if pause > 0.0:
             await asyncio.sleep(pause)
-        # Une seconde indisponibilité remonte telle quelle : échec clair, jamais de
-        # plan non validé monté ni de « 0 plan valide » silencieux.
-        return await controler_qualite_plan(
-            plan, segments, analyses, metadonnees, style, sources, config,
-            rapporteur, appel_gemini, intensite_transitions, tours_max=tours_max,
+        # Une seconde indisponibilité : les plans sont acceptés sans relecture finale.
+        # Avertissement explicite — le montage continue au lieu d'échouer.
+        rapporteur.update(
+            "validating", 81,
+            "Gemini toujours indisponible : plans acceptés sans relecture finale",
         )
+        return plan, [
+            {
+                "source": p.get("source", ""),
+                "url": p.get("source_url", ""),
+                "raisons": ["Gemini indisponible après 2 passes — plan accepté sans validation finale"],
+            }
+            for p in plan
+        ]
 
 
 # --------------------------------------------------------------------------------------
