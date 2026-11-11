@@ -6410,6 +6410,45 @@ async def test_rst_get() -> dict[str, str]:
     return {"job_id": job_id, "session_id": session_id}
 
 
+@app.get("/api/jobs/rst/sync")
+async def test_rst_sync() -> dict[str, Any]:
+    """Job RsT SYNCHRONE — lance le pipeline ET attend le résultat dans une seule requête.
+
+    Contourne le spin-down de Render Free : le conteneur reste vivant pendant
+    toute la durée du job car il y a une requête HTTP active. À utiliser quand
+    on ne peut pas poller plusieurs fois.
+    """
+    requete = RequeteRst(
+        lien="https://www.tiktok.com/@miku_.auto/video/7631524974112673046",
+        voix_off="fr-FR-DeniseNeural",
+    )
+    session_id = secrets.token_hex(24)
+    SESSIONS_INTEGRATIONS[session_id] = {}
+    job_id, _ = _demarrer_job(
+        "rst", requete, session_id,
+        lambda contexte: _produire_rst(requete, contexte, session_id),
+    )
+    # Attendre que le job se termine — la requête HTTP reste ouverte,
+    # ce qui maintient le conteneur vivant sur Render Free.
+    while True:
+        job = JOBS.get(job_id, {})
+        status = job.get("status", "")
+        if status in {"completed", "failed", "cancelled"}:
+            break
+        await asyncio.sleep(5)
+    job = JOBS.get(job_id, {})
+    return {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "progress": job.get("progress"),
+        "detail": job.get("detail", ""),
+        "url": job.get("url", ""),
+        "error": job.get("error", ""),
+        "found_videos": job.get("found_videos", []),
+        "search_queries": job.get("search_queries", []),
+    }
+
+
 @app.post("/api/jobs/montage/batch", status_code=202)
 async def lancer_lot_montages(requete: RequeteLotMontages, request: Request):
     """Place jusqu’à six projets indépendants dans la file séquentielle Render Free."""
