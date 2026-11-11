@@ -389,6 +389,8 @@ DOSSIER_VIDEOS = RACINE / "videos"
 DOSSIER_VIDEOS.mkdir(exist_ok=True)
 DOSSIER_TRAVAIL = RACINE / "travail"
 DOSSIER_TRAVAIL.mkdir(exist_ok=True)
+DOSSIER_JOBS = RACINE / "jobs"
+DOSSIER_JOBS.mkdir(exist_ok=True)
 DOSSIER_VOIX_OFF = DOSSIER_TRAVAIL / "voixoff"
 DOSSIER_VOIX_OFF.mkdir(parents=True, exist_ok=True)
 # Profils d'entraînement privés : un seul JSON 0600 par cookie de session.
@@ -5222,6 +5224,57 @@ class ContexteJob:
 
 
 
+def _fichier_jobs() -> Path:
+    return DOSSIER_JOBS / "jobs.json"
+
+
+def _sauvegarder_jobs() -> None:
+    """Persiste JOBS sur disque pour résister aux spin-downs de Render Free."""
+    try:
+        donnees = {"jobs": JOBS, "index": JOB_INDEX}
+        tmp = _fichier_jobs().with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(donnees, f, ensure_ascii=False, default=str)
+        tmp.replace(_fichier_jobs())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Échec sauvegarde jobs sur disque : %s", exc)
+
+
+def _charger_jobs() -> None:
+    """Restaure JOBS depuis disque au démarrage après un spin-down."""
+    try:
+        fichier = _fichier_jobs()
+        if not fichier.exists():
+            return
+        with open(fichier, "r", encoding="utf-8") as f:
+            donnees = json.load(f)
+        maintenant = time.time()
+        for identifiant, job in donnees.get("jobs", {}).items():
+            status = job.get("status", "")
+            if status in {"queued", "running", "validating", "analysing", "editing", "exporting", "completed"}:
+                # Un job en cours au moment du spin-down ne peut pas reprendre :
+                # la tâche asyncio a été tuée. On le marque comme interrompu.
+                if status in {"queued", "running", "validating", "analysing", "editing", "exporting"}:
+                    job["status"] = "interrupted"
+                    job["detail"] = "Job interrompu par un restart du serveur (spin-down Render). Créez un nouveau job."
+                    job["error"] = "Container restarted during job execution"
+                    job["updated_at"] = time.monotonic()
+                    job["updated_at_unix"] = maintenant
+                JOBS[identifiant] = job
+        for empreinte, identifiant in donnees.get("index", {}).items():
+            if identifiant in JOBS:
+                JOB_INDEX[empreinte] = identifiant
+        logger.info("Jobs restaurés depuis disque : %d", len(JOBS))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Échec chargement jobs depuis disque : %s", exc)
+
+
+@app.on_event("startup")
+async def _demarrage_app() -> None:
+    """Restaure les jobs persistés au démarrage après un spin-down Render."""
+    _charger_jobs()
+
+
 def _purger_jobs() -> None:
     """Expire états, rendus et dossiers orphelins sans toucher aux travaux actifs."""
     maintenant = time.monotonic()
@@ -5257,7 +5310,7 @@ def _purger_jobs() -> None:
             logger.warning("Nettoyage impossible pour %s", dossier)
 
     _purger_voix_off()
-
+    _sauvegarder_jobs()
 
 
 def _resoudre_voix_off(session_id: str, identifiant: str) -> Optional[Path]:
@@ -5564,6 +5617,7 @@ async def _executer_job(job_id: str, fabrique, session_id: str) -> None:
             except asyncio.CancelledError:
                 pass
         JOB_TASKS.pop(job_id, None)
+        _sauvegarder_jobs()
 
 
 
@@ -5622,6 +5676,7 @@ def _demarrer_job(
         "drive": {"status": "pending"}, "fingerprint": empreinte,
     }
     JOB_INDEX[empreinte] = job_id
+    _sauvegarder_jobs()
     JOB_TASKS[job_id] = asyncio.create_task(_executer_job(job_id, fabrique, session_id))
     return job_id, False
 
