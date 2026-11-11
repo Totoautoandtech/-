@@ -723,8 +723,6 @@ async def analyser_video(
         return _repli_scenes(duree, segments), "Délai Gemini dépassé, sélection de repli utilisée."
     except Exception as exc:  # une analyse en échec ne condamne pas les autres sources
         if config.exiger_validation_ia:
-            if isinstance(exc, ErreurMontage):
-                raise
             if getattr(exc, "indisponible", False):
                 # L'API n'a pas pu être jointe (quota 429, 503, délai, transport) :
                 # ce n'est pas un rejet de la source. Repli temporel utilisé,
@@ -733,6 +731,8 @@ async def analyser_video(
                     f"Validation IA indisponible pour {source.name} : {exc} — "
                     "sélection de repli temporel utilisée (Gemini quota épuisé)."
                 )
+            if isinstance(exc, ErreurMontage):
+                raise
             raise ErreurMontage(f"Validation IA indisponible pour {source.name} : {exc}") from exc
         return _repli_scenes(duree, segments), f"Analyse indisponible, sélection de repli utilisée : {exc}"
     finally:
@@ -2081,22 +2081,22 @@ async def construire_montage_professionnel(
                 except ErreurMontage as exc:
                     if getattr(exc, "indisponible", False):
                         # Gemini est injoignable : ce n'est PAS un rejet qualité de la
-                        # source. Le plan reste non validé et le travail doit s'arrêter
-                        # sur une erreur explicite, jamais sur un « rejected_by_ai »
-                        # silencieux qui dégraderait en « 0 plan valide ».
+                        # source. La source est exclue du montage mais le job continue
+                        # avec les autres sources. Le repli temporel a déjà été appliqué
+                        # dans analyser_video — ici on enregistre juste le statut.
                         rapports[index].update(status="unavailable", scenes=0, error=str(exc))
                         erreurs_sources.append({
                             "index": index, "url": metadonnees[nom]["url"],
                             "error": str(exc), "status": "unavailable",
                         })
-                        raise
-                    # Une source refusée par l'IA (texte, réponse invalide) est exclue ;
-                    # les autres sources propres peuvent continuer.
-                    rapports[index].update(status="rejected_by_ai", scenes=0, error=str(exc))
-                    erreurs_sources.append({
-                        "index": index, "url": metadonnees[nom]["url"],
-                        "error": str(exc), "status": "rejected_by_ai",
-                    })
+                    else:
+                        # Une source refusée par l'IA (texte, réponse invalide) est exclue ;
+                        # les autres sources propres peuvent continuer.
+                        rapports[index].update(status="rejected_by_ai", scenes=0, error=str(exc))
+                        erreurs_sources.append({
+                            "index": index, "url": metadonnees[nom]["url"],
+                            "error": str(exc), "status": "rejected_by_ai",
+                        })
                 terminees += 1
                 rapporteur.update(
                     "analysing", 36 + int(34 * terminees / total_analyses),
