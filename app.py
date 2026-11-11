@@ -5536,16 +5536,25 @@ async def _sauvegarde_auto_drive(
 async def _keep_alive_job(contexte: "ContexteJob") -> None:
     """Heartbeat : empêche Render Free de suspendre le service pendant un travail.
 
-    Render Free suspend le service après ~15 min d'inactivité, ce qui tue les
-    tâches asyncio en arrière-plan et laisse le job bloqué en « queued ». Un
-    heartbeat régulier maintient le service actif pendant l'exécution du travail.
+    Render Free suspend le service après ~15 min sans requêtes HTTP entrantes.
+    Ce heartbeat envoie des requêtes réelles vers /api/sante pour générer du
+    trafic entrante et éviter le spin-down du conteneur pendant l'exécution.
     """
+    base_url = _env("RENDER_EXTERNAL_URL") or _env("APP_BASE_URL")
+    timeout = aiohttp.ClientTimeout(total=10)
     try:
-        while True:
-            await asyncio.sleep(180)  # 3 minutes — bien sous la limite de 15 min
-            contexte.update(
-                detail=f"Heartbeat keep-alive — {contexte.derniere_etape}",
-            )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while True:
+                await asyncio.sleep(120)  # 2 minutes — bien sous la limite de 15 min
+                if base_url:
+                    try:
+                        async with session.get(f"{base_url}/api/sante") as resp:
+                            await resp.read()
+                    except Exception:
+                        pass  # le service peut être en train de spin down — on réessaye
+                contexte.update(
+                    detail=f"Heartbeat keep-alive — {contexte.derniere_etape}",
+                )
     except asyncio.CancelledError:
         return
 
@@ -5555,11 +5564,13 @@ async def _executer_job(job_id: str, fabrique, session_id: str) -> None:
     contexte = ContexteJob(job_id, job)
     keep_alive_task = None
     try:
+        # Keep-alive : lance TOUS SURTOUT avant l'acquisition du sémaphore.
+        # Render Free spin down après ~15 min sans requêtes entrantes — même
+        # un job en file d'attente doit générer du trafic.
+        keep_alive_task = asyncio.create_task(_keep_alive_job(contexte))
         async with JOB_SEMAPHORE:
             contexte.debut = time.monotonic()  # la limite globale commence après la file d'attente
             contexte.update(statut="validating", progress=1, detail="Démarrage et validation")
-            # Keep-alive : empêche Render Free de suspendre le service pendant le travail.
-            keep_alive_task = asyncio.create_task(_keep_alive_job(contexte))
             resultat = await asyncio.wait_for(fabrique(contexte), timeout=CONFIG.delai_job)
             chemin = resultat.pop("path", None)
             if chemin and not isinstance(chemin, Path):
