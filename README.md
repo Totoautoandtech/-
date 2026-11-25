@@ -127,8 +127,8 @@ Aucun service payant n'est intégré à l'application. Elle est conçue pour les
 
 | Variable | Défaut | Rôle |
 |---|---:|---|
-| `GEMINI_MODEL` | `gemini-2.5-flash` | modèle Gemini principal |
-| `GEMINI_MODELES` | `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash` | chaîne de modèles de secours, essayés dans l'ordre en cas de 503 / 429 |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | modèle Gemini principal |
+| `GEMINI_MODELES` | `gemini-3.8-flash,gemini-3.5-flash-lite` | chaîne de modèles de secours, essayés dans l'ordre en cas de 503 / 429 (les modèles 2.5/2.0 sont dépréciés, 404) |
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | modèle Groq principal (repli `qwen/qwen3.6-27b` ; `llama-3.3-70b-versatile` est arrêté depuis 16/08/2026 et renvoie 404) |
 | `MISTRAL_MODEL` | `mistral-small-latest` | modèle Mistral principal |
 | `DUREE_CIBLE_SECONDES` | `30` | ancienne durée indicative du script ; l'export final est toujours prolongé et vérifié à 61 s minimum |
@@ -175,7 +175,7 @@ Gemini renvoie parfois `503 UNAVAILABLE — This model is currently experiencing
 vient d'échouer :
 
 1. **Chaîne de secours en round-robin** — `GEMINI_MODELES` liste les modèles essayés dans l'ordre
-   (défaut `gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash`). Les couples clé/modèle sont
+   (défaut `gemini-3.8-flash,gemini-3.5-flash-lite`). Les couples clé/modèle sont
    visités en rotation : la tentative k vise le couple (k % nombre de couples), donc chaque couple
    reçoit une première tentative avant qu'aucun n'en reçoive une deuxième — jamais cinq échecs
    d'affilée sur un modèle saturé pendant que les autres attendent.
@@ -197,8 +197,8 @@ vient d'échouer :
    autre modèle ni aucune autre clé ne peut modifier ce résultat, et l'application l'indique sans
    parler d'épuisement des clés.
 5. **Messages honnêtes** — après épuisement, le message public nomme les modèles réellement
-   essayés avec leurs comptes (`gemini-2.5-flash ×2, gemini-2.5-flash-lite ×1`), les modèles
-   **non essayés** quand le budget a coupé la rotation (« gemini-2.0-flash non essayé avant la
+   essayés avec leurs comptes (`gemini-3.8-flash ×2, gemini-3.5-flash-lite ×1`), les modèles
+   **non essayés** quand le budget a coupé la rotation (« gemini-3.5-flash-lite non essayé avant la
    fin du budget de … s »), et la cause observée : un 503 est nommé « saturation 503 persistante »,
    un 429 est distingué en **quota minute** (429 RPM, `Retry-After` ≤ 60 s) ou **quota journalier**
    (429 RPD, `Retry-After` > 3600 s), avec la fenêtre de réinitialisation réelle — jamais

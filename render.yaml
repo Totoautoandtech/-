@@ -36,12 +36,13 @@ services:
       - key: FOURNISSEURS_TEXTE_ORDRE
         value: gemini,groq,mistral
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
+        value: gemini-3.8-flash
       # Chaîne de modèles de secours essayée dans l'ordre. Quand Google répond 503
       # « This model is currently experiencing high demand » (ou 429), l'appel bascule
       # automatiquement sur le modèle suivant, puis sur la clé suivante.
+      # Les modèles 2.5/2.0 sont DÉPRÉCIÉS (404) : on passe sur la génération 3.x.
       - key: GEMINI_MODELES
-        value: gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash
+        value: gemini-3.8-flash,gemini-3.5-flash-lite
       - key: DUREE_CIBLE_SECONDES
         value: "30"
       # Garde-fous adaptés à Render Free (512 Mo). La limite globale vaut 30 min.

@@ -880,7 +880,7 @@ def test_chaine_de_modeles_par_defaut_et_variable_denvironnement(monkeypatch):
     monkeypatch.delenv("GEMINI_MODEL", raising=False)
     monkeypatch.delenv("GEMINI_TIMEOUT_SECONDES", raising=False)
     defaut = app.Config.charger()
-    assert defaut.gemini_modeles == ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    assert defaut.gemini_modeles == ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
     assert defaut.delai_gemini == 200
     monkeypatch.setenv("GEMINI_TIMEOUT_SECONDES", "10")
     assert app.Config.charger().delai_gemini == 15
