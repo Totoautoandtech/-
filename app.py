@@ -20,7 +20,7 @@ ffmpeg), ou installer ffmpeg dans l'image/runtime avant de lancer `uvicorn app:a
 
 Variables d'environnement :
     GEMINI_API_KEYS   (obligatoire) une ou plusieurs clés, séparées par des virgules
-    GEMINI_MODEL      (défaut: gemini-2.5-flash)
+    GEMINI_MODEL      (défaut: gemini-3.8-flash)
     PEXELS_API_KEY    (obligatoire) clé gratuite sur pexels.com/api
     DUREE_CIBLE_SECONDES (défaut: 30)
     GROQ_API_KEY      (facultatif) fournisseur de texte alternatif
@@ -95,7 +95,9 @@ def _env(nom: str, defaut: str = "") -> str:
 
 # Chaîne de modèles Gemini essayée dans l'ordre. Le premier modèle est le plus capable ;
 # les suivants servent de secours quand Google renvoie 503 « high demand » sur le premier.
-MODELES_GEMINI_DEFAUT = "gemini-2.5-flash,gemini-2.5-flash-lite,gemini-2.0-flash"
+# Les modèles 2.5/2.0 sont dépréciés par Google (404 « no longer available to new
+# users ») : on utilise la génération 3.x stable recommandée.
+MODELES_GEMINI_DEFAUT = "gemini-3.8-flash,gemini-3.5-flash-lite"
 
 # Voix off importée par l'utilisateur (aucun service payant, aucune synthèse) :
 # fichier audio brut envoyé par le navigateur, conservé 6 h, lié à la session.
