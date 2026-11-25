@@ -353,6 +353,12 @@ DELAI_CONTROLE_QUALITE_PLAN = 150.0
 # que sur indisponibilité, jamais sur un verdict de rejet ; pause et seconde passe
 # restent comptabilisées dans la limite globale du travail.
 DELAI_SECONDE_PASSE_QUALITE = 30.0
+# Borne mure (wall-clock) par source pendant la validation (résolution + ffprobe).
+# Une source dont le téléchargement/la résolution/le ffprobe s'accroche ne doit JAMAIS
+# bloquer tout le job : au-delà de ce délai, la source est écartée avec un erreur
+# explicite et la boucle continue sur la suivante. Sans cette borne, une source
+# bloquée figeait le job indéfiniment (téléchargement ou flux distant non réactif).
+DELAI_VALIDATION_SOURCE = 60.0
 # Marge hors budget (attente du sémaphore, marge réseau) ajoutée à la borne de
 # sécurité `asyncio.wait_for` qui entoure chaque appel Gemini : elle ne doit jamais
 # couper un retry en cours, sinon la double échéance défaite silencieusement l'appel.
@@ -1960,12 +1966,16 @@ async def construire_montage_professionnel(
                 entree = {"index": i - 1, "url": url, "status": "validating"}
                 rapports.append(entree)
                 try:
-                    direct = await resolveur(session, url)
-                    infos = await sonder_video(direct, timeout=rapporteur.timeout(min(25, config.delai_ffmpeg)))
-                    if infos["duration"] > config.duree_max_source:
-                        raise ErreurMontage(
-                            f"Source de {infos['duration']:.1f} s, limite {config.duree_max_source:.0f} s."
-                        )
+                    # Borne mure par source : une source bloquée (résolution TikWM,
+                    # ffprobe sur flux distant non réactif) est écartée après le
+                    # délai au lieu de figer tout le job.
+                    async with asyncio.timeout(DELAI_VALIDATION_SOURCE):
+                        direct = await resolveur(session, url)
+                        infos = await sonder_video(direct, timeout=rapporteur.timeout(min(25, config.delai_ffmpeg)))
+                        if infos["duration"] > config.duree_max_source:
+                            raise ErreurMontage(
+                                f"Source de {infos['duration']:.1f} s, limite {config.duree_max_source:.0f} s."
+                            )
                     entree.update(status="validated", **infos)
                     directs.append((i - 1, url, direct, infos))
                 except Exception as exc:
