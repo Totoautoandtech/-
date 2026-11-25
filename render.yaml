@@ -21,6 +21,11 @@ services:
         sync: false
       - key: MISTRAL_API_KEY
         sync: false
+      # TikWM API (recherche TikTok / résolution vidéo). La nouvelle API est à
+      # api.tikwmapi.com et requiert une clé. Obtenir une clé gratuite sur
+      # https://tikwmapi.com/dashboard/keys
+      - key: TIKWM_API_KEY
+        sync: false
       # Modèle Groq principal. « llama-3.3-70b-versatile » est arrêté depuis 16/08/2026
       # (renvoie 404) : le défaut est openai/gpt-oss-120b, avec qwen/qwen3.6-27b en repli
       # (configurable via GROQ_MODEL). MISTRAL_MODEL garde mistral-small-latest.

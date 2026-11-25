@@ -104,9 +104,13 @@ VOIX_OFF_MAX_OCTETS = VOIX_OFF_MAX_MO * 1024 * 1024
 VOIX_OFF_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus"}
 DUREE_VIE_VOIX_OFF = 6 * 60 * 60
 
-# TikWM filtre les clients qui ne ressemblent pas à un navigateur : sans ces en-têtes,
-# /feed/search et /user/posts répondent 403 depuis un hébergeur, alors que /api/ passe.
-# Aucune clé, aucun compte, aucun abonnement : seulement une identification honnête.
+# TikWM a migré vers une nouvelle API (api.tikwmapi.com) qui requiert une clé API.
+# L'ancien endpoint www.tikwm.com/api est en panne. La clé est configurable via
+# TIKWM_API_KEY (variable d'environnement Render). Sans clé, les appels échouent
+# avec une erreur explicite — aucune donnée n'est inventée.
+TIKWM_API_BASE = _env("TIKWM_API_BASE", "https://api.tikwmapi.com").rstrip("/")
+TIKWM_API_KEY = _env("TIKWM_API_KEY", "").strip()
+
 ENTETES_TIKWM = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -116,6 +120,8 @@ ENTETES_TIKWM = {
     "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
     "Referer": "https://www.tikwm.com/",
 }
+if TIKWM_API_KEY:
+    ENTETES_TIKWM["x-tikwmapi-key"] = TIKWM_API_KEY
 
 # Urlebird : miroir public utilisé en repli RsT. En production (Render), Cloudflare
 # bloque souvent son IP de datacenter ; Urlebird n'est donc que la dernière source
@@ -725,7 +731,7 @@ async def _resoudre_video_tiktok(session: aiohttp.ClientSession, url: str) -> st
     async def _appel():
         try:
             async with asyncio.timeout(CONFIG.delai_tikwm):
-                async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
+                async with session.get(f"{TIKWM_API_BASE}/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
                     if resp.status != 200:
                         raise ErreurApp(f"TikWM inaccessible ({resp.status})")
                     try:
@@ -766,7 +772,7 @@ async def _extraire_texte_tiktok(session: aiohttp.ClientSession, url: str) -> st
 
     async def _appel():
         try:
-            async with session.get("https://www.tikwm.com/api/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
+            async with session.get(f"{TIKWM_API_BASE}/", params={"url": url, "hd": "1"}, headers=ENTETES_TIKWM) as resp:
                 if resp.status != 200:
                     raise ErreurApp(f"TikWM inaccessible ({resp.status})")
                 try:
@@ -868,7 +874,15 @@ BUDGET_COUPLE_MIN = 20.0
 # Borne haute d'un Retry-After Google : l'attente réellement respectée est plafonnée
 # à 60 s, puis bornée par le budget total restant de l'appel.
 PAUSE_MAX_RETRY_AFTER = 60.0
-GEMINI_TENTATIVES_PAR_MODELE = 5
+# Une même clé/modèle ne retentit que 2 fois avant d'être épuisé : en saturation
+# 503 persistante, marteler 5 fois le même couple ne fait qu'empiéter sur le budget
+# et saturer davantage l'API. La rotation visite tous les couples une première fois
+# avant de revenir, donc 2 tentatives par couple suffisent à couvrir une retry.
+GEMINI_TENTATIVES_PAR_MODELE = 2
+# Plafond global de tentatives sur toute la rotation clé/modèle : arrête net l'orage
+# de retries (le job pouvait enchaîner 5 × 3 modèles × N clés = 20+ tentatives sur une
+# fenêtre de surcharge). 8 tentatives couvrent la rotation complète sans martelage.
+GEMINI_TENTATIVES_TOTAL_MAX = 8
 BUDGET_GEMINI_TEXTE = 30.0  # budget max d'une appel texte Gemini avant bascule
 # Backoff exponentiel entre deux tentatives d'un même couple (1 s, 2 s, 4 s, 8 s…),
 # auquel s'ajoute un jitter de ±GEMINI_JITTER_MAX pour éviter que plusieurs travaux ne
@@ -1223,6 +1237,11 @@ async def _appel_gemini_brut(
                     and compteurs[index] < GEMINI_TENTATIVES_PAR_MODELE
                 ]
                 if not vivants:
+                    break
+                # Plafond global : arrête l'orage de retries en saturation persistante
+                # (503/429) avant d'épuiser le budget et de saturer davantage l'API.
+                if tentatives_totales >= GEMINI_TENTATIVES_TOTAL_MAX:
+                    coupe_par_horloge = True
                     break
                 maintenant = time.monotonic()
                 restant_total = fin_totale - maintenant
@@ -2083,33 +2102,69 @@ PROMPT_SUJET_RST = (
     "Tu analyses une vidéo TikTok de départ pour en extraire le SUJET VISUEL PRINCIPAL "
     "à chercher pour le montage. Ton rôle est d'identifier ce qui est réellement filmé "
     "(objet, véhicule, produit, animal, scène) et comment il est filmé (en action ou statique). "
+    "Évite ABSOLUMENT les concepts abstraits ou catégories génériques : pas de « JDM », "
+    "« jeune permis », « voiture de luxe » — seulement le nom concret du véhicule/objet filmé. "
     "Réponds UNIQUEMENT avec un JSON valide, sans texte avant/après, sans balises markdown, "
     "avec exactement quatre clés :\n"
-    '- "sujet" : l\'objet/véhicule/produit principal filmé (2 à 40 caractères), sans hashtag. '
-    "Exemple : « corvette c7 », « smartphone », « café », « chat ». Si le sujet est abstrait, "
-    "retiens le sujet visuel concret le plus proche.\n"
+    '- "sujet" : le nom CONCREET de l\'objet/véhicule/produit principal filmé (2 à 40 caractères), sans hashtag. '
+    "Exemple : « corvette c7 », « porsche 911 », « smartphone », « café », « chat ». "
+    "Si le sujet est abstrait, retiens le nom concret du véhicule/objet le plus proche.\n"
     '- "action" : comment le sujet est filmé : « roule », « tourne », « ouvre », « saute », '
     "« statique », « utilisé », etc. Si le sujet bouge, indique l'action réelle.\n"
     '- "marque" : la marque ou le modèle du sujet si identifiable (2 à 40 caractères), '
     "sinon une chaîne vide. Exemple : « chevrolet corvette ».\n"
     '- "requetes" : un tableau de 3 requêtes de recherche TikTok, classées de la plus '
     "précise à la plus générale : sujet exact + action, marque + action, catégorie + action. "
-    "Chaque requête fait 2 à 40 caractères, sans hashtag, utilisable tel quel.\n"
+    "Chaque requête fait 2 à 40 caractères, sans hashtag, utilisable tel quel. "
+    "Exemples : « corvette c7 roule », « chevrolet corvette roule », « corvette roule ».\n"
     "N'invente jamais un sujet qui ne serait pas filmé dans la vidéo : si le sujet est "
-    "abstrait, retiens le sujet visuel concret le plus proche. Réponds strictement avec ce JSON."
+    "abstrait, retiens le nom concret du véhicule/objet le plus proche. Réponds strictement avec ce JSON."
+)
+
+
+PROMPT_SUJET_VISUEL_CAPTURES = (
+    "Tu reçois plusieurs captures d'image extraites d'une vidéo TikTok. "
+    "Ton rôle est d'identifier PRECISEMENT le véhicule ou l'objet principal qui est filmé. "
+    "Regarde attentivement chaque image : reconnais la marque, le modèle, la carrosserie, "
+    "les détails visuels (phares, calandre, logo, silhouette, couleur…). "
+    "Réponds UNIQUEMENT avec un JSON valide, sans texte avant/après, sans balises markdown, "
+    "avec exactement cinq clés :\n"
+    '- "sujet" : le nom CONCREET du véhicule/objet filmé (2 à 40 caractères). '
+    "Exemples : « corvette c7 », « porsche 911 », « bmw m3 », « lamborghini huracan ». "
+    "Si tu vois une voiture sans marque identifiable, décrivez-la précisément : « voiture sportive rouge ».\n"
+    '- "marque" : la marque du véhicule si identifiable (2 à 40 caractères), sinon une chaîne vide. '
+    "Exemples : « chevrolet », « porsche », « bmw ».\n"
+    '- "modele" : le modèle précis si identifiable (2 à 40 caractères), sinon une chaîne vide. '
+    "Exemples : « corvette c7 », « 911 gt3 », « m3 g80 ».\n"
+    '- "action" : comment le véhicule/objet est filmé : « roule », « stationne », « tourne », '
+    "« démarre », « statique », etc.\n"
+    '- "requetes" : un tableau de 3 requêtes de recherche TikTok, classées de la plus '
+    "précise à la plus générale : modèle exact + action, marque + action, catégorie + action. "
+    "Chaque requête fait 2 à 40 caractères. Exemples : « corvette c7 roule », "
+    "« chevrolet corvette roule », « corvette roule ».\n"
+    "N'invente jamais un véhicule qui n'est pas visible sur les images : si tu ne vois "
+    "rien de précis, renvoie un sujet descriptif basé sur ce que tu vois vraiment. "
+    "Réponds strictement avec ce JSON."
 )
 
 
 PROMPT_NOMS_RST = (
-    "Tu analyses la légende d'une vidéo TikTok. Ton rôle est d'en extraire les NOMS "
-    "réellement évoqués : personnes, personnages, lieux, marques, équipes, œuvres, objets "
-    "ou concepts précis. Réponds UNIQUEMENT avec un JSON valide, sans texte avant/après, "
+    "Tu analyses la légende d'une vidéo TikTok. Ton rôle est d'en extraire les NOMS DE "
+    "VÉHICLES / OBJETS CONCRETS réellement évoqués : marques de voitures, modèles de "
+    "véhicules, noms de produits, marques, lieux précis, personnages. "
+    "Évite ABSOLUMENT les concepts abstraits, thèmes génériques ou catégories : "
+    "pas de « JDM », « jeune permis », « voiture de luxe » — seulement des noms concrets "
+    "de voitures/véhicules/objets qui peuvent servir de recherche sur TikTok. "
+    "Réponds UNIQUEMENT avec un JSON valide, sans texte avant/après, "
     "sans balises markdown, avec exactement une clé :\n"
     '- "noms" : un tableau de {nombre} chaînes maximum, classées de la plus importante à la '
     "moins importante. Chaque nom fait 2 à 40 caractères et doit pouvoir servir tel quel de "
-    "requête de recherche sur TikTok.\n"
-    "N'invente jamais un nom qui ne serait pas soutenu par la légende : s'il y en a moins de "
-    "{nombre}, renvoie seulement ceux qui existent vraiment. Réponds strictement avec ce JSON."
+    "requête de recherche sur TikTok. Exemples concrets : « corvette c7 », « porsche 911 », "
+    "« bmw m3 », « lamborghini », « ford mustang ».\n"
+    "N'invente jamais un nom qui ne serait pas soutenu par la légende : s'il y a moins de "
+    "{nombre} noms concrets, renvoie seulement ceux qui existent vraiment. "
+    "Si la légende ne mentionne AUCUN nom de véhicule/objet concret, renvoie une liste vide. "
+    "Réponds strictement avec ce JSON."
 )
 
 
@@ -2141,6 +2196,38 @@ def _deduplique_noms(noms: Iterable[str], limite: int) -> list[str]:
         if len(retenus) >= limite:
             break
     return retenus
+
+
+def _deduplique_noms_distincts(noms: Iterable[str], limite: int) -> list[str]:
+    """Déduplique en collapse aussi les variantes d'un même véhicule.
+
+    Outre le doublon insensible à la casse, une marque seule est écrasée si une
+    marque+modèle du même constructeur est déjà retenue : « chevrolet » ne doit pas
+    compter comme un nom distinct quand « chevrolet corvette » est déjà présent.
+    La contenance (un nom inclus dans un autre) est la règle : on garde toujours la
+    forme la plus spécifique, donc les noms restants sont des véhicules DISTINTS
+    concrets, jamais le même truc répété sous des formulations différentes.
+    """
+    brut = _deduplique_noms(noms, limite * 2)
+    retenus: list[str] = []
+    for nom in brut:
+        cle = nom.casefold()
+        # Écrasé si un nom déjà retenu est inclus dans celui-ci (il est plus spécifique)
+        # ou si celui-ci est inclus dans un nom déjà retenu (il est moins spécifique).
+        supprime = False
+        for i,existant in enumerate(retenus):
+            cle_existant = existant.casefold()
+            if cle in cle_existant or cle_existant in cle:
+                if cle_existant in cle:
+                    # Le nouveau est plus spécifique : on le substitue.
+                    retenus[i] = nom
+                supprime = True
+                break
+        if not supprime:
+            retenus.append(nom)
+        if len(retenus) >= limite:
+            break
+    return retenus[:limite]
 
 
 def borner_nombre_noms_rst(valeur: Any) -> int:
@@ -2406,6 +2493,79 @@ async def _creer_apercu_video(video_path: Path) -> Path:
         timeout=CONFIG.delai_ffmpeg, sortie_attendue=apercu,
     )
     return apercu
+
+
+async def _analyser_sujet_visuel_captures(
+    session: aiohttp.ClientSession, url_tiktok: str, dossier: Path
+) -> tuple[dict, Optional[str]]:
+    """Télécharge la vidéo de départ, extrait des captures d'image, et demande à
+    Gemini d'identifier le véhicule/objet précis qui est filmé.
+
+    Retourne (sujet_visuel, erreur_ou_none) : sujet_visuel contient 'sujet',
+    'marque', 'modele', 'action' et 'requetes' identifiées visuellement.
+    Si Gemini est indisponible ou que l'analyse échoue, sujet_visuel est vide
+    et l'erreur est retournée pour qu'on passe au repli texte.
+    """
+    sujet_visuel: dict[str, Any] = {}
+    try:
+        # Téléchargement de la vidéo TikTok
+        source = dossier / "source_rst.mp4"
+        lien_direct = await _resoudre_video_tiktok(session, url_tiktok)
+        await _telecharger_fichier(session, lien_direct, source)
+
+        # Extraction de 4 captures réparties sur la vidéo (0s, 25%, 50%, 75%)
+        captures: list[Path] = []
+        nb_captures = 4
+        for i in range(nb_captures):
+            capture = dossier / f"capture_{i}.jpg"
+            pourcent = 100.0 * i / max(1, nb_captures - 1)
+            # On prend une image au milieu d'une courte plage pour éviter les plans noirs.
+            commande = [
+                "ffmpeg", "-y",
+                "-ss", f"{pourcent:.1f}%",
+                "-i", str(source),
+                "-frames:v", "1",
+                "-vf", "scale=640:-2",
+                "-q:v", "3",
+                str(capture),
+            ]
+            await executer_commande(
+                commande, etape=f"capture d'image {i + 1}/{nb_captures}",
+                timeout=CONFIG.delai_ffmpeg, sortie_attendue=capture,
+            )
+            if capture.exists() and capture.stat().st_size > 0:
+                captures.append(capture)
+
+        if not captures:
+            return sujet_visuel, "aucune capture d'image extractible"
+
+        # Envoi des captures à Gemini pour identification visuelle précise
+        parts: list[dict] = []
+        for capture in captures:
+            data_b64 = base64.b64encode(capture.read_bytes()).decode("ascii")
+            parts.append({
+                "inline_data": {"mime_type": "image/jpeg", "data": data_b64}
+            })
+        parts.append({"text": PROMPT_SUJET_VISUEL_CAPTURES})
+        brut = await _appel_gemini_brut(
+            parts, temperature=0.0, json_mode=True,
+        )
+        donnees = _parser_json(brut)
+        if isinstance(donnees, dict):
+            sujet_visuel = {
+                "sujet": str(donnees.get("sujet") or "").strip()[:40],
+                "marque": str(donnees.get("marque") or "").strip()[:40],
+                "modele": str(donnees.get("modele") or "").strip()[:40],
+                "action": str(donnees.get("action") or "").strip()[:40],
+                "requetes": [
+                    str(q).strip()[:40]
+                    for q in (donnees.get("requetes") or [])
+                    if str(q).strip()
+                ][:3],
+            }
+        return sujet_visuel, None
+    except Exception as exc:  # noqa: BLE001
+        return sujet_visuel, str(exc)
 
 
 async def _analyser_video(video_path: Path, segments: list[dict]) -> list[dict]:
@@ -3026,8 +3186,10 @@ _MOTS_VIDES_RST = {
 
 
 async def _donnees_tikwm(session: aiohttp.ClientSession, chemin: str, params: dict) -> Any:
-    """Appelle l'API publique TikWM et renvoie son bloc « data » — rien n'est inventé ici."""
-    url = f"https://www.tikwm.com/api{chemin}"
+    """Appelle l'API TikWM (api.tikwmapi.com) et renvoie son bloc « data » — rien n'est inventé ici."""
+    if not TIKWM_API_KEY:
+        raise ErreurApp("TikWM API clé non configurée : ajoute TIKWM_API_KEY dans les variables d'environnement.")
+    url = f"{TIKWM_API_BASE}{chemin}"
 
     async def _appel():
         try:
@@ -3815,6 +3977,8 @@ async def _produire_rst(
     echecs_recherche: list[str] = []
 
     contexte.update(statut="analysing", progress=4, detail="Lecture de la vidéo TikTok de départ")
+    dossier_str = tempfile.mkdtemp(prefix="rst_visuel_", dir=str(DOSSIER_TRAVAIL))
+    dossier = Path(dossier_str)
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=75, connect=15)) as session:
         donnees = await _donnees_tikwm(session, "/", {"url": lien, "hd": "1"})
         legende = str(donnees.get("title") or "").strip()
@@ -3832,39 +3996,82 @@ async def _produire_rst(
         script, resultat_texte = await generer_script(legende, requete.fournisseur)
         _noter_fournisseur_texte(contexte, resultat_texte)
         contexte.update(
-            statut="analysing", progress=18, detail="Script prêt — extraction des noms à chercher",
+            statut="analysing", progress=18, detail="Script prêt — analyse visuelle de la vidéo",
             script=script, seed=seed_infos,
         )
 
-        # TOP N : 3 ou 5 noms tirés de la vraie légende, chacun cherché séparément.
-        noms, resultat_noms = await extraire_noms_rst(
-            legende, nombre_noms, script.get("mot_cle_broll", ""), requete.fournisseur
+        # ANALYSE VISUELLE : télécharge la vidéo, extrait des captures d'image,
+        # et demande à Gemini d'identifier le véhicule/objet précis. Si la vidéo
+        # montre une voiture, on obtient la marque + le modèle réels — pas de
+        # concepts abstraits. Le sujet visuel alimente la recherche DIRECTE par sujet.
+        sujet_visuel_captures, erreur_captures = await _analyser_sujet_visuel_captures(
+            session, lien, dossier
         )
-        _noter_fournisseur_texte(contexte, resultat_noms)
-        contexte.update(
-            statut="analysing", progress=20,
-            detail=(
-                f"{len(noms)} nom(s) à chercher : {', '.join(noms)}" if noms
-                else "Aucun nom exploitable — recherche par sujet visuel"
-            ),
-            noms=noms, nombre_noms=nombre_noms,
-        )
+        if sujet_visuel_captures.get("sujet"):
+            # Analyse visuelle réussie : elle fournit le sujet de la recherche directe.
+            sujet = sujet_visuel_captures
+            # Le TOP N de noms DISTINCTS vient de l'extraction texte de la légende :
+            # la vidéo de départ évoque plusieurs véhicules, et l'utilisateur veut un
+            # nom concret DIFFÉRENT par recherche (chevrolet c7 / honda civic / bmw z4),
+            # jamais 3 variantes du même véhicule. La capture visuelle confirme/enrichit
+            # le premier nom seulement si elle n'est pas déjà représentée.
+            noms, resultat_noms = await extraire_noms_rst(
+                legende, nombre_noms, script.get("mot_cle_broll", ""), requete.fournisseur
+            )
+            _noter_fournisseur_texte(contexte, resultat_noms)
+            visuel_nom = (
+                sujet_visuel_captures.get("modele")
+                or sujet_visuel_captures.get("sujet")
+                or ""
+            )
+            if visuel_nom and visuel_nom.strip():
+                noms = _deduplique_noms_distincts(
+                    [*noms, str(visuel_nom).strip()], limite=nombre_noms
+                )
+            noms = _deduplique_noms_distincts(noms, limite=nombre_noms)
+            contexte.update(
+                statut="analysing", progress=20,
+                detail=(
+                    f"Sujet visuel identifié sur les captures : {sujet.get('sujet', '?')}"
+                    + (f" — marque : {sujet.get('marque', '?')}" if sujet.get("marque") else "")
+                    + (f" — modèle : {sujet.get('modele', '?')}" if sujet.get("modele") else "")
+                ),
+                noms=noms, nombre_noms=nombre_noms, sujet=sujet,
+            )
+        else:
+            avec_reperage = False
+            # Repli : extraction texte seule (légende sans images).
+            contexte.update(statut="analysing", progress=19, detail="Analyse visuelle impossible — repli sur la légende")
 
-        # Sujet VISUEL : identifie l'objet/véhicule réellement filmé et son action.
-        # La recherche se fait directement sur TikTok par sujet (pas par publications du compte).
-        sujet, resultat_sujet = await extraire_sujet_rst(
-            legende, script.get("mot_cle_broll", ""), requete.fournisseur
-        )
-        _noter_fournisseur_texte(contexte, resultat_sujet)
-        contexte.update(
-            statut="analysing", progress=21,
-            detail=(
-                f"Sujet visuel : {sujet.get('sujet', '?')}"
-                + (f" (action : {sujet.get('action', '?')})" if sujet.get("action") else "")
-                + (f" — marque : {sujet.get('marque', '?')}" if sujet.get("marque") else "")
-            ),
-            sujet=sujet,
-        )
+            # TOP N : 3 ou 5 noms tirés de la vraie légende, chacun cherché séparément.
+            noms, resultat_noms = await extraire_noms_rst(
+                legende, nombre_noms, script.get("mot_cle_broll", ""), requete.fournisseur
+            )
+            _noter_fournisseur_texte(contexte, resultat_noms)
+            noms = _deduplique_noms_distincts(noms, limite=nombre_noms)
+            contexte.update(
+                statut="analysing", progress=20,
+                detail=(
+                    f"{len(noms)} nom(s) distinct(s) à chercher : {', '.join(noms)}" if noms
+                    else "Aucun nom exploitable — recherche par sujet visuel"
+                ),
+                noms=noms, nombre_noms=nombre_noms,
+            )
+
+            # Sujet VISUEL (repli texte) : identifie l'objet/véhicule réellement filmé.
+            sujet, resultat_sujet = await extraire_sujet_rst(
+                legende, script.get("mot_cle_broll", ""), requete.fournisseur
+            )
+            _noter_fournisseur_texte(contexte, resultat_sujet)
+            contexte.update(
+                statut="analysing", progress=21,
+                detail=(
+                    f"Sujet visuel (texte) : {sujet.get('sujet', '?')}"
+                    + (f" (action : {sujet.get('action', '?')})" if sujet.get("action") else "")
+                    + (f" — marque : {sujet.get('marque', '?')}" if sujet.get("marque") else "")
+                ),
+                sujet=sujet,
+            )
 
         requetes_reelles: list[str] = []
         candidats: dict[str, dict] = {}
