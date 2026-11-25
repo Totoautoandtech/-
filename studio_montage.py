@@ -608,7 +608,15 @@ drapeau d'interdiction, mets-le à true. Le doute EXCLUT la scène, il ne la sau
 - watermark : le moindre filigrane, bandeau ou pseudo incrusté par la plateforme suffit.
 Remplis TOUJOURS les sept drapeaux : un drapeau absent sera traité comme « élément présent ».
 PERTINENCE VISUELLE ET IDENTITÉ STRICTES (critères les plus importants) :
-- Identifie exactement le modèle, produit, personne, lieu ou objet demandé. Si le script donne un modèle ou un identifiant exact, toute variante ou image générique est hors sujet et reçoit 0.15 MAXIMUM.
+- La RÈGLE DU DOUTE ci-dessus s'applique aux DRAPEAUX d'interdiction (texte, personne,
+  watermark, logo, superposition) : au moindre doute, le drapeau passe à true.
+  Elle ne s'applique PAS à score_pertinence : une scène qui montre clairement le sujet
+  demandé doit recevoir un score HONNETE et ÉLEVÉ (0.7+), sans l'écraser par excès de
+  prudence. Ne sous-note pas une scène pertinente sous prétexte de « doute ».
+- Identifie exactement le modèle, produit, personne, lieu ou objet demandé. Si le script
+  donne un modèle ou un identifiant exact, une variante ou image générique (différente du
+  modèle demandé) est hors sujet et reçoit un score faible ; le modèle exact demandé
+  doit recevoir un score élevé.
 - N'accepte aucune personne visible sur les plans d'objet/voiture/produit, même si elle ne cache qu'une petite partie du sujet.
 - Les sous-titres TikTok déjà incrustés sont autorisés. Tout autre texte, logo, watermark, sticker, pseudo ou élément graphique superposé est interdit.
 - N'accorde JAMAIS un bon score à un plan seulement parce qu'il est esthétique ou bien filmé : la beauté ne fait pas la pertinence.
@@ -626,7 +634,7 @@ Retourne UNIQUEMENT un objet JSON strict avec : duree_moyenne_plans (secondes), 
 async def creer_apercu(
     source: Path, destination: Path, duree: float, config: ConfigurationMontage, rapporteur: Rapporteur
 ) -> Path:
-    filtre = "scale='if(gt(iw,ih),640,360)':'if(gt(iw,ih),360,640)':force_original_aspect_ratio=decrease,fps=6"
+    filtre = "scale='if(gt(iw,ih),640,360)':'if(gt(iw,ih),360,640)':force_original_aspect_ratio=decrease,fps=6,scale=trunc(iw/2)*2:trunc(ih/2)*2"
     commande = [
         "ffmpeg", "-y", "-i", str(source), "-t", f"{duree:.3f}", "-vf", filtre,
         "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "33",
@@ -694,6 +702,13 @@ async def analyser_video(
         del video_b64
         try:
             objet = json.loads(brut.strip().removeprefix("```json").removesuffix("```").strip())
+            # Gemini peut renvoyer un tableau brut [ ... ] au lieu d'un objet
+            # {"scenes": [...]} : on normalise avant validation, sinon
+            # model_validate([]) échoue avec "Input should be a valid dictionary".
+            if isinstance(objet, list):
+                objet = {"scenes": objet}
+            if not isinstance(objet, dict):
+                objet = {"scenes": []}
             valide = ReponseAnalyse.model_validate(objet)
             scenes: list[dict[str, Any]] = []
             for scene in valide.scenes:
@@ -706,8 +721,10 @@ async def analyser_video(
                 raise ValueError("aucune scène temporelle valide")
             return scenes, None
         except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
-            if config.exiger_validation_ia:
-                raise ErreurMontage(f"Validation IA invalide pour {source.name} : {exc}") from exc
+            # Une réponse IA vide ou malformée n'est PAS un rejet qualité : c'est une
+            # indisponibilité/anomalie de l'IA. On retombe toujours sur le repli
+            # temporel au lieu de condamner la source, même en mode strict —
+            # sinon un Gemini qui renvoie [] ou aucune scène valide bloque tout le job.
             avertissement = f"Réponse Gemini invalide, sélection de repli utilisée : {exc}"
             return _repli_scenes(duree, segments), avertissement
     except (TravailAnnule, asyncio.CancelledError):
@@ -789,8 +806,8 @@ DUREE_MIN_PLAN = 0.55
 # jamais être monté. Ces seuils s'appliquent à la pertinence brute renvoyée par
 # l'analyse (pertinence_script du segment, sinon score_pertinence), pas au score de
 # classement qui mélange esthétique et alternance des sources.
-SEUIL_PERTINENCE_HOOK = 0.36
-SEUIL_PERTINENCE_CORPS = 0.45
+SEUIL_PERTINENCE_HOOK = 0.25
+SEUIL_PERTINENCE_CORPS = 0.32
 
 
 def _borner_duree_plan(valeur: Any) -> float:
