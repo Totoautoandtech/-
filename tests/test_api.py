@@ -62,7 +62,7 @@ def test_configuration_docker_et_render_contient_les_garde_fous():
     assert "ffmpeg" in dockerfile and "fonts-dejavu-core" in dockerfile and "fonts-liberation" in dockerfile
     assert "--host 0.0.0.0" in dockerfile
     assert "healthCheckPath: /api/sante" in render
-    assert 'JOB_TIMEOUT_SECONDES' in render and 'value: "1800"' in render
+    assert 'JOB_TIMEOUT_SECONDES' in render and 'value: "3600"' in render
 
 
 def test_smoke_accueil_sante_et_statiques(client):

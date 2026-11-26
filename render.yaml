@@ -45,11 +45,11 @@ services:
         value: gemini-3.8-flash,gemini-3.5-flash-lite
       - key: DUREE_CIBLE_SECONDES
         value: "30"
-      # Garde-fous adaptés à Render Free (512 Mo). La limite globale vaut 30 min.
+      # Garde-fous adaptés à Render Free (512 Mo). La limite globale vaut 60 min.
       - key: DUREE_MAX_SOURCE_SECONDES
         value: "180"
       - key: JOB_TIMEOUT_SECONDES
-        value: "1800"
+        value: "3600"
       - key: FFMPEG_TIMEOUT_SECONDES
         value: "240"
       - key: GEMINI_TIMEOUT_SECONDES
